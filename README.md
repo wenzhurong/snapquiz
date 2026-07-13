@@ -41,6 +41,36 @@
 - **MVP-1** —— 1–2 周:「先自答→看解析」浮层 + SQLite 错题本/去重缓存 + 可改热键 + 选区记忆 + 成本&幻觉护栏。
 - **MVP-2** —— 按需:签名+公证 .app + 密钥入 Keychain;可选升级(GLM-4.6V 质量档 / Qwen-VL / 本地 VLM 隐私路)。
 
+## 运行(MVP-0)
+
+```bash
+cd snapquiz
+python3 -m venv .venv && source .venv/bin/activate
+pip install -e .                 # 基础依赖(openai / mss / pyobjc ...)
+pip install -e ".[hotkey]"       # 可选:真·全局热键(pynput,需辅助功能权限)
+
+cp .env.example .env             # 然后编辑 .env,填入智谱 GLM_API_KEY
+python scripts/grant_check.py    # 首次:按提示授予「屏幕录制」权限后重启终端
+
+snapquiz                         # 默认 stdin 触发:聚焦终端按 Enter,解答当前屏幕上的题
+snapquiz --trigger hotkey        # 全局热键(默认 Cmd+Shift+Space,需 [hotkey] 依赖 + 辅助功能权限)
+```
+
+可选环境变量(见 `.env.example`):`GLM_MODEL`、`GLM_BASE_URL`、`SNAPQUIZ_HOTKEY`、
+`SNAPQUIZ_REGION`(`left,top,width,height` 截取区域,默认全屏)。
+
+> 触发方式说明:MVP-0 默认 `stdin`(零权限)让你立刻验证核心链路;`hotkey` 用 pynput
+> 实现真·全局热键但需辅助功能权限。架构目标里「零权限 Carbon 热键」留待 MVP-1。
+
+## 开发 / 测试
+
+```bash
+python3 -m unittest discover -s tests    # 45 个纯逻辑单测,无需网络/依赖
+```
+
+纯逻辑(配置、prompt、输出解析、busy-guard、编排、格式化、热键转换)均有单测覆盖;
+截屏、GLM 网络调用、macOS 权限/通知、全局热键等需在 macOS 上实跑验证。
+
 ## 许可
 
 待定(TBD)。

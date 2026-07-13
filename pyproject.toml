@@ -1,0 +1,32 @@
+[project]
+name = "snapquiz"
+version = "0.0.1"
+description = "个人学习刷题助手:热键截屏 → 视觉大模型(GLM-4.6V-Flash)→ 答案+解析"
+requires-python = ">=3.10"
+dependencies = [
+    "openai>=1.0",       # 指向 GLM OpenAI 兼容 endpoint
+    "mss>=9.0",          # 屏幕截取
+    "python-dotenv>=1.0",
+    # macOS 全局热键 / 权限自检(仅 macOS)
+    "pyobjc-framework-Carbon>=10.0 ; sys_platform == 'darwin'",
+    "pyobjc-framework-Cocoa>=10.0 ; sys_platform == 'darwin'",
+    "pyobjc-framework-Quartz>=10.0 ; sys_platform == 'darwin'",
+]
+
+[project.scripts]
+snapquiz = "snapquiz.app:main"
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+# 真·全局热键(--trigger hotkey);macOS 上需授予「辅助功能」权限
+hotkey = ["pynput>=1.7"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["snapquiz*"]
