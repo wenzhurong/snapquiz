@@ -2,6 +2,7 @@
 .env
 .env.*
 *.env
+!.env.example        # 模板文件需要提交(上面的 .env.* 会误伤,这里放行)
 secrets.*
 config.local.*
 *.key
