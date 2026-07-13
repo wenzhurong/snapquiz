@@ -1,0 +1,53 @@
+# === Secrets / config (NEVER commit) ===
+.env
+.env.*
+*.env
+secrets.*
+config.local.*
+*.key
+*.pem
+credentials.json
+
+# === macOS ===
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+
+# === Python ===
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.python-version
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# === Node (若用到工具链) ===
+node_modules/
+npm-debug.log*
+yarn-error.log*
+
+# === Swift / Xcode (若做成品 App) ===
+.build/
+DerivedData/
+*.xcworkspace/xcuserdata/
+*.xcodeproj/xcuserdata/
+xcuserdata/
+*.xcuserstate
+
+# === Runtime artifacts ===
+*.log
+logs/
+captures/
+screenshots/
+tmp/
+.cache/
+
+# === IDE ===
+.vscode/
+.idea/
