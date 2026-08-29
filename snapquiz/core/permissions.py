@@ -1,6 +1,7 @@
-"""macOS 屏幕录制权限自检(fail-closed 用)。
+"""已隔离的 MVP-0 权限探测器。
 
-非 macOS 或拿不到该 API 时返回 True(不拦截),避免在其它平台误伤开发/测试。
+该实现保留旧的 fail-open 行为，仅供迁移识别，产品入口不得调用；M3 将以
+``granted / denied / unknown`` 三态实现替换。
 """
 from __future__ import annotations
 

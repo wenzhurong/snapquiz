@@ -1,0 +1,218 @@
+# snapquiz v3 实施计划（Phase 1 优先多模态）
+
+> **状态**：Active
+>
+> **审计基线**：`2026-08-28`，`main@93a7b2b`
+>
+> **工作区实现快照**：M0、M1 已完成；M2–M9 未开始。当前应用被有意冻结，没有可执行的截图解题链。
+>
+> **规范来源**：[`ARCHITECTURE.md`](./ARCHITECTURE.md) 是目标行为与安全约束的唯一规范；本文只负责依赖顺序、工作包、状态和验收证据，不能弱化 Spec。
+
+## 1. 交付目标与边界
+
+当前目标是先把 `direct_multimodal` 做成可扩展且 fail-closed 的安全主干，再接入第二个不同协议族的多模态模型。`ocr_text` 只保留领域边界，Phase 2 前不进入运行时路由。
+
+Phase 1 的完成条件不是“能调用两个模型”，而是：
+
+1. 真实用户截图只能沿不可绕过的 `Plan → PrivacyGate/Consent → PermissionGate → 明确选区/捕获 → PreparedOutbound 实际预览 → 逐次 EgressApproval → 受控传输` 链发送；截图前的数据政策同意与截图后的实际 payload 批准是两层不同授权；
+2. Adapter 只做纯 `prepare/decode`，不能读取密钥、创建客户端、联网或自行重试；
+3. GLM 与至少一个不同协议族的 exact binding 分别通过 contract、安全、非敏感 live smoke、统一 eval 与当前 macOS E2E；
+4. 只有达到 Spec 的完整门槛才能标记为 `supported`，此前一律是 `experimental`。
+
+## 2. 当前基线与迁移原则
+
+MVP-0 的 45 个 `unittest` 是当前行为刻画，不是 v3 的兼容门槛。以下行为与 v3 目标冲突，迁移时必须有意识地反转或删除对应测试：
+
+| 当前行为 | 风险 | v3 目标 |
+|---|---|---|
+| 权限 API 导入/调用异常时返回允许 | fail-open | `granted / denied / unknown` 三态，非 granted 全部阻断 |
+| 未配置区域时默认捕获主屏全屏 | 远程数据范围扩大 | Phase 1 remote/unknown 只允许明确选区 |
+| 启动时读取密钥并构造 OpenAI client | 绕过逐次出站批准 | approval 成功且原子消费后才解析 secret/构造 client |
+| Capture 层生成 OpenAI Data URI | Provider 协议侵入核心 | Capture 只产出 bytes 与元数据，序列化属于 Adapter |
+| Provider 同时 prepare/send/retry/decode | 无法核对获批 payload，重试可能叠加 | 纯 Adapter + exact-envelope Transport + 单一预算 |
+| `{}`、缺字段或自然语言 fallback 可展示 | 坏输出冒充结果并泄露 raw | 严格 `SolveResult` 或 typed error，永不展示 raw response |
+| 展示模型自报 confidence 百分比 | 把主观自评伪装成可靠度 | 未校准数值不展示；仅 calibrated score 可数值化 |
+
+迁移采用“离线新链并行建立，安全门禁完成后一次切换入口”的方式。旧 `GLMProvider.answer(image_data_url)` 不作为兼容 API，也不能在新链旁保留为隐藏旁路。
+
+## 3. 不可跨越的全局门禁
+
+- **真实用户截图**：M0–M6 全部通过前禁止远程发送；M6 只能使用仓库内固定、非敏感合成题图。
+- **普通测试**：禁止真实 secret、SDK client、DNS、socket、HTTP、真实屏幕捕获和生产响应录制。
+- **批准顺序**：实际 outbound bytes 生成后才能预览和批准；批准必须 one-shot、原子消费，并绑定 request/plan/stage/operation、endpoint、应用控制的非密钥 headers、body、credential injection slot/binding digest、capture fingerprint 和所有策略 digest。真实 secret 值只在 approval 消费后注入，既不进入 approval，也不进入 envelope digest；`Host`、`Content-Length` 等库派生 header 由 Transport policy 重算并核验。
+- **密钥顺序**：EgressApproval 消费前 secret resolve 和 client construction 必须均为 0。
+- **网络边界**：只允许计划内 exact scheme/host/port/path/query/content-type/header；3xx fail-closed；SDK 自动 retry 必须关闭。
+- **调用预算**：所有 attempt 共用 monotonic deadline、总网络次数、总计费次数和取消状态；Adapter 不持有自己的重试循环。
+- **结果边界**：模型输出先成为不可信 candidate；只有本地严格 Validator 能构造 `SolveResult`。
+- **状态声明**：单次 smoke 成功不能晋级 `supported`；配置文件也不能自我声明 supported。
+
+## 4. 里程碑与验收
+
+状态值：`pending`、`in_progress`、`complete`、`blocked`。只有代码和对应证据都存在时才能标记 complete。
+
+| Milestone | 状态 | 范围 | Exit gate |
+|---|---|---|---|
+| Spec-0 | complete | v3 双通道规范、多模型边界、安全顺序与支持门槛 | 架构和安全 P0/P1 复核为 0；Spec 自洽 |
+| M0 | complete | 冻结 MVP-0 真实截图远程旁路 | 所有可达入口无 v3 plan/gate 时均不能 capture、resolve secret、构造 SDK 或联网；fixture-only 入口也不能读取屏幕/真实 key |
+| M1 | complete | 纯领域契约、typed errors、canonical digest、严格结果 Validator | 纯标准库测试；无 Quartz/mss/OpenAI import；malformed 输出全拒绝；digest golden vectors |
+| M2 | pending | Registry snapshot、能力、Planner、Consent/Authorization、可信 endpoint profile | 截图前得到不可变单-stage Plan；未知 capability/endpoint 拒绝；policy unknown 额外披露确认；compute unknown 按 remote 约束 |
+| M3 | pending | fail-closed 权限、明确选区、CapturePolicy、InputValidator、清理 | 权限 unknown/denied、无选区、越界/拓扑变化、图片超限均零 secret/网络 |
+| M4 | pending | 纯 GLM/OpenAI-compatible Adapter 与 typed response/error mapping | prepare/decode 零 I/O；request/response fixtures 和 golden envelope 全通过 |
+| M5 | pending | Egress、session、Transport、预算、取消、授权租约、延迟密钥与统一清理 | 完整负向矩阵；approval 并发只能一次成功；每次 attempt 重验 valid_until/撤销；exact envelope；无 redirect/隐式 retry |
+| M6 | pending | GLM 固定合成题图 opt-in live smoke | 单次、无自动 retry；记录非内容证据；仍为 experimental |
+| M7 | pending | macOS 真实选区接入同一安全链 | 实际发送图可预览；取消零网络；完整 E2E；无旧旁路 |
+| M8-A | pending | 第二个不同协议族多模态 Adapter | 核心无 Provider 分支；独立 credential binding；结构化输出降级链；contract/security/synthetic live 通过，保持 experimental |
+| M8-B | pending | 两个 binding 的正式支持证明与选择 UX | profile selector + 启动披露；两个 binding 的统一 eval、当前 macOS E2E 与 supported 证据全部留存 |
+| M9 | pending | Phase 1C 多模态学习 UX | 图形选区/NSPanel、题面先确认、缓存/预算、错题本及查看删除路径完成验收 |
+
+Phase 映射：Phase 1A = M0–M7；Phase 1B = M8-A/M8-B；Phase 1C = M9；Phase 2 才实现 `ocr_text`。
+
+### M0：冻结遗留远程路径
+
+交付：
+
+- stdin、hotkey、`app/orchestrator` 及所有可达 legacy Provider 调用在 v3 pipeline 未就绪时 fail-closed；
+- 如需保留开发演示，只允许明确的 fixture-only 入口，且不能读取屏幕或真实 key；
+- 为 capture、secret resolve、SDK construct、DNS/socket/HTTP 建立统一副作用探针；
+- 更新旧测试，不再把任意 endpoint、默认全屏或通用异常自动重试当作兼容行为。
+
+非目标：不在 M0 内实现新 Provider，不运行真实 API，不使用真实截图 smoke。
+
+当前证据：CLI 的 stdin/hotkey 参数路径均只返回 legacy-disabled 错误并以退出码 `3` 结束；poison-import 与副作用探针证明产品入口未导入/调用 dotenv、Quartz、mss、pynput、OpenAI SDK、DNS、socket 或 HTTP。旧 `Config`、权限、parse/notify 与 `AnswerResult` 仍在源码树中但不可达；后续里程碑不得复用其 secret dataclass、fail-open 权限或 raw fallback 行为。
+
+### M1：纯领域契约
+
+拆分为：
+
+- **M1-A**：canonical digest、`CaptureScope/CaptureArtifact`、typed errors、`SolveResult` 与严格 Validator；
+- **M1-B**：`PolicySnapshot`、`SolveIntent`、不可变 `ExecutionPlan`、`PreparedOutbound` 等剩余纯领域类型；
+- **M1-C**：所有 digest 的固定 golden vectors、Unicode/字段顺序/数值/类型域分离测试与模块 import 边界测试。
+
+| 子里程碑 | 状态 | 当前证据 |
+|---|---|---|
+| M1-A | complete | 新领域/结果模块保持纯标准库；strict result、provenance、capture integrity 与 safe error boundary 测试通过 |
+| M1-B | complete | Policy/Intent/Plan/Outbound 契约、预算与 consent 绑定、Phase 1 direct 形状、envelope 完整性、runtime-final/type-exact 边界通过 |
+| M1-C | complete | serializer、CaptureScope、ExecutionPlan、body/header/envelope golden；Unicode/顺序/数值/类型域/import、篡改、URL 与序列化泄露负向测试通过 |
+
+验收：
+
+- 空对象、缺字段、`null` 字符串化、错误类型、非有限数、超长字段、未知字段均失败；
+- model-self-reported confidence 不能被标为 calibrated；
+- domain/result 测试在未安装 OpenAI、mss、Quartz 时仍可运行；
+- raw Provider response 不进入 `SolveResult`。
+
+M1 的 URL 工作只证明无 I/O 的规范形与明显 scope 不变量，不证明 endpoint 获准或 DNS 安全。Phase 1 只允许空 query；`QueryPolicyKind.EXACT` 在 M2 绑定可信 endpoint profile/固定非密钥参数前 fail-closed。Registry authority、credential reference、hostname 解析结果、连接 peer 与 DNS rebinding 防护仍分别属于 M2/M5。
+
+### M2：规划、能力与授权快照
+
+交付 Registry/profile/capability snapshot、legacy GLM 到冻结 profile 的映射、RoutePlanner、ConsentGrant、AuthorizationContext 和 endpoint policy。配置只保存 `credential_ref`，不得保存 secret value；未知模型不得继承已知能力。未知 capability 或 endpoint 必须拒绝；`compute_location=unknown` 必须按 remote 规则执行；retention/data/cost policy 为 unknown 时必须显著披露并获得额外确认，不能笼统当成同一种 unknown。
+
+Phase 1 的 Plan 只能包含一个 `direct_multimodal` solver stage、一个 inline inference operation、空 fallback，并在截图前固定 endpoint、payload data kinds、token/call/billing/deadline 预算及所有 policy digest。
+
+### M3：本地捕获安全
+
+交付三态 PermissionGate、明确选区、显示器 geometry revision/fingerprint、Provider-neutral 图片 bytes、硬限制、空白/黑帧检查和终态清理。Quartz 不可用或 API 异常必须是 unknown 并阻断；Phase 1 remote/unknown profile 必须拒绝 full-screen。
+
+### M4：GLM 纯 Adapter
+
+保留的 legacy 兼容面仅限已冻结的官方 GLM exact profile、模型和 Chat Completions wire shape。`prepare()` 生成确定性的 endpoint/headers/body bytes 与 envelope digest，`decode()` 只产生 candidate/typed error；二者都不能读取环境、创建 SDK、sleep、重试或联网。
+
+本地 repair 最多允许版本化、确定性的单层 JSON fence 移除；从任意正文中搜索 JSON 或远程 repair 均禁止。
+
+### M5：出站与传输安全核
+
+交付 `EgressGate → EgressApproval → AuthorizedSendSession → RemoteTransport`。实际 preview 必须表示将要发送的变换后图像与 metadata；任何应用控制的 body/非密钥 header/endpoint mutation 都改变 envelope digest 并使 approval 失效。
+
+授权有效期统一为 deadline、EgressApproval、AuthorizationContext 与 ConsentGrant 到期时间的最小值；在首次发送和每次 retry 前都必须重新检查有效期、撤销、取消与预算，任一失败都不得开始下一次网络 attempt。
+
+如果继续使用 OpenAI SDK，必须证明实际发送 bytes 与获批 envelope 一致，并显式关闭自动 retry 和 redirect；无法证明时改用能原样发送 body bytes 的低层 HTTP Transport。
+
+### M6：合成图 live smoke
+
+live smoke 必须显式 opt-in、一次调用、无自动 retry，只用固定非敏感合成图。受控 `VerificationRecord` 保存完整的 profile/adapter/policy digest、真实 origin/path/TLS、调用数、usage、延迟和 typed outcome，以便复核 exact binding；普通 console/log 只显示这些配置 digest 的短前缀。任何位置都不得记录 key、请求正文、截图、完整 capture/content/envelope digest 或原始响应。
+
+### M7：真实选区纵切
+
+只有 M0–M6 全部通过后，才能把 macOS selected-region source 接入同一链。预览取消、权限变化、显示器拓扑变化、approval 失效、secret 失败和退出取消必须分别验证；此时仍只标记 `experimental`。
+
+### M8-A：第二协议族实验接入
+
+第二个 Adapter 必须是不同原生协议族，并复用相同的安全与领域合同。Provider 选择依据账号可用性、地域、成本与 eval 决定；实现前重新核验官方协议。第二 binding 必须使用独立 credential binding，并验证 native schema、tool/schema、prompt-only 等结构化输出能力的确定性降级链；先完成 contract、安全与 synthetic live smoke，状态保持 `experimental`。
+
+### M8-B：正式多模型支持证明
+
+交付显式 profile selector、启动时 Provider/host/data-kind 提示、两个 binding 的统一 eval 与当前 macOS E2E，并为所有 supported 条件生成可复核 VerificationRecord。两个 exact binding 均达到完整 supported 门槛后，才可对外称为“正式多模型支持”。
+
+### M9：Phase 1C 多模态学习 UX
+
+在 M8-B 的安全主干上实现图形化选区、NSPanel 实际预览、区域记忆与敏感提醒；模型响应后先确认题面摘要再揭示答案；增加本地哈希缓存、调用预算、SQLite 错题本和查看/删除入口。截图仍默认不保存，所有 UI 状态必须经主线程 dispatcher 更新。M9 不改变 M0–M8 的出站、支持状态和安全门槛。
+
+## 5. 工作包与依赖
+
+| ID | 工作包 | 依赖 | 主要文件 | 验收测试 |
+|---|---|---|---|---|
+| W01 | 领域 digest 与基础值对象 | Spec-0 | `domain/digest.py`、`domain/capture.py` | golden vectors、不可变性、边界 |
+| W02 | typed errors 与严格结果 | W01 | `domain/errors.py`、`domain/solve.py`、`result/validator.py` | malformed/limits/confidence 矩阵 |
+| W03 | 冻结 legacy 远程入口 | Spec-0 | `app.py`、旧 orchestrator/config tests | stdin/hotkey/app/orchestrator/legacy Provider 全部零 capture/secret/SDK/network |
+| W04 | profile/capability Registry | W01 | `config/`、`routing/registry.py` | exact binding、digest、legacy mapping |
+| W05 | Planner/Consent/Authorization | W04 | `routing/planner.py`、`privacy/consent.py` | 单 stage、空 fallback、过期/撤销/热重载 |
+| W06 | 权限、选区与 CapturePolicy | W01,W05 | `core/permissions.py`、`capture/` | tri-state、边界、fingerprint、零副作用 |
+| W07 | GLM 纯 Adapter | W02,W04 | `adapters/openai_chat_compatible.py` | request/response fixtures、零 I/O |
+| W08 | Egress 与 one-shot session | W05,W06,W07 | `privacy/egress.py`、`transport/session.py` | mutation、并发消费、撤销 |
+| W09 | HTTP Transport 与预算 | W08 | `transport/http.py`、`runtime/` | TLS/redirect、attempt/deadline/cancel |
+| W10 | 新 multimodal pipeline | W06,W07,W09 | `pipelines/multimodal.py` | 完整 gate 顺序和故障矩阵 |
+| W11 | GLM synthetic live smoke | W03,W10 | `scripts/`、非敏感 fixture | M0 已完成；opt-in 单次实调证据 |
+| W12 | macOS 选区/预览纵切 | W03,W10,W11 | `capture/`、`present/`、`app.py` | 当前 macOS E2E |
+| W13 | 第二协议族 experimental Adapter | W12 | `adapters/`、profile | 独立 binding；结构化输出降级；共用 contract/security/live |
+| W14 | 双 binding 支持证明与选择 UX | W12,W13 | profile selector、VerificationRecord | 统一 eval、启动披露、两个 binding 当前 macOS E2E |
+| W15 | Phase 1C 学习 UX | W14 | `present/`、`study/`、缓存 | 图形选区/预览、题面确认、数据查看删除与 E2E |
+
+W01/W02 可以与 W03 并行，但 W04 之后的任何运行时接线都必须等待 W03；W11/W13 的任何 synthetic live 之前均必须完成 W03/M0；W12 之前禁止真实用户截图远程发送。
+
+当前工作包状态：W01、W02、W03 complete；W04 是下一工作包；W05–W15 pending。complete 仅表示对应离线代码与证据存在，不表示应用、Provider、macOS 捕获或发布链可用。
+
+## 6. 测试与证据矩阵
+
+### 6.1 统一副作用断言
+
+| 失败位置 | capture | secret resolve | SDK/client construct | DNS/socket/HTTP |
+|---|---:|---:|---:|---:|
+| plan/privacy/permission/scope 前置失败 | 0 | 0 | 0 | 0 |
+| capture/input/prepare/Egress 失败 | 最多 1 | 0 | 0 | 0 |
+| snapshot/envelope/binding/session 失败 | 最多 1 | 0 | 0 | 0 |
+| secret 解析失败 | 最多 1 | 1 | 0 | 0 |
+| response Schema 失败 | 最多 1 | 1 | 1 | 只允许已经获批的次数；之后不得再调用 |
+
+### 6.2 分层证据
+
+| 层级 | 证明内容 | 不证明内容 |
+|---|---|---|
+| domain/unit | 不变量、Schema、digest、预算算法 | SDK/HTTP、Provider 可用性、macOS 用户路径 |
+| contract/fixture | exact request/response 映射和 typed errors | 当前 endpoint、认证、限流、计费 |
+| security integration | gate 顺序、零副作用、原子 approval、取消/清理 | 模型质量与真实 macOS 权限体验 |
+| synthetic live smoke | 当前 exact endpoint/auth/wire shape 可用 | 真实截图安全、准确率、supported |
+| eval | 分题型质量、拒答、校准与限制 | UI、TCC、进程退出安全 |
+| macOS E2E | 真实选区/预览/确认/展示用户路径 | 未来 OS/模型版本持续有效 |
+
+普通 CI 与本地默认测试不得依赖 secret 或网络。live smoke 必须使用独立命令和显式环境开关，不能被 `unittest discover` 或 `pytest` 自动收集执行。
+
+## 7. 近期执行顺序
+
+1. 实现 M2 的冻结 GLM profile、Registry、trusted endpoint policy、Consent/Authorization 与单 stage Planner；
+2. 实现 M3 的 fail-closed 权限和 selected-region CaptureArtifact；
+3. 实现 M4 的纯 Adapter 和严格 response fixtures；
+4. 实现 M5 的 Egress/session/Transport，并跑完整安全负向矩阵；
+5. M6 synthetic live smoke 通过后，再进入 M7 的真实 macOS 选区纵切；
+6. 选定不同协议族并实施 M8-A，再以 M8-B 完成选择 UX 与两个 binding 的正式支持证明；
+7. 实施 M9 学习 UX；Phase 1 exit gate 全部满足后再启动 Phase 2 的 OCR 实现。
+
+每个里程碑结束时必须记录：代码 SHA、测试命令与结果、是否联网、是否使用真实用户数据、未覆盖项、状态变化依据。合并、发布、部署或 live API 调用均是独立授权边界，不由本文自动授权。
+
+## 8. 本轮变更记录
+
+- 将 Phase 1A 从单个大里程碑拆成 M0–M7，把第二协议族与支持证明拆为 M8-A/M8-B，并为 Phase 1C 建立 M9；
+- 明确旧远程链不是兼容目标，M0–M6 前禁止真实用户截图远程发送；
+- 增加目标模块、工作包依赖、副作用矩阵和分层证据定义；
+- 完成 M0：冻结所有 MVP-0 产品入口，CLI 明确以退出码 `3` fail-closed，并用 poison-import/副作用探针证明零截图、零 secret resolve、零 SDK、零网络；
+- 完成 M1-A/M1-B/M1-C：加入 runtime-final 领域值对象、Plan/consent/预算/PreparedOutbound 绑定、canonical URL 与 literal scope 负向约束、固定 digest vectors、严格结果 Validator；Phase 1 的 query 暂只允许空值；
+- 完整离线 `unittest` 为 112/112（含独立新进程 poison-import/network CLI 探针），并通过 Python 3.10 grammar、compileall 与 diff 静态检查；本轮没有截图、真实 secret、SDK client、DNS/socket/HTTP、live API、macOS E2E、commit、push、merge 或部署。

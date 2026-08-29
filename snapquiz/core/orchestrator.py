@@ -1,35 +1,27 @@
-"""编排一次查询:权限自检(fail-closed)→ 截屏 → 作答 → 呈现。
+"""已冻结的 MVP-0 编排器。
 
-所有外部依赖(截屏、模型、呈现、权限)都以可调用对象注入,便于测试与替换 provider。
+新的 ExecutionPlan/Egress 链接管前，本类只保留兼容签名；运行时不会调用
+任何注入能力。
 """
 from __future__ import annotations
 
-from typing import Callable, Optional
+from typing import Any, Callable, NoReturn, Optional
 
-from snapquiz.llm.base import AnswerResult, VlmProvider
+from snapquiz.core.legacy import raise_legacy_pipeline_disabled
 
 
 class Orchestrator:
     def __init__(
         self,
-        provider: VlmProvider,
+        provider: Any,
         capture_fn: Callable[[], str],
-        present_fn: Callable[[AnswerResult], None],
+        present_fn: Callable[[Any], None],
         has_permission_fn: Callable[[], bool],
         on_denied: Callable[[], None],
         question_hint: Optional[str] = None,
     ) -> None:
-        self._provider = provider
-        self._capture_fn = capture_fn
-        self._present_fn = present_fn
-        self._has_permission_fn = has_permission_fn
-        self._on_denied = on_denied
-        self._question_hint = question_hint
+        # 不保留 capability 引用，避免调用方从 legacy 对象重新取出旁路能力。
+        del provider, capture_fn, present_fn, has_permission_fn, on_denied, question_hint
 
-    def run_once(self) -> None:
-        if not self._has_permission_fn():
-            self._on_denied()
-            return
-        image_data_url = self._capture_fn()
-        result = self._provider.answer(image_data_url, self._question_hint)
-        self._present_fn(result)
+    def run_once(self) -> NoReturn:
+        raise_legacy_pipeline_disabled()
