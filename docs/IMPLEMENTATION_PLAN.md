@@ -215,4 +215,4 @@ W01/W02 可以与 W03 并行，但 W04 之后的任何运行时接线都必须�
 - 增加目标模块、工作包依赖、副作用矩阵和分层证据定义；
 - 完成 M0：冻结所有 MVP-0 产品入口，CLI 明确以退出码 `3` fail-closed，并用 poison-import/副作用探针证明零截图、零 secret resolve、零 SDK、零网络；
 - 完成 M1-A/M1-B/M1-C：加入 runtime-final 领域值对象、Plan/consent/预算/PreparedOutbound 绑定、canonical URL 与 literal scope 负向约束、固定 digest vectors、严格结果 Validator；Phase 1 的 query 暂只允许空值；
-- 完整离线 `unittest` 为 112/112（含独立新进程 poison-import/network CLI 探针），并通过 Python 3.10 grammar、compileall 与 diff 静态检查；本轮没有截图、真实 secret、SDK client、DNS/socket/HTTP、live API、macOS E2E、commit、push、merge 或部署。
+- 完整离线 `unittest` 为 112/112（含独立新进程 poison-import/network CLI 探针），并通过 Python 3.10 grammar、compileall 与 diff 静态检查；M0/M1 实现已由独立授权提交并推送至 `main`，实现与验证过程没有截图、真实 secret、SDK client、DNS/socket/HTTP、live API 或 macOS E2E，也未执行额外 merge 或部署。
