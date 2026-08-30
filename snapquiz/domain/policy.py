@@ -67,3 +67,25 @@ def policy_value_payload(value: PolicyValue) -> object:
     if type(value) is PolicySnapshot:
         return PolicySnapshot.as_digest_payload(value)
     return value.value
+
+
+def validate_policy_value_at(
+    value: PolicyValue,
+    now: datetime,
+    *,
+    name: str = "policy value",
+) -> None:
+    """Fail closed when a verified policy is not valid at ``now``.
+
+    Contract markers have no temporal evidence to validate.  Their disclosure
+    and acknowledgement requirements belong to the privacy-consent boundary.
+    """
+
+    require_policy_value(value, name)
+    require_aware_datetime(now, "now")
+    if type(value) is not PolicySnapshot:
+        return
+    if now < value.verified_at:
+        raise ValueError(f"{name} is not valid yet")
+    if value.expires_at is not None and now >= value.expires_at:
+        raise ValueError(f"{name} has expired")

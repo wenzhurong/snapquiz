@@ -467,11 +467,19 @@ class RegistrySnapshot:
                 raise RegistryIntegrityError(
                     "Phase 1 direct operation must be inline image inference"
                 )
+            if provider.cost_policy != pipeline.cost_policy:
+                raise RegistryIntegrityError(
+                    "provider and pipeline cost policies must be identical"
+                )
             billable_operation_count = 1 if (
                 operation.billable is True
                 or operation.billable is ContractMarker.UNKNOWN
             ) else 0
             if billable_operation_count:
+                if pipeline.cost_policy is ContractMarker.NOT_APPLICABLE:
+                    raise RegistryIntegrityError(
+                        "potentially billable operation requires a cost policy"
+                    )
                 if not (
                     billable_operation_count
                     <= pipeline.max_billable_calls

@@ -65,7 +65,12 @@ from snapquiz.domain.plan import (
     validate_endpoint_for_network_scope,
     validate_phase1_remote_direct_plan,
 )
-from snapquiz.domain.policy import ContractMarker, PolicySnapshot, PolicyValue
+from snapquiz.domain.policy import (
+    ContractMarker,
+    PolicySnapshot,
+    PolicyValue,
+    validate_policy_value_at,
+)
 from snapquiz.domain.solve import (
     ConfidenceKind,
     PipelineKind,
@@ -137,5 +142,6 @@ __all__ = [
     "validate_capture_artifact",
     "validate_endpoint_for_network_scope",
     "validate_phase1_remote_direct_plan",
+    "validate_policy_value_at",
     "validate_prepared_outbound_against_plan",
 ]
