@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from snapquiz.config import Region
+from snapquiz.legacy_config import Region
 from snapquiz.core.legacy import raise_legacy_pipeline_disabled
 
 

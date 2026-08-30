@@ -2,9 +2,9 @@
 
 > **状态**：Active
 >
-> **审计基线**：`2026-08-28`，`main@93a7b2b`
+> **实施基线**：`2026-08-29`，`main@00973d0`
 >
-> **工作区实现快照**：M0、M1 已完成；M2–M9 未开始。当前应用被有意冻结，没有可执行的截图解题链。
+> **工作区实现快照**：M0、M1 与 M2-A/W04 已完成；M2 总里程碑 `in_progress`，W05 与 M3–M9 未开始。W04 当前尚未提交；应用仍被有意冻结，没有可执行的截图解题链。
 >
 > **规范来源**：[`ARCHITECTURE.md`](./ARCHITECTURE.md) 是目标行为与安全约束的唯一规范；本文只负责依赖顺序、工作包、状态和验收证据，不能弱化 Spec。
 
@@ -55,7 +55,7 @@ MVP-0 的 45 个 `unittest` 是当前行为刻画，不是 v3 的兼容门槛。
 | Spec-0 | complete | v3 双通道规范、多模型边界、安全顺序与支持门槛 | 架构和安全 P0/P1 复核为 0；Spec 自洽 |
 | M0 | complete | 冻结 MVP-0 真实截图远程旁路 | 所有可达入口无 v3 plan/gate 时均不能 capture、resolve secret、构造 SDK 或联网；fixture-only 入口也不能读取屏幕/真实 key |
 | M1 | complete | 纯领域契约、typed errors、canonical digest、严格结果 Validator | 纯标准库测试；无 Quartz/mss/OpenAI import；malformed 输出全拒绝；digest golden vectors |
-| M2 | pending | Registry snapshot、能力、Planner、Consent/Authorization、可信 endpoint profile | 截图前得到不可变单-stage Plan；未知 capability/endpoint 拒绝；policy unknown 额外披露确认；compute unknown 按 remote 约束 |
+| M2 | in_progress | Registry snapshot、能力、Planner、Consent/Authorization、可信 endpoint profile | 截图前得到不可变单-stage Plan；未知 capability/endpoint 拒绝；policy unknown 额外披露确认；compute unknown 按 remote 约束 |
 | M3 | pending | fail-closed 权限、明确选区、CapturePolicy、InputValidator、清理 | 权限 unknown/denied、无选区、越界/拓扑变化、图片超限均零 secret/网络 |
 | M4 | pending | 纯 GLM/OpenAI-compatible Adapter 与 typed response/error mapping | prepare/decode 零 I/O；request/response fixtures 和 golden envelope 全通过 |
 | M5 | pending | Egress、session、Transport、预算、取消、授权租约、延迟密钥与统一清理 | 完整负向矩阵；approval 并发只能一次成功；每次 attempt 重验 valid_until/撤销；exact envelope；无 redirect/隐式 retry |
@@ -108,6 +108,13 @@ M1 的 URL 工作只证明无 I/O 的规范形与明显 scope 不变量，不证
 交付 Registry/profile/capability snapshot、legacy GLM 到冻结 profile 的映射、RoutePlanner、ConsentGrant、AuthorizationContext 和 endpoint policy。配置只保存 `credential_ref`，不得保存 secret value；未知模型不得继承已知能力。未知 capability 或 endpoint 必须拒绝；`compute_location=unknown` 必须按 remote 规则执行；retention/data/cost policy 为 unknown 时必须显著披露并获得额外确认，不能笼统当成同一种 unknown。
 
 Phase 1 的 Plan 只能包含一个 `direct_multimodal` solver stage、一个 inline inference operation、空 fallback，并在截图前固定 endpoint、payload data kinds、token/call/billing/deadline 预算及所有 policy digest。
+
+| 子工作包 | 状态 | 当前证据 |
+|---|---|---|
+| M2-A / W04 | complete | 纯标准库、runtime-final 的 endpoint operation/policy、credential binding metadata、Provider/Capability/Stage/Pipeline profile 与 Registry generation；全部 digest 逐层绑定并 exact lookup，GLM profile 无 VerificationRecord 时只解析为 `experimental`；legacy mapper 不接受 key 值，只接受冻结的官方 base URL 与 exact model |
+| M2-B / W05 | pending | 尚无 RoutePlanner、ConsentGrant、AuthorizationContext 或原子持有 `ExecutionPlan + ResolvedPipelineProfile` 的 `PlannedExecution` |
+
+W04 的 `complete` 只证明离线 authority snapshot、不可变性、exact binding、legacy 非秘密映射和零副作用边界。Stage binding 已冻结 Adapter 实际选择的 image encoding、structured-output 与 system/reasoning/usage 行为，W05 必须把同一 generation 的 resolution 与 Plan 原子绑定，M4 不得重新查询当前 Registry。W04 不证明 GLM Adapter wire shape、认证、Provider 可用性、价格/限流、DNS/连接 peer、截图授权或 macOS 用户路径；这些证据分别留在 M4–M8。当前 pending Adapter/prompt/preprocessing version 被显式写入 profile，M4 实现时必须变更版本并使所有传递 digest 失效。
 
 ### M3：本地捕获安全
 
@@ -169,7 +176,7 @@ live smoke 必须显式 opt-in、一次调用、无自动 retry，只用固定�
 
 W01/W02 可以与 W03 并行，但 W04 之后的任何运行时接线都必须等待 W03；W11/W13 的任何 synthetic live 之前均必须完成 W03/M0；W12 之前禁止真实用户截图远程发送。
 
-当前工作包状态：W01、W02、W03 complete；W04 是下一工作包；W05–W15 pending。complete 仅表示对应离线代码与证据存在，不表示应用、Provider、macOS 捕获或发布链可用。
+当前工作包状态：W01、W02、W03、W04 complete；W05 是下一工作包；W05–W15 pending。complete 仅表示对应离线代码与证据存在，不表示应用、Provider、macOS 捕获或发布链可用。
 
 ## 6. 测试与证据矩阵
 
@@ -198,7 +205,7 @@ W01/W02 可以与 W03 并行，但 W04 之后的任何运行时接线都必须�
 
 ## 7. 近期执行顺序
 
-1. 实现 M2 的冻结 GLM profile、Registry、trusted endpoint policy、Consent/Authorization 与单 stage Planner；
+1. 实现 M2-B/W05 的 Consent/Authorization 与单 stage RoutePlanner，把已冻结的 GLM Registry snapshot 映射为截图前的 ExecutionPlan；
 2. 实现 M3 的 fail-closed 权限和 selected-region CaptureArtifact；
 3. 实现 M4 的纯 Adapter 和严格 response fixtures；
 4. 实现 M5 的 Egress/session/Transport，并跑完整安全负向矩阵；
@@ -216,3 +223,5 @@ W01/W02 可以与 W03 并行，但 W04 之后的任何运行时接线都必须�
 - 完成 M0：冻结所有 MVP-0 产品入口，CLI 明确以退出码 `3` fail-closed，并用 poison-import/副作用探针证明零截图、零 secret resolve、零 SDK、零网络；
 - 完成 M1-A/M1-B/M1-C：加入 runtime-final 领域值对象、Plan/consent/预算/PreparedOutbound 绑定、canonical URL 与 literal scope 负向约束、固定 digest vectors、严格结果 Validator；Phase 1 的 query 暂只允许空值；
 - 完整离线 `unittest` 为 112/112（含独立新进程 poison-import/network CLI 探针），并通过 Python 3.10 grammar、compileall 与 diff 静态检查；M0/M1 实现已由独立授权提交并推送至 `main`，实现与验证过程没有截图、真实 secret、SDK client、DNS/socket/HTTP、live API 或 macOS E2E，也未执行额外 merge 或部署。
+- 完成 M2-A/W04：把旧 secret-bearing `config.py` 隔离为未接线的 `legacy_config.py`，建立无 I/O 的 `config/` 包、Provider-neutral capability/profile snapshots、受控 GLM exact Registry 与纯 legacy 非秘密映射；未知 profile/model/capability 不回退，非空 query、自定义 legacy endpoint、generic serialization、摘要篡改与快照代际混用均 fail-closed；本轮未提交、未推送、未调用 Provider API。
+- W04 后当前完整离线 `unittest` 为 138/138，其中 Registry contract/security 为 25/25；固定 Registry golden digest、fresh-process poison-import/secret/network 探针、Python 3.10 grammar、compileall 与 diff 静态检查均通过。2026-08-29 只读复核了官方 GLM model 与 Chat Completions/OpenAI-compatible 文档，但未使用真实 secret、截图、SDK client 或 Provider live 调用，也未执行提交、推送、合并或部署。

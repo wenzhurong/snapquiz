@@ -123,6 +123,46 @@ def _is_loopback_endpoint(endpoint: str) -> bool:
         return False
 
 
+def validate_endpoint_for_network_scope(
+    endpoint: str, network_scope: NetworkScope
+) -> None:
+    """Validate canonical endpoint scheme/host against a declared scope.
+
+    DNS resolution and peer verification remain Transport responsibilities;
+    this helper only classifies canonical hostnames and literal addresses.
+    """
+
+    require_canonical_http_url(endpoint, "endpoint", allow_query=False)
+    if type(network_scope) is not NetworkScope or network_scope is NetworkScope.NONE:
+        raise ValueError("network endpoint requires a concrete NetworkScope")
+    is_loopback = _is_loopback_endpoint(endpoint)
+    if network_scope is NetworkScope.LOOPBACK:
+        if not is_loopback:
+            raise ValueError("loopback endpoints must target a loopback host")
+        return
+    if is_loopback:
+        raise ValueError("LAN/internet endpoints cannot target a loopback host")
+    if urlsplit(endpoint).scheme != "https":
+        raise ValueError("LAN/internet endpoints require HTTPS")
+
+    host = canonical_http_url_host(endpoint)
+    try:
+        literal_ip = ip_address(host)
+    except ValueError:
+        return
+    if literal_ip.is_unspecified or literal_ip.is_multicast or literal_ip.is_reserved:
+        raise ValueError("network endpoint targets a forbidden literal address")
+    is_lan_literal = any(
+        literal_ip in network
+        for network in _LAN_LITERAL_NETWORKS
+        if literal_ip.version == network.version
+    )
+    if network_scope is NetworkScope.LAN and not is_lan_literal:
+        raise ValueError("LAN endpoints require an explicit LAN literal address")
+    if network_scope is NetworkScope.INTERNET and not literal_ip.is_global:
+        raise ValueError("internet endpoints require a global unicast literal address")
+
+
 def _marker_or_text_payload(value: str | ContractMarker) -> str:
     return value.value if isinstance(value, ContractMarker) else value
 
@@ -407,39 +447,10 @@ class ExecutionPlanStage:
         elif self.network_scope in (NetworkScope.LAN, NetworkScope.INTERNET):
             if self.tls_policy_ref is ContractMarker.NOT_APPLICABLE:
                 raise ValueError("LAN/internet stages require an explicit TLS policy")
-            if any(
-                urlsplit(operation.canonical_endpoint).scheme != "https"
-                for operation in self.network_operations
-            ):
-                raise ValueError("LAN/internet operations require HTTPS endpoints")
         for operation in self.network_operations:
-            is_loopback = _is_loopback_endpoint(operation.canonical_endpoint)
-            if self.network_scope is NetworkScope.LOOPBACK:
-                if not is_loopback:
-                    raise ValueError("loopback operations must target a loopback host")
-                continue
-            if is_loopback:
-                raise ValueError("LAN/internet operations cannot target a loopback host")
-            host = canonical_http_url_host(operation.canonical_endpoint)
-            try:
-                literal_ip = ip_address(host)
-            except ValueError:
-                continue
-            if (
-                literal_ip.is_unspecified
-                or literal_ip.is_multicast
-                or literal_ip.is_reserved
-            ):
-                raise ValueError("network operation targets a forbidden literal address")
-            is_lan_literal = any(
-                literal_ip in network
-                for network in _LAN_LITERAL_NETWORKS
-                if literal_ip.version == network.version
+            validate_endpoint_for_network_scope(
+                operation.canonical_endpoint, self.network_scope
             )
-            if self.network_scope is NetworkScope.LAN and not is_lan_literal:
-                raise ValueError("LAN operations require an explicit LAN literal address")
-            if self.network_scope is NetworkScope.INTERNET and not literal_ip.is_global:
-                raise ValueError("internet operations require a global unicast literal address")
         for operation in self.network_operations:
             slot_is_na = (
                 operation.credential_injection_slot

@@ -12,6 +12,8 @@ from snapquiz.domain.solve import (
     SolveStatus,
 )
 
+RESULT_VALIDATOR_VERSION = "snapquiz.result-validator.v1"
+
 _EXPECTED_FIELDS = frozenset(
     {
         "schema_version",

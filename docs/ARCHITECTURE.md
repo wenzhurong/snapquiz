@@ -1,6 +1,6 @@
 # snapquiz 产品与技术规格（v3 · 多模型双通道）
 
-> **状态**：v3 实现基准。本文描述目标架构；当前工作区只完成 M0 安全冻结与 M1 离线领域契约，不代表 v3 用户链路已经可用。交付顺序、状态与逐项验收见 [`IMPLEMENTATION_PLAN.md`](./IMPLEMENTATION_PLAN.md)。
+> **状态**：v3 实现基准。本文描述目标架构；当前工作区已完成 M0、M1 与 M2-A/W04 的离线 Registry 契约，不代表 v3 用户链路已经可用。交付顺序、状态与逐项验收见 [`IMPLEMENTATION_PLAN.md`](./IMPLEMENTATION_PLAN.md)。
 >
 > **已定方向**：模型能力分为两条推理通道：
 >
@@ -23,12 +23,13 @@
 - 输出：prompt 约束 JSON，终端与系统通知展示；
 - 尚无：选区预览、Provider registry、严格结果契约、NSPanel、SQLite、错题本、缓存、签名应用。
 
-当前未提交工作区已经进入迁移态：
+当前工作区已经进入迁移态：
 
 - **M0 complete**：stdin、全局热键、app/orchestrator、legacy GLM Provider 与截图入口全部 fail-closed；CLI 只解释参数并以退出码 `3` 说明 legacy pipeline 已禁用，不读取 `.env`、权限或屏幕，也不构造 SDK/联网；
 - **M1 complete**：已建立纯标准库 canonical digest、Capture/Intent/Policy/ExecutionPlan/PreparedOutbound、typed errors、严格 `SolveResult` 与本地 Validator；敏感值对象禁止通用 dataclass 序列化并在运行时禁止继承；
-- **尚不可用**：没有 Registry/Planner/Consent、三态权限/真实选区、纯 Adapter、Egress/session/Transport 或任何 live/E2E 证据，因此当前没有可执行的解题用户路径，不能称为 `experimental` 或 `supported`；
-- legacy `Config`、权限探测、parse/notify 与 `AnswerResult` 仍留在源码树中，但被 M0 产品入口隔离；M2/M3/M4 必须替换而不得重新接回。结构化 URL 只完成无 I/O 的规范形校验；endpoint authority、profile allowlist、DNS 结果与连接 peer 验证仍属于 M2/M5。
+- **M2-A/W04 complete（当前未提交工作区）**：已建立不可变、内容寻址、精确匹配的 Endpoint/Credential Binding/Provider/Capability/Pipeline Registry snapshot；冻结 GLM profile 只解析为 `experimental`，legacy 映射只处理固定 endpoint/model 与 `env:GLM_API_KEY` 引用，不读取 key 值；
+- **尚不可用**：没有 Planner/Consent/Authorization、三态权限/真实选区、纯 Adapter、Egress/session/Transport 或任何 live/eval/E2E 证据，因此当前没有可执行的解题用户路径；Registry 中的 `experimental` 只是 exact binding 状态，不代表应用链已可运行，更不能称为 `supported`；
+- legacy `Config`、权限探测、parse/notify 与 `AnswerResult` 仍留在源码树中，但被 M0 产品入口隔离；M2/M3/M4 必须替换而不得重新接回。W04 只完成无 I/O 的 endpoint authority/profile allowlist snapshot；Planner 消费属于 W05，DNS 全结果、连接 peer 与 rebinding 防护属于 M5。
 
 因此本文必须区分：
 
@@ -667,7 +668,8 @@ verification_evidence:
 StageAdapter.prepare(
   invocation: StageInvocation,
   frozen_stage: ExecutionPlanStage,
-  frozen_operation: ExecutionPlanNetworkOperation
+  frozen_operation: ExecutionPlanNetworkOperation,
+  frozen_binding: ResolvedStageBinding
 ) -> PreparedOutbound
 
 RemoteTransport.send(
@@ -680,7 +682,8 @@ RemoteTransport.send(
 StageAdapter.decode(
   response: TransportResponse,
   frozen_stage: ExecutionPlanStage,
-  frozen_operation: ExecutionPlanNetworkOperation
+  frozen_operation: ExecutionPlanNetworkOperation,
+  frozen_binding: ResolvedStageBinding
 ) -> StageResult
 
 LocalStageAdapter.execute_local(
@@ -742,6 +745,8 @@ OperationReceipt
   opaque_reference: ephemeral string | null
 ```
 
+`ResolvedStageBinding` 只能由一个不可变 Registry generation 创建，除 profile/capability 对象外还必须冻结 Adapter 实际选择的 image encoding、structured-output 模式、system/reasoning/usage 开关和受控非秘密参数。W05 生成的 `PlannedExecution` 必须原子持有 `ExecutionPlan + ResolvedPipelineProfile`；其 pipeline/provider/capability/adapter/endpoint/credential digests 和版本逐项一致后才能进入 prepare。这样 M4 Adapter 不重新读取“当前 Registry”、不根据 model 字符串猜能力，也不把 Provider 参数硬编码成未纳入 Plan 的旁路。热重载只产生新的 generation，不改变旧 `PlannedExecution`。
+
 TransportResponse 的 plan/stage/operation/envelope 必须与 session 和显式 frozen operation 完全一致，否则在 decode 前失败。`raw_response` 只允许在当前调用栈内用于 Decoder/ErrorMapper，默认不得持久化或记录。只有 AnswerCandidateResult 可以进入 ResultValidator 并转换为 SolveResult；OcrCandidateResult 必须先进入 QuestionDocumentValidator 与 OcrQualityGate；未来 upload/delete/model-discovery 使用 OperationReceipt，不能冒充答案结果。Adapter 不得自行绕过对应 Validator。
 
 第二阶段的 OCR 最小能力契约为：
@@ -775,7 +780,7 @@ OCR stage 可以使用 `component_id/version`，不强制伪装成生成模型 `
 
 | Provider | Adapter family | 图片序列化 | 结构化输出基线 | 角色 |
 |---|---|---|---|---|
-| 智谱 GLM | `openai_chat_compatible` + `zhipu` profile | URL / Data URI | 视觉型号首版按 `prompt_only`，实测后才能升级 | Phase 1A 显式开发迁移起点，不是发布默认项 |
+| 智谱 GLM | `openai_chat_compatible` + `zhipu` profile | exact GLM-4.6V-Flash profile 首版冻结为 `image_url` 中的 raw Base64；公开 URL 仅记为能力，不进入 Phase 1 本地截图路径 | 视觉型号首版按 `prompt_only`，实测后才能升级 | Phase 1A 显式开发迁移起点，不是发布默认项 |
 | OpenAI | `openai_responses` | `input_image` URL / Data URI / file id | 支持的型号可用原生 JSON Schema；按 profile/model 验证 | 不同协议族候选 |
 | Anthropic Claude API | `anthropic_messages` | image block：base64 / URL / file id | 支持的型号/平台可用原生 JSON Schema | 不同协议族候选；不依赖其兼容层 |
 | Google Gemini | `gemini_interactions` 或 `openai_chat_compatible` + `gemini_beta` profile | Interactions：`image.data` raw base64 / `image.uri`；兼容层：`image_url` Data URI | 按 adapter/profile 验证 Schema | native profile 钉住 API version 并设置 `store=false`；兼容层仍按 beta 对待 |
@@ -1116,7 +1121,7 @@ capabilities_ref = "zhipu/glm-4.6v-flash@verified-date"
 - `M7`：把 macOS 真实选区接入已经通过 M0–M6 的同一安全链，并保持 `experimental`；
 - 严格验证结果，禁止空 JSON 成功；GLM 不进入默认用户列表；当前 fail-open、默认全屏、任意 endpoint、raw fallback 与不受控重试均不属于兼容目标。
 
-**当前实现状态（2026-08-28 工作区）**：M0 与 M1 已完成；M2–M9 均未完成。应用被有意冻结，没有截图、密钥解析、SDK 构造、网络、live smoke 或真实 macOS E2E。Phase 1 的 query 固定为空；`exact` query 仅保留枚举位置，在 M2 由可信 endpoint profile 约束前一律拒绝。
+**当前实现状态（2026-08-29 工作区）**：M0、M1 与 M2-A/W04 已完成，M2 总里程碑仍在进行中，W05 与 M3–M9 均未完成。W04 已提供受控 GLM exact endpoint/profile/capability/credential-reference snapshot 与只读 Registry，且没有 VerificationRecord，因此只派生 `experimental`。应用仍被有意冻结，没有截图、密钥解析、SDK 构造、Provider API 调用、live smoke 或真实 macOS E2E。Phase 1 的 query 固定为空；`QueryPolicyKind.EXACT` 仍未启用。DNS 全结果、连接 peer 与 rebinding 防护仍属于 M5，W04 的离线 endpoint authority 不证明传输安全。
 
 `M1` 的离线脚手架已与 `M0` 并行完成；任何真实 Provider、真实截图或默认入口切换仍必须严格按 M2→M3→M4→M5→M6→M7 的剩余门禁推进。详细工作包、依赖和当前状态以 Implementation Plan 为准；Plan 不得弱化本 Spec 的约束。
 

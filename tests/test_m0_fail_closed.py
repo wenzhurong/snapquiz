@@ -1,5 +1,6 @@
 import builtins
 import contextlib
+import importlib.util
 import io
 import os
 from pathlib import Path
@@ -34,6 +35,15 @@ class SideEffectProbe:
 
 
 class M0FailClosedTest(unittest.TestCase):
+    def test_v3_config_package_does_not_reexport_legacy_secret_config(self):
+        import snapquiz.config as config_package
+
+        spec = importlib.util.find_spec("snapquiz.config")
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.submodule_search_locations)
+        self.assertFalse(hasattr(config_package, "Config"))
+        self.assertFalse(hasattr(config_package, "load_config"))
+
     def test_fresh_cli_process_has_poisoned_optional_import_and_network_boundary(self):
         repository_root = Path(__file__).resolve().parents[1]
         sitecustomize = """
@@ -43,7 +53,12 @@ import socket
 _original_import = builtins.__import__
 
 def _guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
-    if name.split('.', 1)[0] in {'dotenv', 'mss', 'Quartz', 'openai', 'pynput'}:
+    if (
+        name.split('.', 1)[0] in {'dotenv', 'mss', 'Quartz', 'openai', 'pynput'}
+        or name == 'snapquiz.config'
+        or name.startswith('snapquiz.config.')
+        or name == 'snapquiz.legacy_config'
+    ):
         raise RuntimeError('forbidden optional import: ' + name)
     return _original_import(name, globals, locals, fromlist, level)
 
@@ -101,7 +116,10 @@ socket.socket = _forbidden_network
                     return original_import(name, globals, locals, fromlist, level)
 
                 with (
-                    patch("snapquiz.config.load_config", probe.trip("secret_resolve")),
+                    patch(
+                        "snapquiz.legacy_config.load_config",
+                        probe.trip("secret_resolve"),
+                    ),
                     patch(
                         "snapquiz.core.permissions.has_screen_recording",
                         probe.trip("permission"),

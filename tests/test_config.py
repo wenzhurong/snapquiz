@@ -1,6 +1,6 @@
 import unittest
 
-from snapquiz.config import Config, ConfigError, load_config
+from snapquiz.legacy_config import Config, ConfigError, load_config
 
 
 class LoadConfigTest(unittest.TestCase):
