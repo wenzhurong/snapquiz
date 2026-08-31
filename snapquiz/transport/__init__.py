@@ -1,4 +1,4 @@
-"""Authorized transport contracts; no network implementation exists in W08."""
+"""Authorized transport contracts; no network implementation exists yet."""
 
 from snapquiz.transport.session import (
     AUTHORIZED_SEND_SESSION_SCHEMA_VERSION,

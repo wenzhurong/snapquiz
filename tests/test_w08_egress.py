@@ -478,12 +478,22 @@ class EgressBindingFailureTest(unittest.TestCase):
             )
         self.assertEqual(ledger.safe_metadata()["approval_count"], 0)
 
-    def test_one_shot_consent_is_rejected_until_w09_lease_semantics_exist(self):
+    def test_one_shot_approval_does_not_consume_grant_before_session(self):
         base = make_w07_authorities(one_shot_consent=True)
         ledger = EgressApprovalLedger()
-        with self.assertRaises(EndpointPolicyError):
-            _approve(base, prepare_w08(base), ledger, FixedPreviewController())
-        self.assertEqual(ledger.safe_metadata()["approval_count"], 0)
+        approval = _approve(
+            base,
+            prepare_w08(base),
+            ledger,
+            FixedPreviewController(),
+        )
+        current = base.consent_ledger.snapshot_for_ids(
+            base.privacy.consent_grant_ids
+        )[0]
+        self.assertTrue(current.one_shot)
+        self.assertIsNone(current.consumed_at)
+        self.assertEqual(ledger.safe_metadata()["approval_count"], 1)
+        self.assertIsNone(approval.consumed_at)
 
     def test_gate_has_no_environment_file_sleep_or_network_side_effect(self):
         base = make_w07_authorities()

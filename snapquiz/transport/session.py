@@ -1,14 +1,15 @@
-"""Static, exact-envelope send-session authority for W08.
+"""Static, exact-envelope send-session authority for W08/W09-A.
 
-This module deliberately stops before every W09 responsibility.  It does not
-resolve credentials, construct a client, perform network I/O, track attempts,
-or invent deadline/budget/cancellation state.  It only consumes one exact
-``EgressApproval`` and freezes the authority that W09 must later honor.
+This module does not resolve credentials, construct a client, or perform
+network I/O.  It consumes one exact ``EgressApproval``, freezes the authority
+that the W09 runtime must honor, and atomically binds a one-shot consent use to
+the exact issued session when required.
 """
 from __future__ import annotations
 
 from datetime import datetime
 from threading import RLock
+from typing import Callable, TypeVar
 from uuid import UUID, uuid5
 
 from snapquiz.domain._validation import (
@@ -33,9 +34,11 @@ from snapquiz.domain.policy import ContractMarker
 from snapquiz.pipelines.contracts import StageInvocation
 from snapquiz.privacy.consent import (
     AuthorizationContext,
+    ConsentGrant,
     ConsentLedger,
     PrivacyGate,
     _ATOMIC_PRIVACY_AUTHORITY,
+    _CONSENT_SESSION_AUTHORITY,
 )
 from snapquiz.privacy.egress import (
     EGRESS_POLICY_VERSION,
@@ -51,12 +54,18 @@ AUTHORIZED_SEND_SESSION_SCHEMA_VERSION = "snapquiz.authorized-send-session.v1"
 SEND_SESSION_POLICY_VERSION = "snapquiz.send-session.static-w08.v1"
 
 _SESSION_LEDGER_AUTHORITY = object()
+_SESSION_ATTEMPT_AUTHORITY = object()
 _SESSION_UUID_NAMESPACE = UUID("29b51c62-11ea-5707-ad4d-12f7e2cb96c4")
+_T = TypeVar("_T")
 
 
-def _session_error(message: str) -> EndpointPolicyError:
+def _session_error(
+    message: str,
+    *,
+    stage: str = "send_session_factory",
+) -> EndpointPolicyError:
     return EndpointPolicyError(
-        stage="send_session_factory",
+        stage=stage,
         safe_message=message,
         retryable=False,
     )
@@ -222,6 +231,7 @@ class AuthorizedSendSession:
         "revoked_at",
         "session_terms_digest",
         "session_digest",
+        "_approval_ledger",
         "_session_ledger",
     )
 
@@ -310,6 +320,7 @@ class AuthorizedSendSession:
             ("issued_at", issued_at),
             ("valid_until", valid_until),
             ("revoked_at", None),
+            ("_approval_ledger", consumed_approval._approval_ledger),
             ("_session_ledger", session_ledger),
         )
         for name, value in values:
@@ -462,6 +473,8 @@ class AuthorizedSendSession:
 
     def validate_integrity(self) -> None:
         self._validate_fields()
+        if type(self._approval_ledger) is not EgressApprovalLedger:
+            raise ValueError("approval ledger authority changed")
         if type(self._session_ledger) is not SendSessionLedger:
             raise ValueError("session ledger authority changed")
         if self.session_id != _session_id_for(_session_identifier_payload(self)):
@@ -567,24 +580,164 @@ class SendSessionLedger:
     ) -> None:
         if _authority is not _SESSION_LEDGER_AUTHORITY:
             raise TypeError("send sessions can only be issued by SendSessionFactory")
+        self._validate_new_session(session)
+        with self._lock:
+            self._require_issue_slot_locked(session)
+            original_revision = self._revision
+            try:
+                self._publish_locked(session)
+            except BaseException:
+                try:
+                    self._rollback_publish_locked(
+                        session,
+                        original_revision=original_revision,
+                    )
+                except BaseException as rollback_error:
+                    raise _session_error(
+                        "发送会话无法安全回滚。"
+                    ) from rollback_error
+                raise
+
+    def _issue_with_one_shot_consent(
+        self,
+        session: AuthorizedSendSession,
+        *,
+        consent_ledger: ConsentLedger,
+        grant: ConsentGrant,
+        authorization: AuthorizationContext,
+        planned: PlannedExecution,
+        stage: ExecutionPlanStage,
+        consumed_at: datetime,
+        _authority: object | None = None,
+    ) -> AuthorizedSendSession:
+        """Publish one session and its one-shot consent lease atomically.
+
+        SendSessionFactory enters this method while the exact Consent and
+        Approval locks are already held.  This method acquires only the
+        Session lock, then invokes the fixed ConsentLedger transition; it does
+        not accept an arbitrary callback capable of changing the lock graph.
+        """
+
+        if _authority is not _SESSION_LEDGER_AUTHORITY:
+            raise TypeError("send sessions can only be issued by SendSessionFactory")
+        if type(consent_ledger) is not ConsentLedger:
+            raise TypeError("consent_ledger must be ConsentLedger")
+        if type(grant) is not ConsentGrant:
+            raise TypeError("grant must be ConsentGrant")
+        if type(authorization) is not AuthorizationContext:
+            raise TypeError("authorization must be AuthorizationContext")
+        if type(planned) is not PlannedExecution:
+            raise TypeError("planned must be PlannedExecution")
+        if type(stage) is not ExecutionPlanStage:
+            raise TypeError("stage must be ExecutionPlanStage")
+        require_aware_datetime(consumed_at, "consumed_at")
+        self._validate_new_session(session)
+        with self._lock:
+            self._require_issue_slot_locked(session)
+            original_session_revision = self._revision
+            original_consent_revision = consent_ledger._revision
+            try:
+                self._publish_locked(session)
+                consent_ledger._consume_for_session(
+                    grant=grant,
+                    authorization=authorization,
+                    planned=planned,
+                    stage=stage,
+                    session=session,
+                    session_ledger=self,
+                    consumed_at=consumed_at,
+                    _authority=_CONSENT_SESSION_AUTHORITY,
+                )
+            except BaseException:
+                rollback_error: BaseException | None = None
+                try:
+                    consent_ledger._rollback_session_use(
+                        original_grant=grant,
+                        session_id=session.session_id,
+                        original_revision=original_consent_revision,
+                        _authority=_CONSENT_SESSION_AUTHORITY,
+                    )
+                except BaseException as error:
+                    rollback_error = error
+                try:
+                    self._rollback_publish_locked(
+                        session,
+                        original_revision=original_session_revision,
+                    )
+                except BaseException as error:
+                    if rollback_error is None:
+                        rollback_error = error
+                if rollback_error is not None:
+                    raise _session_error(
+                        "发送会话与一次性同意事务无法安全回滚。"
+                    ) from rollback_error
+                raise
+            return session
+
+    @staticmethod
+    def _validate_new_session(session: AuthorizedSendSession) -> None:
         if type(session) is not AuthorizedSendSession:
             raise TypeError("session must be AuthorizedSendSession")
         try:
             session.validate_integrity()
         except (ValueError, TypeError, AttributeError) as error:
             raise _session_error("发送会话完整性校验失败。") from error
-        with self._lock:
-            if session._session_ledger is not self:
-                raise _session_error("发送会话不属于当前账本。")
-            if session.session_id in self._sessions:
-                raise _session_error("发送会话标识已存在。")
-            if session.approval_id in self._approval_ids:
-                raise _session_error("同一出站批准已经创建发送会话。")
-            self._sessions[session.session_id] = session
-            self._issued_terms[session.session_id] = session.session_terms_digest
-            self._current_digests[session.session_id] = session.session_digest
-            self._approval_ids[session.approval_id] = session.session_id
-            object.__setattr__(self, "_revision", self._revision + 1)
+
+    def _require_issue_slot_locked(
+        self,
+        session: AuthorizedSendSession,
+    ) -> None:
+        if session._session_ledger is not self:
+            raise _session_error("发送会话不属于当前账本。")
+        if session.session_id in self._sessions:
+            raise _session_error("发送会话标识已存在。")
+        if session.approval_id in self._approval_ids:
+            raise _session_error("同一出站批准已经创建发送会话。")
+
+    def _publish_locked(self, session: AuthorizedSendSession) -> None:
+        self._sessions[session.session_id] = session
+        self._issued_terms[session.session_id] = session.session_terms_digest
+        self._current_digests[session.session_id] = session.session_digest
+        self._approval_ids[session.approval_id] = session.session_id
+        object.__setattr__(self, "_revision", self._revision + 1)
+
+    def _rollback_publish_locked(
+        self,
+        session: AuthorizedSendSession,
+        *,
+        original_revision: int,
+    ) -> None:
+        expected_entries = (
+            (self._sessions, session.session_id, session),
+            (
+                self._issued_terms,
+                session.session_id,
+                session.session_terms_digest,
+            ),
+            (
+                self._current_digests,
+                session.session_id,
+                session.session_digest,
+            ),
+            (
+                self._approval_ids,
+                session.approval_id,
+                session.session_id,
+            ),
+        )
+        for mapping, key, expected in expected_entries:
+            current = mapping.get(key)
+            if current is not None and current != expected:
+                raise _session_error("发送会话临时事务状态已经变化。")
+        if self._revision not in (
+            original_revision,
+            original_revision + 1,
+        ):
+            raise _session_error("发送会话临时事务版本已经变化。")
+        for mapping, key, expected in reversed(expected_entries):
+            if mapping.get(key) == expected:
+                del mapping[key]
+        object.__setattr__(self, "_revision", original_revision)
 
     def _require_current_locked(self, session: AuthorizedSendSession) -> None:
         if type(session) is not AuthorizedSendSession:
@@ -627,6 +780,32 @@ class SendSessionLedger:
                 session.validate_active_at(now)
             except ValueError as error:
                 raise _session_error("发送会话当前不可用。") from error
+
+    def _run_active_action(
+        self,
+        *,
+        session: AuthorizedSendSession,
+        now: datetime,
+        action: Callable[[], _T],
+        _authority: object | None = None,
+    ) -> _T:
+        """Run W09 authority checks under the current session revision."""
+
+        if _authority is not _SESSION_ATTEMPT_AUTHORITY:
+            raise TypeError("session attempt checks require AttemptGate")
+        require_aware_datetime(now, "now")
+        if not callable(action):
+            raise TypeError("action must be callable")
+        with self._lock:
+            self._require_current_locked(session)
+            try:
+                session.validate_active_at(now)
+            except ValueError as error:
+                raise _session_error(
+                    "发送会话当前不可用于新 attempt。",
+                    stage="attempt_gate",
+                ) from error
+            return action()
 
     def revoke(
         self,
@@ -733,7 +912,7 @@ def _validate_approval_binding(
 
 @runtime_final
 class SendSessionFactory:
-    """Atomically consume one approval and issue one static W08 session."""
+    """Atomically consume one approval and issue one exact send session."""
 
     __slots__ = ()
 
@@ -770,6 +949,31 @@ class SendSessionFactory:
                 or type(operation) is not ExecutionPlanNetworkOperation
             ):
                 raise _session_error("冻结计划中的网络操作无效。")
+            grants = consent_ledger.snapshot_for_ids(
+                authorization.consent_grant_ids
+            )
+            matching_grants = tuple(
+                grant for grant in grants if grant.binding_id == stage.binding_id
+            )
+            if len(matching_grants) != 1:
+                raise _session_error("当前阶段没有唯一同意记录覆盖。")
+            matching_grant: ConsentGrant = matching_grants[0]
+            if any(grant.one_shot for grant in grants) and (
+                len(grants) != 1
+                or not matching_grant.one_shot
+                or len(
+                    tuple(
+                        candidate
+                        for candidate in planned.plan.stages
+                        if candidate.network_operations
+                    )
+                )
+                != 1
+                or len(stage.network_operations) != 1
+            ):
+                raise _session_error(
+                    "一次性同意暂不支持多阶段或多操作发送计划。"
+                )
             _validate_approval_binding(
                 approval=approval,
                 approval_ledger=approval_ledger,
@@ -799,11 +1003,23 @@ class SendSessionFactory:
                     session_ledger=session_ledger,
                     _authority=_EGRESS_SESSION_AUTHORITY,
                 )
-                session_ledger._issue(
+                if not matching_grant.one_shot:
+                    session_ledger._issue(
+                        session,
+                        _authority=_SESSION_LEDGER_AUTHORITY,
+                    )
+                    return session
+
+                return session_ledger._issue_with_one_shot_consent(
                     session,
+                    consent_ledger=consent_ledger,
+                    grant=matching_grant,
+                    authorization=authorization,
+                    planned=planned,
+                    stage=stage,
+                    consumed_at=now,
                     _authority=_SESSION_LEDGER_AUTHORITY,
                 )
-                return session
 
             return approval_ledger._consume_with(
                 approval=approval,

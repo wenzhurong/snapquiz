@@ -52,12 +52,20 @@ CONSENT_NETWORK_OPERATION_SCHEMA_VERSION = (
     "snapquiz.consent-network-operation.v1"
 )
 CONSENT_GRANT_SCHEMA_VERSION = "snapquiz.consent-grant.v1"
+CONSENT_USE_LEASE_SCHEMA_VERSION = "snapquiz.consent-use-lease.v1"
+CONSENT_USE_LEASE_POLICY_VERSION = "snapquiz.consent-use-lease.session-w09.v1"
 AUTHORIZATION_CONTEXT_SCHEMA_VERSION = "snapquiz.authorization-context.v1"
 
 _GRANT_AUTHORITY = object()
+_CONSENT_USE_LEASE_AUTHORITY = object()
+_CONSENT_SESSION_AUTHORITY = object()
+_CONSENT_ATTEMPT_AUTHORITY = object()
 _AUTHORIZATION_AUTHORITY = object()
 _ATOMIC_PRIVACY_AUTHORITY = object()
 _AUTHORIZATION_UUID_NAMESPACE = UUID("3f2f5b36-d01d-5094-bf86-0273671fe5dd")
+_CONSENT_USE_LEASE_UUID_NAMESPACE = UUID(
+    "17c23f1f-c6bb-5ae0-a0f7-bc8999d7b44c"
+)
 
 _T = TypeVar("_T")
 
@@ -79,6 +87,23 @@ def _short_digest(value: Digest256) -> str:
 
 def _marker_or_text_payload(value: str | ContractMarker) -> str:
     return value.value if isinstance(value, ContractMarker) else value
+
+
+def _digest_or_marker_payload(
+    value: Digest256 | ContractMarker,
+) -> object:
+    return value.value if isinstance(value, ContractMarker) else value
+
+
+def _require_digest_or_not_applicable(
+    value: Digest256 | ContractMarker,
+    name: str,
+) -> None:
+    if value is ContractMarker.NOT_APPLICABLE:
+        return
+    if isinstance(value, ContractMarker):
+        raise ValueError(f"{name} cannot be unknown")
+    require_digest(value, name)
 
 
 def _require_not_applicable_or_text(
@@ -438,6 +463,12 @@ class ConsentGrant:
                     raise ValueError(f"{name} cannot precede issued_at")
         if consumed_at is not None and not one_shot:
             raise ValueError("only one-shot grants can be consumed")
+        if (
+            consumed_at is not None
+            and revoked_at is not None
+            and revoked_at < consumed_at
+        ):
+            raise ValueError("revoked_at cannot precede consumed_at")
         if capture_scope_kind is CaptureScopeKind.FULL_SCREEN and (
             request_id is None or not one_shot
         ):
@@ -630,6 +661,460 @@ class ConsentGrant:
         )
 
 
+def _consent_use_lease_identifier_payload(
+    lease: "ConsentUseLease",
+) -> dict[str, object]:
+    return {
+        "policy_version": lease.policy_version,
+        "grant_id": lease.grant_id,
+        "grant_terms_digest": lease.grant_terms_digest,
+        "authorized_grant_digest": lease.authorized_grant_digest,
+        "consumed_grant_digest": lease.consumed_grant_digest,
+        "authorization_id": lease.authorization_id,
+        "authorization_digest": lease.authorization_digest,
+        "approval_id": lease.approval_id,
+        "approval_terms_digest": lease.approval_terms_digest,
+        "consumed_approval_digest": lease.consumed_approval_digest,
+        "session_id": lease.session_id,
+        "session_terms_digest": lease.session_terms_digest,
+        "session_digest": lease.session_digest,
+        "request_id": lease.request_id,
+        "plan_id": lease.plan_id,
+        "plan_digest": lease.plan_digest,
+        "planned_execution_digest": lease.planned_execution_digest,
+        "binding_id": lease.binding_id,
+        "provider_profile_id": lease.provider_profile_id,
+        "provider_profile_digest": lease.provider_profile_digest,
+        "stage_id": lease.stage_id,
+        "operation_id": lease.operation_id,
+        "invocation_id": lease.invocation_id,
+        "invocation_digest": lease.invocation_digest,
+        "capture_scope_fingerprint": _digest_or_marker_payload(
+            lease.capture_scope_fingerprint
+        ),
+        "credential_binding_digest": _digest_or_marker_payload(
+            lease.credential_binding_digest
+        ),
+        "request_envelope_digest": lease.request_envelope_digest,
+        "issued_at": lease.issued_at,
+        "valid_until": lease.valid_until,
+    }
+
+
+def _consent_use_lease_id_for(payload: dict[str, object]) -> UUID:
+    seed = digest256(
+        "ConsentUseLeaseIdentifier",
+        CONSENT_USE_LEASE_SCHEMA_VERSION,
+        payload,
+    )
+    return uuid5(_CONSENT_USE_LEASE_UUID_NAMESPACE, str(seed))
+
+
+def _consent_use_lease_terms_payload(
+    lease: "ConsentUseLease",
+) -> dict[str, object]:
+    return {
+        "lease_id": lease.lease_id,
+        **_consent_use_lease_identifier_payload(lease),
+    }
+
+
+@runtime_final
+class ConsentUseLease:
+    """Immutable authority binding one consumed grant to one send session.
+
+    A lease is useful only through its issuing ``ConsentLedger``.  It contains
+    no caller-controlled bypass bit: AttemptGate derives it from the exact
+    session object while the ConsentLedger lock is held.
+    """
+
+    __slots__ = (
+        "lease_id",
+        "policy_version",
+        "grant_id",
+        "grant_terms_digest",
+        "authorized_grant_digest",
+        "consumed_grant_digest",
+        "authorization_id",
+        "authorization_digest",
+        "approval_id",
+        "approval_terms_digest",
+        "consumed_approval_digest",
+        "session_id",
+        "session_terms_digest",
+        "session_digest",
+        "request_id",
+        "plan_id",
+        "plan_digest",
+        "planned_execution_digest",
+        "binding_id",
+        "provider_profile_id",
+        "provider_profile_digest",
+        "stage_id",
+        "operation_id",
+        "invocation_id",
+        "invocation_digest",
+        "capture_scope_fingerprint",
+        "credential_binding_digest",
+        "request_envelope_digest",
+        "issued_at",
+        "valid_until",
+        "lease_terms_digest",
+        "lease_digest",
+        "_authorized_grant",
+        "_consumed_grant",
+        "_authorization",
+        "_planned_execution",
+        "_session",
+        "_consent_ledger",
+        "_session_ledger",
+    )
+
+    def __init__(
+        self,
+        *,
+        authorized_grant: ConsentGrant,
+        consumed_grant: ConsentGrant,
+        authorization: "AuthorizationContext",
+        planned: PlannedExecution,
+        stage: ExecutionPlanStage,
+        session: "AuthorizedSendSession",
+        consent_ledger: "ConsentLedger",
+        session_ledger: "SendSessionLedger",
+        _authority: object | None = None,
+    ) -> None:
+        if _authority is not _CONSENT_USE_LEASE_AUTHORITY:
+            raise TypeError(
+                "ConsentUseLease can only be created by ConsentLedger"
+            )
+        if type(authorized_grant) is not ConsentGrant:
+            raise TypeError("authorized_grant must be ConsentGrant")
+        if type(consumed_grant) is not ConsentGrant:
+            raise TypeError("consumed_grant must be ConsentGrant")
+        if type(authorization) is not AuthorizationContext:
+            raise TypeError("authorization must be AuthorizationContext")
+        if type(planned) is not PlannedExecution:
+            raise TypeError("planned must be PlannedExecution")
+        if type(stage) is not ExecutionPlanStage:
+            raise TypeError("stage must be ExecutionPlanStage")
+        if type(consent_ledger) is not ConsentLedger:
+            raise TypeError("consent_ledger must be ConsentLedger")
+        try:
+            session.validate_integrity()
+        except (ValueError, TypeError, AttributeError) as error:
+            raise TypeError("session must be trusted session authority") from error
+        if getattr(session, "_session_ledger", None) is not session_ledger:
+            raise TypeError("session_ledger must own the exact session")
+
+        values = (
+            ("policy_version", CONSENT_USE_LEASE_POLICY_VERSION),
+            ("grant_id", authorized_grant.grant_id),
+            ("grant_terms_digest", authorized_grant.grant_terms_digest),
+            ("authorized_grant_digest", authorized_grant.grant_digest),
+            ("consumed_grant_digest", consumed_grant.grant_digest),
+            ("authorization_id", authorization.authorization_id),
+            ("authorization_digest", authorization.authorization_digest),
+            ("approval_id", session.approval_id),
+            ("approval_terms_digest", session.approval_terms_digest),
+            (
+                "consumed_approval_digest",
+                session.consumed_approval_digest,
+            ),
+            ("session_id", session.session_id),
+            ("session_terms_digest", session.session_terms_digest),
+            ("session_digest", session.session_digest),
+            ("request_id", session.request_id),
+            ("plan_id", session.plan_id),
+            ("plan_digest", session.plan_digest),
+            (
+                "planned_execution_digest",
+                session.planned_execution_digest,
+            ),
+            ("binding_id", stage.binding_id),
+            ("provider_profile_id", stage.provider_profile_id),
+            ("provider_profile_digest", stage.provider_profile_digest),
+            ("stage_id", session.stage_id),
+            ("operation_id", session.operation_id),
+            ("invocation_id", session.invocation_id),
+            ("invocation_digest", session.invocation_digest),
+            (
+                "capture_scope_fingerprint",
+                session.capture_scope_fingerprint,
+            ),
+            (
+                "credential_binding_digest",
+                session.credential_binding_digest,
+            ),
+            ("request_envelope_digest", session.request_envelope_digest),
+            ("issued_at", session.issued_at),
+            ("valid_until", session.valid_until),
+            ("_authorized_grant", authorized_grant),
+            ("_consumed_grant", consumed_grant),
+            ("_authorization", authorization),
+            ("_planned_execution", planned),
+            ("_session", session),
+            ("_consent_ledger", consent_ledger),
+            ("_session_ledger", session_ledger),
+        )
+        for name, value in values:
+            object.__setattr__(self, name, value)
+        object.__setattr__(
+            self,
+            "lease_id",
+            _consent_use_lease_id_for(
+                _consent_use_lease_identifier_payload(self)
+            ),
+        )
+        object.__setattr__(
+            self,
+            "lease_terms_digest",
+            digest256(
+                "ConsentUseLeaseTerms",
+                CONSENT_USE_LEASE_SCHEMA_VERSION,
+                _consent_use_lease_terms_payload(self),
+            ),
+        )
+        object.__setattr__(
+            self,
+            "lease_digest",
+            digest256(
+                "ConsentUseLease",
+                CONSENT_USE_LEASE_SCHEMA_VERSION,
+                {"lease_terms_digest": self.lease_terms_digest},
+            ),
+        )
+        self.validate_integrity()
+
+    def __setattr__(self, name: str, value: object) -> None:
+        del name, value
+        raise AttributeError("ConsentUseLease is immutable")
+
+    def __deepcopy__(self, memo: dict[int, object]) -> "ConsentUseLease":
+        del memo
+        return self
+
+    def __repr__(self) -> str:
+        return (
+            "ConsentUseLease("
+            f"lease_id={self.lease_id!r}, grant_id={self.grant_id!r}, "
+            f"session_id={self.session_id!r}, valid_until={self.valid_until!r})"
+        )
+
+    def safe_metadata(self) -> dict[str, object]:
+        return {
+            "lease_id": str(self.lease_id),
+            "grant_id": str(self.grant_id),
+            "session_id": str(self.session_id),
+            "binding_id": self.binding_id,
+            "provider_profile_id": self.provider_profile_id,
+            "issued_at": self.issued_at,
+            "valid_until": self.valid_until,
+            "lease_digest_prefix": _short_digest(self.lease_digest),
+        }
+
+    def validate_integrity(self) -> None:
+        for name in (
+            "lease_id",
+            "grant_id",
+            "authorization_id",
+            "approval_id",
+            "session_id",
+            "request_id",
+            "plan_id",
+            "stage_id",
+            "operation_id",
+            "invocation_id",
+        ):
+            require_uuid(getattr(self, name), name)
+        for name in (
+            "grant_terms_digest",
+            "authorized_grant_digest",
+            "consumed_grant_digest",
+            "authorization_digest",
+            "approval_terms_digest",
+            "consumed_approval_digest",
+            "session_terms_digest",
+            "session_digest",
+            "plan_digest",
+            "planned_execution_digest",
+            "provider_profile_digest",
+            "invocation_digest",
+            "request_envelope_digest",
+            "lease_terms_digest",
+            "lease_digest",
+        ):
+            require_digest(getattr(self, name), name)
+        if self.policy_version != CONSENT_USE_LEASE_POLICY_VERSION:
+            raise ValueError("unsupported consent-use lease policy")
+        require_text(self.binding_id, "binding_id", max_length=512)
+        require_text(
+            self.provider_profile_id,
+            "provider_profile_id",
+            max_length=512,
+        )
+        _require_digest_or_not_applicable(
+            self.capture_scope_fingerprint,
+            "capture_scope_fingerprint",
+        )
+        _require_digest_or_not_applicable(
+            self.credential_binding_digest,
+            "credential_binding_digest",
+        )
+        require_aware_datetime(self.issued_at, "issued_at")
+        require_aware_datetime(self.valid_until, "valid_until")
+        if self.valid_until <= self.issued_at:
+            raise ValueError("consent-use lease must have positive lifetime")
+        if type(self._authorized_grant) is not ConsentGrant:
+            raise ValueError("consent-use lease grant authority changed")
+        if type(self._consumed_grant) is not ConsentGrant:
+            raise ValueError("consent-use lease consumed revision changed")
+        if type(self._authorization) is not AuthorizationContext:
+            raise ValueError("consent-use lease authorization changed")
+        if type(self._planned_execution) is not PlannedExecution:
+            raise ValueError("consent-use lease plan authority changed")
+        if type(self._consent_ledger) is not ConsentLedger:
+            raise ValueError("consent-use lease ledger authority changed")
+
+        grant = self._authorized_grant
+        consumed = self._consumed_grant
+        authorization = self._authorization
+        planned = self._planned_execution
+        session = self._session
+        if getattr(session, "_session_ledger", None) is not self._session_ledger:
+            raise ValueError("consent-use lease session ledger changed")
+        grant.validate_integrity()
+        consumed.validate_integrity()
+        authorization.validate_integrity()
+        planned.validate_integrity()
+        session.validate_integrity()
+        stage = next(
+            (
+                candidate
+                for candidate in planned.plan.stages
+                if candidate.stage_id == session.stage_id
+            ),
+            None,
+        )
+        operation = None if stage is None else next(
+            (
+                candidate
+                for candidate in stage.network_operations
+                if candidate.operation_id == session.operation_id
+            ),
+            None,
+        )
+        authorization_pairs = dict(
+            zip(
+                authorization.consent_grant_ids,
+                authorization.consent_grant_digests,
+            )
+        )
+        network_stages = tuple(
+            candidate
+            for candidate in planned.plan.stages
+            if candidate.network_operations
+        )
+        if (
+            stage is None
+            or operation is None
+            or len(network_stages) != 1
+            or network_stages[0] is not stage
+            or len(stage.network_operations) != 1
+            or len(authorization.consent_grant_ids) != 1
+            or not grant.one_shot
+            or grant.consumed_at is not None
+            or grant.revoked_at is not None
+            or consumed.grant_id != grant.grant_id
+            or consumed.grant_terms_digest != grant.grant_terms_digest
+            or not consumed.one_shot
+            or consumed.consumed_at != session.issued_at
+            or consumed.revoked_at is not None
+            or authorization._consent_ledger is not self._consent_ledger
+            or session._session_ledger is not self._session_ledger
+            or session.request_id != planned.plan.request_id
+            or session.plan_id != planned.plan.plan_id
+            or session.plan_digest != planned.plan.plan_digest
+            or session.planned_execution_digest
+            != planned.planned_execution_digest
+            or session.privacy_authorization_id
+            != authorization.authorization_id
+            or session.privacy_authorization_digest
+            != authorization.authorization_digest
+            or session.valid_until > (
+                authorization.valid_until or session.valid_until
+            )
+            or (
+                grant.expires_at is not None
+                and session.valid_until > grant.expires_at
+            )
+            or authorization_pairs.get(grant.grant_id)
+            != grant.grant_digest
+            or not _grant_covers_stage(
+                grant,
+                planned=planned,
+                stage=stage,
+            )
+            or self.grant_id != grant.grant_id
+            or self.grant_terms_digest != grant.grant_terms_digest
+            or self.authorized_grant_digest != grant.grant_digest
+            or self.consumed_grant_digest != consumed.grant_digest
+            or self.authorization_id != authorization.authorization_id
+            or self.authorization_digest != authorization.authorization_digest
+            or self.approval_id != session.approval_id
+            or self.approval_terms_digest != session.approval_terms_digest
+            or self.consumed_approval_digest
+            != session.consumed_approval_digest
+            or self.session_id != session.session_id
+            or self.session_terms_digest != session.session_terms_digest
+            or self.session_digest != session.session_digest
+            or self.request_id != session.request_id
+            or self.plan_id != session.plan_id
+            or self.plan_digest != session.plan_digest
+            or self.planned_execution_digest
+            != session.planned_execution_digest
+            or self.binding_id != stage.binding_id
+            or self.provider_profile_id != stage.provider_profile_id
+            or self.provider_profile_digest
+            != stage.provider_profile_digest
+            or self.stage_id != stage.stage_id
+            or self.operation_id != operation.operation_id
+            or self.invocation_id != session.invocation_id
+            or self.invocation_digest != session.invocation_digest
+            or self.capture_scope_fingerprint
+            != session.capture_scope_fingerprint
+            or self.credential_binding_digest
+            != session.credential_binding_digest
+            or self.request_envelope_digest
+            != session.request_envelope_digest
+            or self.issued_at != session.issued_at
+            or self.valid_until != session.valid_until
+            or self.lease_id
+            != _consent_use_lease_id_for(
+                _consent_use_lease_identifier_payload(self)
+            )
+            or self.lease_terms_digest
+            != digest256(
+                "ConsentUseLeaseTerms",
+                CONSENT_USE_LEASE_SCHEMA_VERSION,
+                _consent_use_lease_terms_payload(self),
+            )
+            or self.lease_digest
+            != digest256(
+                "ConsentUseLease",
+                CONSENT_USE_LEASE_SCHEMA_VERSION,
+                {"lease_terms_digest": self.lease_terms_digest},
+            )
+        ):
+            raise ValueError("consent-use lease binding changed")
+
+        try:
+            grant.validate_active_at(self.issued_at)
+        except ValueError as error:
+            raise ValueError(
+                "consent-use lease was not issued from an active grant"
+            ) from error
+
+
 @runtime_final
 class ConsentLedger:
     """Thread-safe in-memory authority for immutable grant revisions."""
@@ -639,6 +1124,10 @@ class ConsentLedger:
         "_grants",
         "_issued_terms",
         "_current_grant_digests",
+        "_use_leases",
+        "_issued_use_lease_digests",
+        "_use_lease_by_grant",
+        "_use_lease_by_session",
         "_revision",
     )
 
@@ -647,6 +1136,10 @@ class ConsentLedger:
         object.__setattr__(self, "_grants", {})
         object.__setattr__(self, "_issued_terms", {})
         object.__setattr__(self, "_current_grant_digests", {})
+        object.__setattr__(self, "_use_leases", {})
+        object.__setattr__(self, "_issued_use_lease_digests", {})
+        object.__setattr__(self, "_use_lease_by_grant", {})
+        object.__setattr__(self, "_use_lease_by_session", {})
         object.__setattr__(self, "_revision", 0)
 
     def safe_metadata(self) -> dict[str, int]:
@@ -654,6 +1147,7 @@ class ConsentLedger:
             return {
                 "revision": self._revision,
                 "grant_count": len(self._grants),
+                "use_lease_count": len(self._use_leases),
             }
 
     def issue_for_plan(
@@ -807,10 +1301,15 @@ class ConsentLedger:
             )
             if current.revoked_at is not None:
                 raise _privacy_error("同意记录已经撤销。")
-            replacement = current._with_status(
-                consumed_at=current.consumed_at,
-                revoked_at=revoked_at,
-            )
+            try:
+                replacement = current._with_status(
+                    consumed_at=current.consumed_at,
+                    revoked_at=revoked_at,
+                )
+            except ValueError as error:
+                raise _privacy_error(
+                    "同意记录撤销时间与当前状态不一致。"
+                ) from error
             self._grants[grant_id] = replacement
             self._current_grant_digests[grant_id] = replacement.grant_digest
             object.__setattr__(self, "_revision", self._revision + 1)
@@ -841,6 +1340,451 @@ class ConsentLedger:
             self._current_grant_digests[grant_id] = replacement.grant_digest
             object.__setattr__(self, "_revision", self._revision + 1)
             return replacement
+
+    def _consume_for_session(
+        self,
+        *,
+        grant: ConsentGrant,
+        authorization: "AuthorizationContext",
+        planned: PlannedExecution,
+        stage: ExecutionPlanStage,
+        session: "AuthorizedSendSession",
+        session_ledger: "SendSessionLedger",
+        consumed_at: datetime,
+        _authority: object | None = None,
+    ) -> ConsentUseLease:
+        """Commit a one-shot grant revision and its exact session lease.
+
+        SendSessionFactory calls this only while Consent, Approval and Session
+        locks are already held in that order.  The local snapshot makes every
+        ConsentLedger write rollback-capable; the caller owns the matching
+        SessionLedger rollback and deliberately never restores the approval.
+        """
+
+        if _authority is not _CONSENT_SESSION_AUTHORITY:
+            raise TypeError(
+                "session consent use requires SendSessionFactory"
+            )
+        require_aware_datetime(consumed_at, "consumed_at")
+        if type(grant) is not ConsentGrant:
+            raise TypeError("grant must be ConsentGrant")
+        if type(authorization) is not AuthorizationContext:
+            raise TypeError("authorization must be AuthorizationContext")
+        if type(planned) is not PlannedExecution:
+            raise TypeError("planned must be PlannedExecution")
+        if type(stage) is not ExecutionPlanStage:
+            raise TypeError("stage must be ExecutionPlanStage")
+        try:
+            session.validate_integrity()
+        except (ValueError, TypeError, AttributeError) as error:
+            raise TypeError("session must be trusted session authority") from error
+        if getattr(session, "_session_ledger", None) is not session_ledger:
+            raise TypeError("session_ledger must own the exact session")
+
+        with self._lock:
+            self._validate_issued_terms(
+                grant,
+                expected_grant_id=grant.grant_id,
+            )
+            network_stages = tuple(
+                candidate
+                for candidate in planned.plan.stages
+                if candidate.network_operations
+            )
+            if (
+                authorization._consent_ledger is not self
+                or session._session_ledger is not session_ledger
+                or len(network_stages) != 1
+                or network_stages[0] is not stage
+                or len(stage.network_operations) != 1
+                or len(authorization.consent_grant_ids) != 1
+                or authorization.consent_grant_ids != (grant.grant_id,)
+                or authorization.consent_grant_digests
+                != (grant.grant_digest,)
+                or not grant.one_shot
+                or not _grant_covers_stage(
+                    grant,
+                    planned=planned,
+                    stage=stage,
+                )
+                or session.stage_id != stage.stage_id
+                or session.operation_id
+                != stage.network_operations[0].operation_id
+                or session.issued_at != consumed_at
+                or session.privacy_authorization_id
+                != authorization.authorization_id
+                or session.privacy_authorization_digest
+                != authorization.authorization_digest
+                or grant.grant_id in self._use_lease_by_grant
+                or session.session_id in self._use_lease_by_session
+            ):
+                raise _privacy_error(
+                    "一次性同意不能绑定当前发送会话。"
+                )
+            try:
+                grant.validate_active_at(consumed_at)
+            except ValueError as error:
+                raise _privacy_error(
+                    "one-shot 同意记录当前不可用于发送会话。"
+                ) from error
+
+            consumed = grant._with_status(
+                consumed_at=consumed_at,
+                revoked_at=None,
+            )
+            lease = ConsentUseLease(
+                authorized_grant=grant,
+                consumed_grant=consumed,
+                authorization=authorization,
+                planned=planned,
+                stage=stage,
+                session=session,
+                consent_ledger=self,
+                session_ledger=session_ledger,
+                _authority=_CONSENT_USE_LEASE_AUTHORITY,
+            )
+            if lease.lease_id in self._use_leases:
+                raise _privacy_error("同意使用租约标识已经存在。")
+
+            old_revision = self._revision
+            old_grant = self._grants[grant.grant_id]
+            old_grant_digest = self._current_grant_digests[grant.grant_id]
+            try:
+                self._grants[grant.grant_id] = consumed
+                self._current_grant_digests[
+                    grant.grant_id
+                ] = consumed.grant_digest
+                self._use_leases[lease.lease_id] = lease
+                self._issued_use_lease_digests[
+                    lease.lease_id
+                ] = lease.lease_digest
+                self._use_lease_by_grant[grant.grant_id] = lease.lease_id
+                self._use_lease_by_session[
+                    session.session_id
+                ] = lease.lease_id
+                object.__setattr__(self, "_revision", old_revision + 1)
+            except BaseException:
+                self._grants[grant.grant_id] = old_grant
+                self._current_grant_digests[
+                    grant.grant_id
+                ] = old_grant_digest
+                self._use_leases.pop(lease.lease_id, None)
+                self._issued_use_lease_digests.pop(lease.lease_id, None)
+                if self._use_lease_by_grant.get(grant.grant_id) == lease.lease_id:
+                    del self._use_lease_by_grant[grant.grant_id]
+                if (
+                    self._use_lease_by_session.get(session.session_id)
+                    == lease.lease_id
+                ):
+                    del self._use_lease_by_session[session.session_id]
+                object.__setattr__(self, "_revision", old_revision)
+                raise
+            return lease
+
+    def _require_current_use_lease_locked(
+        self,
+        *,
+        lease: ConsentUseLease,
+        authorization: "AuthorizationContext",
+        planned: PlannedExecution,
+        session: "AuthorizedSendSession",
+        now: datetime,
+    ) -> ConsentGrant:
+        require_aware_datetime(now, "now")
+        valid = type(lease) is ConsentUseLease
+        if valid:
+            try:
+                lease.validate_integrity()
+            except (ValueError, TypeError, AttributeError):
+                valid = False
+        current = self._grants.get(lease.grant_id) if valid else None
+        if (
+            not valid
+            or type(current) is not ConsentGrant
+            or lease._consent_ledger is not self
+            or lease._authorization is not authorization
+            or lease._planned_execution is not planned
+            or lease._session is not session
+            or lease._session_ledger is not session._session_ledger
+            or self._use_leases.get(lease.lease_id) is not lease
+            or self._issued_use_lease_digests.get(lease.lease_id)
+            != lease.lease_digest
+            or self._use_lease_by_grant.get(lease.grant_id)
+            != lease.lease_id
+            or self._use_lease_by_session.get(lease.session_id)
+            != lease.lease_id
+            or current is not lease._consumed_grant
+            or current.grant_terms_digest != lease.grant_terms_digest
+            or current.grant_digest != lease.consumed_grant_digest
+            or current.consumed_at != lease.issued_at
+            or current.revoked_at is not None
+            or now < lease.issued_at
+            or now >= lease.valid_until
+        ):
+            raise _privacy_error(
+                "发送会话引用的一次性同意使用租约已经失效。"
+            )
+        try:
+            current.validate_integrity()
+            if current.expires_at is not None and now >= current.expires_at:
+                raise ValueError("consumed grant expired")
+            if now < current.issued_at:
+                raise ValueError("consumed grant is not active yet")
+            for name, policy in (
+                ("retention policy", current.retention_policy),
+                ("data policy", current.data_policy),
+                ("cost policy", current.cost_policy),
+            ):
+                validate_policy_value_at(policy, now, name=name)
+        except ValueError as error:
+            raise _privacy_error(
+                "发送会话引用的一次性同意条款已经失效。"
+            ) from error
+        return current
+
+    def _rollback_session_use(
+        self,
+        *,
+        original_grant: ConsentGrant,
+        session_id: UUID,
+        original_revision: int,
+        _authority: object | None = None,
+    ) -> None:
+        """Restore an unpublished lease transaction after factory failure."""
+
+        if _authority is not _CONSENT_SESSION_AUTHORITY:
+            raise TypeError(
+                "session consent rollback requires SendSessionFactory"
+            )
+        if type(original_grant) is not ConsentGrant:
+            raise TypeError("original_grant must be ConsentGrant")
+        require_uuid(session_id, "session_id")
+        if type(original_revision) is not int or original_revision < 0:
+            raise ValueError("original_revision must be a non-negative int")
+        with self._lock:
+            lease_id = self._use_lease_by_session.get(session_id)
+            if lease_id is None:
+                current = self._grants.get(original_grant.grant_id)
+                if current is not original_grant or self._revision != original_revision:
+                    raise _privacy_error(
+                        "失败的同意租约事务无法安全回滚。"
+                    )
+                return
+            lease = self._use_leases.get(lease_id)
+            if (
+                type(lease) is not ConsentUseLease
+                or lease.grant_id != original_grant.grant_id
+                or lease.session_id != session_id
+                or self._use_lease_by_grant.get(original_grant.grant_id)
+                != lease_id
+                or self._grants.get(original_grant.grant_id)
+                is not lease._consumed_grant
+                or self._revision != original_revision + 1
+            ):
+                raise _privacy_error(
+                    "失败的同意租约事务状态已经变化，不能回滚。"
+                )
+            self._grants[original_grant.grant_id] = original_grant
+            self._current_grant_digests[
+                original_grant.grant_id
+            ] = original_grant.grant_digest
+            del self._use_lease_by_session[session_id]
+            del self._use_lease_by_grant[original_grant.grant_id]
+            del self._issued_use_lease_digests[lease_id]
+            del self._use_leases[lease_id]
+            object.__setattr__(self, "_revision", original_revision)
+
+    def snapshot_use_lease_for_session(
+        self,
+        session_id: UUID,
+    ) -> ConsentUseLease:
+        """Return a read-only lease proof; this does not authorize an attempt."""
+
+        require_uuid(session_id, "session_id")
+        with self._lock:
+            lease_id = self._use_lease_by_session.get(session_id)
+            lease = self._use_leases.get(lease_id)
+            if type(lease) is not ConsentUseLease:
+                raise _privacy_error("发送会话没有一次性同意使用租约。")
+            try:
+                lease.validate_integrity()
+            except (ValueError, TypeError, AttributeError) as error:
+                raise _privacy_error("同意使用租约完整性校验失败。") from error
+            if (
+                lease.session_id != session_id
+                or self._use_lease_by_session.get(lease.session_id)
+                != lease.lease_id
+                or self._issued_use_lease_digests.get(lease.lease_id)
+                != lease.lease_digest
+                or self._use_lease_by_grant.get(lease.grant_id)
+                != lease.lease_id
+            ):
+                raise _privacy_error("同意使用租约账本映射已经变化。")
+            return lease
+
+    def _validate_authorization_for_session_locked(
+        self,
+        *,
+        planned: PlannedExecution,
+        authorization: "AuthorizationContext",
+        session: "AuthorizedSendSession",
+        now: datetime,
+    ) -> None:
+        if type(planned) is not PlannedExecution:
+            raise TypeError("planned must be PlannedExecution")
+        if type(authorization) is not AuthorizationContext:
+            raise TypeError("authorization must be AuthorizationContext")
+        require_aware_datetime(now, "now")
+        try:
+            planned.validate_integrity()
+            authorization.validate_integrity()
+            session.validate_integrity()
+        except (ValueError, TypeError, AttributeError) as error:
+            raise _privacy_error(
+                "发送会话隐私授权完整性校验失败。"
+            ) from error
+        if (
+            authorization._consent_ledger is not self
+            or authorization.plan_id != planned.plan.plan_id
+            or authorization.plan_digest != planned.plan.plan_digest
+            or authorization.planned_execution_digest
+            != planned.planned_execution_digest
+            or session.request_id != planned.plan.request_id
+            or session.plan_id != planned.plan.plan_id
+            or session.plan_digest != planned.plan.plan_digest
+            or session.planned_execution_digest
+            != planned.planned_execution_digest
+            or session.privacy_authorization_id
+            != authorization.authorization_id
+            or session.privacy_authorization_digest
+            != authorization.authorization_digest
+            or now < authorization.authorized_at
+            or (
+                authorization.valid_until is not None
+                and now >= authorization.valid_until
+            )
+        ):
+            raise _privacy_error("发送会话未绑定当前隐私授权。")
+
+        grants: list[ConsentGrant] = []
+        authorized_digests: dict[UUID, Digest256] = {}
+        active_leases: dict[UUID, ConsentUseLease] = {}
+        for grant_id, authorized_digest in zip(
+            authorization.consent_grant_ids,
+            authorization.consent_grant_digests,
+        ):
+            current = self._grants.get(grant_id)
+            if current is None:
+                raise _privacy_error("隐私授权引用的同意记录不存在。")
+            self._validate_issued_terms(
+                current,
+                expected_grant_id=grant_id,
+            )
+            authorized_digests[grant_id] = authorized_digest
+            if current.one_shot and current.consumed_at is not None:
+                lease_id = self._use_lease_by_grant.get(grant_id)
+                lease = self._use_leases.get(lease_id)
+                if type(lease) is not ConsentUseLease:
+                    raise _privacy_error(
+                        "已消费的一次性同意没有发送会话租约。"
+                    )
+                self._require_current_use_lease_locked(
+                    lease=lease,
+                    authorization=authorization,
+                    planned=planned,
+                    session=session,
+                    now=now,
+                )
+                if lease.authorized_grant_digest != authorized_digest:
+                    raise _privacy_error("一次性同意租约未绑定原授权版本。")
+                active_leases[grant_id] = lease
+            else:
+                try:
+                    current.validate_active_at(now)
+                except ValueError as error:
+                    raise _privacy_error("同意记录当前不可用。") from error
+                if current.grant_digest != authorized_digest:
+                    raise _privacy_error("同意记录版本与隐私授权不一致。")
+            grants.append(current)
+
+        network_stages = tuple(
+            stage for stage in planned.plan.stages if stage.network_operations
+        )
+        unmatched = list(grants)
+        matching_for_session: ConsentGrant | None = None
+        for stage in network_stages:
+            matches = [
+                grant
+                for grant in unmatched
+                if _grant_covers_stage(grant, planned=planned, stage=stage)
+            ]
+            if len(matches) != 1:
+                raise _privacy_error()
+            matching = matches[0]
+            unmatched.remove(matching)
+            if stage.stage_id == session.stage_id:
+                matching_for_session = matching
+        if unmatched or matching_for_session is None:
+            raise _privacy_error("发送会话没有唯一同意记录覆盖。")
+        if matching_for_session.one_shot:
+            lease = active_leases.get(matching_for_session.grant_id)
+            if lease is None or lease._session is not session:
+                raise _privacy_error(
+                    "一次性同意没有绑定当前发送会话。"
+                )
+            if (
+                len(network_stages) != 1
+                or len(network_stages[0].network_operations) != 1
+                or len(grants) != 1
+            ):
+                raise _privacy_error(
+                    "一次性同意暂不支持多阶段或多操作计划。"
+                )
+        elif session.session_id in self._use_lease_by_session:
+            raise _privacy_error("持久同意的发送会话不能附加一次性租约。")
+
+        expected_pairs = tuple(
+            sorted(
+                authorized_digests.items(),
+                key=lambda pair: str(pair[0]),
+            )
+        )
+        if (
+            tuple(pair[0] for pair in expected_pairs)
+            != authorization.consent_grant_ids
+            or tuple(pair[1] for pair in expected_pairs)
+            != authorization.consent_grant_digests
+        ):
+            raise _privacy_error("发送会话隐私授权引用已经变化。")
+        expiries = _policy_expiries(planned, tuple(grants))
+        expected_valid_until = min(expiries) if expiries else None
+        if expected_valid_until != authorization.valid_until:
+            raise _privacy_error("发送会话隐私授权有效期已经变化。")
+
+    def _run_session_authorized_action(
+        self,
+        *,
+        planned: PlannedExecution,
+        authorization: "AuthorizationContext",
+        session: "AuthorizedSendSession",
+        now: datetime,
+        action: Callable[[], _T],
+        _authority: object | None = None,
+    ) -> _T:
+        """Run one AttemptGate step under persistent or leased consent."""
+
+        if _authority is not _CONSENT_ATTEMPT_AUTHORITY:
+            raise TypeError("session consent checks require AttemptGate")
+        if not callable(action):
+            raise TypeError("action must be callable")
+        with self._lock:
+            self._validate_authorization_for_session_locked(
+                planned=planned,
+                authorization=authorization,
+                session=session,
+                now=now,
+            )
+            return action()
 
 
 def _authorization_payload(context: "AuthorizationContext") -> dict[str, object]:
@@ -1323,10 +2267,13 @@ __all__ = [
     "CONSENT_GRANT_SCHEMA_VERSION",
     "CONSENT_NETWORK_OPERATION_SCHEMA_VERSION",
     "CONSENT_POLICY_VERSION",
+    "CONSENT_USE_LEASE_POLICY_VERSION",
+    "CONSENT_USE_LEASE_SCHEMA_VERSION",
     "AuthorizationContext",
     "ConsentGrant",
     "ConsentLedger",
     "ConsentNetworkOperation",
+    "ConsentUseLease",
     "PrivacyGate",
     "UnknownPolicyDimension",
 ]

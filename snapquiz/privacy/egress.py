@@ -49,6 +49,7 @@ _PREVIEW_DECISION_AUTHORITY = object()
 _APPROVAL_AUTHORITY = object()
 _APPROVAL_LEDGER_AUTHORITY = object()
 _EGRESS_SESSION_AUTHORITY = object()
+_EGRESS_ATTEMPT_AUTHORITY = object()
 _EGRESS_UUID_NAMESPACE = UUID("d0ac6789-4649-5e0f-8e80-30057112354a")
 _T = TypeVar("_T")
 
@@ -1005,6 +1006,50 @@ class EgressApprovalLedger:
             object.__setattr__(self, "_revision", self._revision + 1)
             return action(consumed)
 
+    def _run_consumed_action(
+        self,
+        *,
+        approval_id: UUID,
+        approval_terms_digest: Digest256,
+        consumed_approval_digest: Digest256,
+        consumed_at: datetime,
+        now: datetime,
+        action: Callable[[], _T],
+        _authority: object | None = None,
+    ) -> _T:
+        """Run W09 authority checks under the consumed approval revision."""
+
+        if _authority is not _EGRESS_ATTEMPT_AUTHORITY:
+            raise TypeError("consumed approval checks require AttemptGate")
+        require_uuid(approval_id, "approval_id")
+        require_digest(approval_terms_digest, "approval_terms_digest")
+        require_digest(consumed_approval_digest, "consumed_approval_digest")
+        require_aware_datetime(consumed_at, "consumed_at")
+        require_aware_datetime(now, "now")
+        if not callable(action):
+            raise TypeError("action must be callable")
+        with self._lock:
+            current = self._approvals.get(approval_id)
+            if current is None:
+                raise _egress_error(
+                    "发送会话引用的出站批准不存在。",
+                    stage="attempt_gate",
+                )
+            self._require_current_locked(current)
+            if (
+                current.approval_terms_digest != approval_terms_digest
+                or current.approval_digest != consumed_approval_digest
+                or current.consumed_at != consumed_at
+                or current.revoked_at is not None
+                or now < current.approved_at
+                or now >= current.expires_at
+            ):
+                raise _egress_error(
+                    "发送会话引用的出站批准状态已经失效。",
+                    stage="attempt_gate",
+                )
+            return action()
+
     def safe_metadata(self) -> dict[str, int]:
         with self._lock:
             return {
@@ -1014,7 +1059,7 @@ class EgressApprovalLedger:
             }
 
 
-def _validate_exact_egress_binding(
+def _validate_exact_egress_binding_core(
     *,
     planned: PlannedExecution,
     invocation: StageInvocation,
@@ -1041,12 +1086,6 @@ def _validate_exact_egress_binding(
         planned.validate_integrity()
         invocation.validate_integrity()
         validate_prepared_outbound_against_plan(prepared, planned.plan)
-        PrivacyGate().validate_authorization(
-            planned=planned,
-            authorization=authorization,
-            ledger=consent_ledger,
-            now=now,
-        )
         # W08 Phase 1 is deliberately tied to the one frozen pass-through
         # Adapter.  PreparedOutbound is a public immutable value object, so its
         # self-consistent digests and source claims are not provenance by
@@ -1108,15 +1147,80 @@ def _validate_exact_egress_binding(
         raise
     except (ValueError, TypeError, AttributeError) as error:
         raise _egress_error("无法复核当前同意记录。") from error
-    if any(grant.one_shot for grant in grants):
-        raise _egress_error("W08 尚不支持一次性同意记录的会话租约。")
     matching_grants = tuple(grant for grant in grants if grant.binding_id == stage.binding_id)
     if len(matching_grants) != 1:
         raise _egress_error("当前网络阶段没有唯一同意记录覆盖。")
+    if any(grant.one_shot for grant in grants):
+        network_stages = tuple(
+            candidate
+            for candidate in planned.plan.stages
+            if candidate.network_operations
+        )
+        if (
+            len(grants) != 1
+            or not matching_grants[0].one_shot
+            or len(network_stages) != 1
+            or network_stages[0] is not stage
+            or len(stage.network_operations) != 1
+        ):
+            raise _egress_error(
+                "一次性同意暂不支持多阶段或多操作发送计划。"
+            )
     granted_scope = matching_grants[0].capture_scope_fingerprint
     if granted_scope is not None and granted_scope != capture.scope_fingerprint:
         raise _egress_error("同意记录未覆盖当前截图区域。")
     return stage, operation
+
+
+def _validate_exact_egress_binding(
+    *,
+    planned: PlannedExecution,
+    invocation: StageInvocation,
+    prepared: PreparedOutbound,
+    authorization: AuthorizationContext,
+    consent_ledger: ConsentLedger,
+    now: datetime,
+) -> tuple[object, object]:
+    """Validate active privacy authority, then the exact outbound binding."""
+
+    PrivacyGate().validate_authorization(
+        planned=planned,
+        authorization=authorization,
+        ledger=consent_ledger,
+        now=now,
+    )
+    return _validate_exact_egress_binding_core(
+        planned=planned,
+        invocation=invocation,
+        prepared=prepared,
+        authorization=authorization,
+        consent_ledger=consent_ledger,
+        now=now,
+    )
+
+
+def _validate_exact_egress_binding_for_session(
+    *,
+    planned: PlannedExecution,
+    invocation: StageInvocation,
+    prepared: PreparedOutbound,
+    authorization: AuthorizationContext,
+    consent_ledger: ConsentLedger,
+    now: datetime,
+    _authority: object | None = None,
+) -> tuple[object, object]:
+    """Validate exact binding after ConsentLedger session authorization."""
+
+    if _authority is not _EGRESS_ATTEMPT_AUTHORITY:
+        raise TypeError("session egress validation requires AttemptGate")
+    return _validate_exact_egress_binding_core(
+        planned=planned,
+        invocation=invocation,
+        prepared=prepared,
+        authorization=authorization,
+        consent_ledger=consent_ledger,
+        now=now,
+    )
 
 
 @runtime_final
