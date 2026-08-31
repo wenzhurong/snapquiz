@@ -163,6 +163,7 @@ def make_w07_authorities(
     request_id: UUID = UUID("30000000-0000-0000-0000-000000000001"),
     capture_id: UUID = CAPTURE_ID,
     registry: RegistrySnapshot | None = None,
+    one_shot_consent: bool = False,
 ) -> SimpleNamespace:
     initial_topology = topology()
     intent = SolveIntent(
@@ -197,6 +198,7 @@ def make_w07_authorities(
     consent_ledger, privacy = privacy_authorization(
         planned,
         scope_fingerprint=scope.fingerprint,
+        one_shot=one_shot_consent,
     )
     capture_ledger = CaptureAuthorizationLedger()
     authorization = CapturePolicy().authorize(

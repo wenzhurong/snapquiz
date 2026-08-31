@@ -2,9 +2,9 @@
 
 > **状态**：Active
 >
-> **实施基线**：`2026-08-31`，W06/W07 已进入本地及远端 `main`
+> **实施基线**：`2026-08-31`，远端 `main@c4e3843`；W08 已在当前工作区完成、尚未提交
 >
-> **工作区实现快照**：M0–M4/W07 的离线合同已完成、提交并推送；M5–M9 未开始。除用户已有的 `README.md` 改动外，W07 提交后工作区干净。应用仍被有意冻结，没有真实截图、出站传输或可执行解题链。
+> **工作区实现快照**：M0–M4/W07 的离线合同已完成、提交并推送；M5 正在进行，W08 的 Egress/静态 one-shot session 合同已完成，W09 是下一工作包。用户已有的 `README.md` 改动保持未暂存且未被本轮修改。应用仍被有意冻结，没有真实截图、真实人机预览、出站传输或可执行解题链。
 >
 > **规范来源**：[`ARCHITECTURE.md`](./ARCHITECTURE.md) 是目标行为与安全约束的唯一规范；本文只负责依赖顺序、工作包、状态和验收证据，不能弱化 Spec。
 
@@ -58,7 +58,7 @@ MVP-0 的 45 个 `unittest` 是当前行为刻画，不是 v3 的兼容门槛。
 | M2 | complete | Registry snapshot、能力、Planner、Consent/Authorization、可信 endpoint profile | 截图前得到不可变单-stage Plan；未知 capability/endpoint 拒绝；policy unknown 分维度额外确认；compute unknown 按 remote 约束 |
 | M3 | complete | fail-closed 权限、明确选区合同、CapturePolicy、InputValidator、引用清理 | 纯离线权限/拓扑/一次性授权/真实 PNG 解码负向矩阵通过；零真实 capture/secret/SDK/network |
 | M4 | complete | 纯 GLM/OpenAI-compatible Adapter 与 typed response/error mapping | prepare/decode 零 I/O；request/response fixtures 和 golden envelope 全通过 |
-| M5 | pending | Egress、session、Transport、预算、取消、授权租约、延迟密钥与统一清理 | 完整负向矩阵；approval 并发只能一次成功；每次 attempt 重验 valid_until/撤销；exact envelope；无 redirect/隐式 retry |
+| M5 | in_progress | Egress、session、Transport、预算、取消、授权租约、延迟密钥与统一清理 | W08 exact preview/approval/static session 已完成；仍需 W09 每次 attempt 重验、monotonic deadline、预算/取消、延迟密钥、TLS/DNS/peer、无 redirect/隐式 retry |
 | M6 | pending | GLM 固定合成题图 opt-in live smoke | 单次、无自动 retry；记录非内容证据；仍为 experimental |
 | M7 | pending | macOS 真实选区接入同一安全链 | 实际发送图可预览；取消零网络；完整 E2E；无旧旁路 |
 | M8-A | pending | 第二个不同协议族多模态 Adapter | 核心无 Provider 分支；独立 credential binding；结构化输出降级链；contract/security/synthetic live 通过，保持 experimental |
@@ -128,7 +128,7 @@ M2 的 `complete` 只证明离线 authority snapshot、不可变性、exact bind
 - `CaptureArtifactFactory` 只物化一次，并在此阶段限制非空 bytes、PNG MIME、尺寸、时间和 Plan 上限；canonical PNG 只能由后续 InputValidator 建立。InputValidator 在捕获后再次复核 privacy/permission/topology/Plan，完整解析 PNG signature/chunk CRC/zlib/真实尺寸，仅接受 8-bit、非交错 RGB 或全不透明 RGBA，并拒绝 ancillary/APNG、截断、尾随、解压超限、黑帧、空白帧和透明帧；
 - 下游只能取得 authority-only `ValidatedCapture` lease；其 digest 绑定 Plan、同意、捕获授权、初始 authorization、捕获前 consumption、捕获后 validation 三阶段的权限/topology 证据以及完整 artifact metadata。初始阶段绑定 topology revision，捕获前后另绑定对应 snapshot digest。`release()` 只保证幂等丢弃该 lease 的 Python 引用，不宣称 immutable bytes 已被安全擦除。
 
-W06 的 `complete` 不包含真实 Quartz/TCC 验收、权限请求 UI、真实 display source/scale/rotation transform、图形选区、截图 backend、JPEG decoder、实际预览、deadline/cancel 编排或应用入口接线。这些分别留给 W08–W12；W12 前禁止把真实用户截图接入远程链。
+W06 的 `complete` 不包含真实 Quartz/TCC 验收、权限请求 UI、真实 display source/scale/rotation transform、图形选区、截图 backend、JPEG decoder、真实人机预览、deadline/cancel 编排或应用入口接线。W08 已完成 preview boundary/exact subject 合同，但 NSPanel 人机证据仍在 W12，deadline/cancel 在 W09；W12 前禁止把真实用户截图接入远程链。
 
 CaptureAuthorizationLedger 只允许 trusted core orchestrator 持有，禁止下放给 Adapter、Provider SDK、UI callback 或插件。W06 证明 public proof/正常调用与并发下 fail-closed，不宣称 Python 私有字段能抵抗已经取得任意同进程代码执行的恶意插件；未来插件必须用进程隔离和窄 IPC capability。
 
@@ -152,13 +152,24 @@ W07 必须消费同一 `PlannedExecution` 的 frozen `ResolvedStageBinding` 与 
 - 因 PlannedExecution v3 摘要传递绑定了实际 user hint，`repr` 与 safe metadata 不再暴露该摘要前缀，避免低熵 hint 的离线猜测 oracle；
 - Adapter import、prepare、decode 的成功/失败路径均不读取环境/secret，不导入 legacy Provider/OpenAI SDK/Quartz/mss，不构造 client，不做文件 I/O、DNS/socket/HTTP、sleep、retry、fallback 或远程 repair。
 
-M4 `complete` 仍只表示纯本地请求/响应合同成立。没有 EgressApproval、one-shot send session、credential resolve、HTTP Transport、Provider live 响应、真实 macOS capture 或可执行 pipeline；GLM binding 继续为 `experimental`，不能据此声称模型当前可用或应用能够解题。
+M4 `complete` 仍只表示纯本地请求/响应合同成立；后续 W08 已补 EgressApproval 与静态 one-shot send session，但仍没有 credential resolve、HTTP Transport、Provider live 响应、真实 macOS capture 或可执行 pipeline。GLM binding 继续为 `experimental`，不能据此声称模型当前可用或应用能够解题。
 
 ### M5：出站与传输安全核
 
 交付 `EgressGate → EgressApproval → AuthorizedSendSession → RemoteTransport`。实际 preview 必须表示将要发送的变换后图像与 metadata；任何应用控制的 body/非密钥 header/endpoint mutation 都改变 envelope digest 并使 approval 失效。
 
 授权有效期统一为 deadline、EgressApproval、AuthorizationContext 与 ConsentGrant 到期时间的最小值；接入 Registry/Policy authority revision，把 reload 或行政撤销传播到旧 generation lease；在首次发送和每次 retry 前都必须重新检查 generation、有效期、撤销、取消与预算，任一失败都不得开始下一次网络 attempt。
+
+W08 已完成的离线边界：
+
+- `AuthorizationContext` 私下绑定 exact ConsentLedger；Consent、Approval、Session 三类 ledger 都独立保存首次 terms、当前 revision digest 与原对象 identity，调用方返回的 proof/capability 不是账本事实来源；
+- phase1 pass-through EgressGate 在预览前后用 trusted GLM Adapter 重建 `PreparedOutbound` 并逐 slot/逐 body byte 比较，绑定 request/plan/planned execution/registry/privacy authorization/stage/operation/invocation/source/scope/exact envelope；自洽 alternate body、预览期间 mutation 或 capture release 都 fail-closed；
+- factory-only、immutable EgressPreview/Decision 绑定 exact review subject；decision 在 approval ledger 中只能使用一次，取消与 controller 异常均产生安全错误且零 approval。ApprovalLedger 不保留 preview/decision/图片/hint；trusted controller 必须在终态释放 UI buffer/引用，但 Python immutable bytes 不宣称 secure wipe，pipeline 统一清理仍属 W09，NSPanel 真人预览/动作与 UI 清理留给 W12；
+- EgressApproval 以五分钟为最大寿命，并受 AuthorizationContext expiry 与 Plan wall-clock timeout 上界收紧；W08 拒绝 one-shot ConsentGrant，直到 W09 定义完整 authority lease/消费语义；
+- SendSessionFactory 固定按 `ConsentLedger → EgressApprovalLedger → SendSessionLedger` 加锁，先不可逆提交 consumed approval revision，再签发 static AuthorizedSendSession；session issue 失败会 burn approval，不能 rollback。session 只冻结 exact authority/envelope、max attempts、billable 与 timestamp validity，不包含 secret/client/I/O，也不伪造 W09 的 attempt state、monotonic deadline、budget、cancel、credential handle 或 HTTP state；
+- approval/session ledger 单独的 `validate_active` 只证明各自 lifecycle，不是完整 send authority。W09 必须逐 attempt 联合复核 Consent/Authorization、consumed approval digest、session revision、Registry/Policy generation lease、真正 monotonic deadline、取消和所有预算；SendSessionFactory 成功返回后才允许解析 secret 或构造 client。
+
+因此 M5 仍为 `in_progress`：W09 的 HTTP/TLS/DNS/peer/redirect、atomic attempt 与 billable/global budget、interruptible backoff/cancel、runtime lease、credential resolver、exact wire send 与统一清理尚未实现。
 
 如果继续使用 OpenAI SDK，必须证明实际发送 bytes 与获批 envelope 一致，并显式关闭自动 retry 和 redirect；无法证明时改用能原样发送 body bytes 的低层 HTTP Transport。
 
@@ -204,7 +215,7 @@ live smoke 必须显式 opt-in、一次调用、无自动 retry，只用固定�
 
 W01/W02 可以与 W03 并行，但 W04 之后的任何运行时接线都必须等待 W03；W11/W13 的任何 synthetic live 之前均必须完成 W03/M0；W12 之前禁止真实用户截图远程发送。
 
-当前工作包状态：W01–W07 complete；W08 是下一工作包；W08–W15 pending。W07 complete 仅表示冻结 request/invocation、纯 Adapter、严格 decode/candidate 与离线 fixture 证据存在，不表示应用、Provider、真实 macOS 捕获、传输或发布链可用。
+当前工作包状态：W01–W08 complete；W09 是下一工作包；W09–W15 pending。W08 complete 仅表示 exact preview boundary、one-shot approval 与静态 session authority 的离线合同存在，不表示真实 UI、secret、HTTP Transport、Provider、真实 macOS 捕获、传输或发布链可用；因此 M5 仍为 `in_progress`。
 
 ## 6. 测试与证据矩阵
 
@@ -233,8 +244,8 @@ W01/W02 可以与 W03 并行，但 W04 之后的任何运行时接线都必须�
 
 ## 7. 近期执行顺序
 
-1. 实现 M5/W08 的 EgressApproval 与 one-shot AuthorizedSendSession，并把 exact PreparedOutbound 与当前 Authorization/Consent lease 逐项绑定；
-2. 实现 M5/W09 的 HTTP Transport、预算、deadline、取消、redirect/TLS/DNS/peer 约束与延迟 secret 注入，并跑完整安全负向矩阵；
+1. **已完成** M5/W08 的 EgressApproval 与静态 one-shot AuthorizedSendSession，并把 trusted Adapter 产生的 exact PreparedOutbound 与当前 Authorization/Consent authority 逐项绑定；
+2. **下一步**实现 M5/W09 的 HTTP Transport、预算、monotonic deadline、取消、redirect/TLS/DNS/peer 约束、authority lease 与延迟 secret 注入，并跑完整安全负向矩阵；
 3. 完成 M5 后组装 W10 新 multimodal pipeline；
 4. M6/W11 synthetic live smoke 通过后，再进入 M7/W12 的真实 macOS topology/选区/截图纵切；
 5. 选定不同协议族并实施 M8-A/W13，再以 M8-B/W14 完成选择 UX 与两个 binding 的正式支持证明；
@@ -258,3 +269,5 @@ W01/W02 可以与 W03 并行，但 W04 之后的任何运行时接线都必须�
 - W06 完整离线 `unittest` 为 247/247，并通过 Python 3.10 grammar、compileall 与 diff 静态检查；实现已提交并随 W07 推送为 `14a099a feat: add fail-closed capture contracts`。该提交明确排除了用户已有的 `README.md` 改动；未调用真实 Quartz/TCC、截图 backend、secret、SDK/client、DNS/socket/HTTP 或 Provider live API，也未执行合并或部署。
 - 完成 M4/W07：新增完整 SolveIntent digest 与 PlannedExecution v3、authority-only SolveRequest/StageInvocation、内容寻址 prompt policy、GLM raw-Base64 OpenAI Chat-compatible pure Adapter、bounded TransportResponse、execution-bound AnswerCandidateResult、correlation-first ResultValidator 入口、HTTP + GLM business-code/finish typed-error mapping，以及 literal request/response fixtures 与并发/release/冻结参数/篡改/strict JSON/usage/零 I/O 负向矩阵；同步更新 Registry generation 与 W05/W06 transitive golden vectors。
 - W07 专项离线 `unittest` 为 26/26（其中一个用例固定覆盖当前官方 34 个 GLM business code 的 status/type/retryability 全矩阵），工作区完整离线 `unittest` 为 273/273；`compileall`、76 个 Python 文件的 3.10 AST grammar 与 `git diff --check` 均通过。本机实际运行时为 Python 3.12.13，真实 Python 3.10 runtime suite 证据仍缺失。实现与验证未使用真实截图、secret、SDK/client、DNS/socket/HTTP、Provider live API 或真实 macOS TCC/E2E；W07 已提交并推送为 `1066a99 feat: add pure multimodal adapter contracts`，`README.md` 用户改动仍保持未暂存且未被修改。
+- 完成 M5/W08：强化 AuthorizationContext 的 exact ConsentLedger identity；新增 factory-only/immutable EgressPreview、EgressPreviewDecision、EgressApproval、EgressApprovalLedger、EgressGate、AuthorizedSendSession、SendSessionLedger 与 SendSessionFactory。当前 phase1 pass-through Gate 在 preview 前后用 trusted Adapter 重建并逐字段/逐字节比对 PreparedOutbound，decision exact-object/one-shot，approval 先不可逆 consumed 再签发 static session；mutation/replay/cross-ledger/concurrency/revoke/expiry/controller-error/capture-release 均 fail-closed，session issue 失败不会复活 approval。preview 期间 consent revoke、approval revoke vs consume、consent revoke vs session create 与 session 签发后撤销均已固化为确定性线性化回归。
+- W08 专项离线 `unittest` 为 31/31，工作区完整离线 `unittest` 为 305/305；三类新增竞态又重复执行 90 次通过。实现与验证未读取 secret、构造 SDK/client、访问文件/环境、sleep、执行真实截图、DNS/socket/HTTP、Provider live API 或真实 macOS TCC/E2E。W08 当前尚未提交；`README.md` 用户改动仍保持未暂存且未被本轮修改。W09 的 monotonic deadline、attempt/global/billable budget、cancel、Registry/Policy revocable lease、credential resolver、HTTP/TLS/DNS/peer/redirect/retry 与统一 cleanup 仍未实现，M5 因此不升级为 complete。

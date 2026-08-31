@@ -867,6 +867,56 @@ class ConsentAuthorizationContractTest(unittest.TestCase):
                 now=NOW + timedelta(seconds=2),
             )
 
+    def test_context_cannot_use_a_cloned_ledger_to_bypass_revocation(self):
+        planned = _planned()
+        ledger_a, grant_a = _issue(planned)
+        gate = PrivacyGate()
+        authorization_a = gate.authorize(
+            planned=planned,
+            ledger=ledger_a,
+            consent_grant_ids=(grant_a.grant_id,),
+            now=NOW,
+        )
+
+        # The public contract intentionally remains content-addressed: two
+        # process-local ledgers can issue byte-for-byte identical terms and
+        # therefore produce the same public authorization id/digest.  The
+        # private capability binding must still keep their authority distinct.
+        ledger_b, grant_b = _issue(planned)
+        authorization_b = gate.authorize(
+            planned=planned,
+            ledger=ledger_b,
+            consent_grant_ids=(grant_b.grant_id,),
+            now=NOW,
+        )
+        self.assertEqual(
+            authorization_a.authorization_id,
+            authorization_b.authorization_id,
+        )
+        self.assertEqual(
+            authorization_a.authorization_digest,
+            authorization_b.authorization_digest,
+        )
+        self.assertIs(copy.deepcopy(authorization_a), authorization_a)
+
+        ledger_a.revoke(
+            grant_id=grant_a.grant_id,
+            revoked_at=NOW + timedelta(seconds=1),
+        )
+        with self.assertRaises(EndpointPolicyError):
+            gate.validate_authorization(
+                planned=planned,
+                authorization=authorization_a,
+                ledger=ledger_b,
+                now=NOW + timedelta(seconds=2),
+            )
+        gate.validate_authorization(
+            planned=planned,
+            authorization=authorization_b,
+            ledger=ledger_b,
+            now=NOW + timedelta(seconds=2),
+        )
+
     def test_duplicate_grant_id_cannot_replace_terms(self):
         planned = _planned()
         ledger, original = _issue(planned)

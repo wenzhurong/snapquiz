@@ -31,8 +31,9 @@
 - **M2-B/W05 complete（`main@65c867e`）**：RoutePlanner 已把 explicit `SolveIntent + Registry generation + trusted CaptureConstraints` 确定性映射为 Phase 1 单 stage Plan，并以 `PlannedExecution` 原子绑定同代 resolution；ConsentLedger、ConsentGrant、PrivacyGate 与 AuthorizationContext 已实现处理地域/保留/数据/费用四个 unknown 维度的独立确认、半开有效期、grant 条款不可替换、撤销/消费复核和热重载隔离；
 - **M3/W06 complete（`main@14a099a`，已推送）**：新增 probe-only 三态 PermissionObservation、trusted display topology/selected-region 合同、Plan-bound 一次性 CaptureAuthorization、canonical PNG 真解码 InputValidator 与 authority-only ValidatedCapture lease；授权、捕获前和捕获后分别复核 consent/permission/topology，ledger 持有不可由返回 proof 重置的原子 attempt 状态；
 - **M4/W07 complete（`main@1066a99`，已推送）**：新增完整 `SolveIntent → PlannedExecution v3 → SolveRequest → StageInvocation` authority/digest 链、纯 `openai_chat_compatible` GLM Adapter、exact canonical request fixture、bounded `TransportResponse`、strict candidate decode/typed error mapping 与 `AnswerCandidateResult → ResultValidator` 绑定；`prepare/decode` 不读取 secret、环境或文件，不构造 SDK client、不 sleep/retry，也不执行 DNS/socket/HTTP；
-- **尚不可用**：没有真实 Quartz/TCC 验收、真实 display/选区/截图 source、实际 payload 预览、EgressApproval/session/HTTP Transport 或任何 live/eval/E2E 证据，因此当前仍没有可执行的解题用户路径；Registry 中的 `experimental` 只是 exact binding 状态，不代表应用链已可运行，更不能称为 `supported`；
-- legacy `Config`、parse/notify 与 `AnswerResult` 仍留在源码树中，但被 M0 产品入口隔离；旧布尔权限 helper 已永久 fail-closed，新 W06/W07 链尚未接入应用。当前离线链不读取 secret、不截图、不构造 SDK 或联网；DNS 全结果、连接 peer 与 rebinding 防护属于 M5。
+- **M5/W08 complete（当前工作区，尚未提交）**：新增 phase1 pass-through 的 exact `EgressPreview → EgressPreviewDecision → EgressApproval` 合同、approval ledger、静态 one-shot `AuthorizedSendSession` 与 session ledger；Gate 在预览前后用可信 GLM Adapter 重建并逐字段/逐字节核对 `PreparedOutbound`，approval 必须先不可逆消费，随后才能签发 session；Consent/approval/session 均绑定原始账本身份与账本私有当前摘要；
+- **尚不可用**：没有真实 Quartz/TCC 验收、真实 display/选区/截图 source、NSPanel 人机预览、HTTP Transport、monotonic deadline/预算/取消/credential resolve 或任何 live/eval/E2E 证据，因此当前仍没有可执行的解题用户路径；Registry 中的 `experimental` 只是 exact binding 状态，不代表应用链已可运行，更不能称为 `supported`；
+- legacy `Config`、parse/notify 与 `AnswerResult` 仍留在源码树中，但被 M0 产品入口隔离；旧布尔权限 helper 已永久 fail-closed，新 W06–W08 链尚未接入应用。当前离线链不读取 secret、不截图、不构造 SDK 或联网；DNS 全结果、连接 peer 与 rebinding 防护属于 W09。
 
 因此本文必须区分：
 
@@ -153,8 +154,8 @@ SolveRequest → PipelineExecutor
 6. 真正捕获前必须以 fresh permission/topology snapshot 再校验并由 trusted ledger 原子消费授权；同一 `capture_id`、capture permit、artifact attempt 与 validation attempt 均最多一次。真实 screen-point/scale/rotation transform 和 capture backend 属于 W12。
 7. CaptureArtifactFactory 返回 Provider-neutral `CaptureArtifact`，不生成 OpenAI 专用 data URL。W06 只接受 canonical PNG；InputValidator 在捕获后再次复核 privacy/permission/topology/Plan，并真解码图片、核对 magic/CRC/zlib/真实尺寸/像素/字节/空白/黑帧，成功后只签发绑定完整 artifact metadata 的 `ValidatedCapture` lease。JPEG 支持必须先加入同等严格的 decoder/policy/version，不得因为领域枚举允许 JPEG 就自动放行。
 8. direct pipeline 只能消费 active ValidatedCapture，形成唯一的 `StageInvocation`；Adapter 的纯本地 PayloadPreparer 依据 plan snapshot 生成待发送 payload 与摘要，不得读取密钥、联网或改变计划。
-9. EgressGate 复核选区、实际预览、AuthorizationContext、plan snapshot、exact endpoint/data-kind，以及最终 payload 的 digest/字节数；通过后为该 network operation 产生限时、单次 `EgressApproval`。Gate 失败、取消或 payload 不匹配时，密钥读取、DNS、socket 与 HTTP 调用次数都必须为零，并立即释放临时 artifact/payload。
-10. SendSessionFactory 原子消费 approval 后，才可按 plan 解析所需 credential（明确无需认证时为 `not_applicable`）、构造 transport，并创建仅允许同一 operation/endpoint/payload 的 `AuthorizedSendSession`。Phase 1 请求期间禁止远程 model discovery；未来若需要，必须作为独立预声明 operation，且结果不能修改当前 plan。
+9. EgressGate 复核选区、AuthorizationContext、plan snapshot、exact endpoint/data-kind，以及最终 payload 的 digest/字节数；当前 pass-through policy 还必须在预览前后用可信 Adapter 重建并逐字段、逐字节比对 `PreparedOutbound`，从而证明预览图片就是 body 内嵌的 canonical PNG。受控 PreviewController 明确批准后，Gate 才为该 network operation 产生限时、单次 `EgressApproval`；W08 只建立 UI boundary 合同，真实 NSPanel 人机证据属于 W12。Gate 失败、取消或 payload 不匹配时，密钥读取、DNS、socket 与 HTTP 调用次数都必须为零，并立即释放临时 artifact/payload。
+10. SendSessionFactory 必须先把 approval 的 consumed revision 不可逆提交到其账本，再签发只绑定同一 operation/endpoint/payload 的静态 `AuthorizedSendSession`；session 创建失败时 approval 也保持 consumed，不能回滚复用。只有 factory 成功返回后，W09 才可按 plan 解析所需 credential（明确无需认证时为 `not_applicable`）并构造 transport。Phase 1 请求期间禁止远程 model discovery；未来若需要，必须作为独立预声明 operation，且结果不能修改当前 plan。
 11. RemoteTransport 在 session 的 attempt budget 内发送已经获批的 payload。Phase 1 direct plan 只允许请求内 inline bytes / raw base64 / Data URI 的 inference operation，禁止预上传、file id、公共 URL 与远程 repair。
 12. Adapter 优先使用 Provider/模型真实支持的结构化输出能力；无原生能力时才使用 prompt JSON。
 13. 所有响应必须经过本地 Schema 与语义校验。
@@ -592,7 +593,7 @@ ExecutionPlan 只声明需要什么同意，不引用尚未存在的 grant。Pri
 
 W05 的 `ConsentLedger.issue_for_plan()` 只接收可信调用方提交的 exact confirmation 枚举，不负责渲染披露、采集手势或证明真人已经看见并同意；因此其完成状态只证明条款 exactness、绑定和 lifecycle。接入用户路径前必须由受控 ConsentController/UI 先展示当前 Plan 的完整条款并采集明确动作，随后才允许调用 Ledger 签发；程序自行填充 confirmation tuple 不能作为用户同意证据。
 
-ConsentGrant 的有效区间为 `[issued_at, expires_at)`；`now == expires_at` 已失效。进程内 ConsentLedger 必须保存首次签发的 `grant_id → grant_terms_digest`，公开路径不得用同一 ID 替换条款；撤销或 one-shot 消费产生新的 grant revision/digest，使旧 AuthorizationContext 立即失效。当前内存 Ledger 不是持久化或跨进程撤销证据，PrivacyGate 也不监听当前 Registry/Policy authority；W05 只提供显式 `ledger.revoke()`，热重载产生新 generation 但不会主动撤销尚未到期的旧 generation 授权。接入产品前必须定义持久 authority、恢复语义以及 Registry/Policy reload → grant/context lease 的行政撤销传播，并在 M5 每次 attempt 前复核。`AuthorizationContext.valid_until` 取所有有限 grant expiry 与相关 `PolicySnapshot.expires_at` 的最小值；后续 CallContext 还必须再与 monotonic request deadline、EgressApproval 和 session expiry 取最小值。
+ConsentGrant 的有效区间为 `[issued_at, expires_at)`；`now == expires_at` 已失效。进程内 ConsentLedger 必须保存首次签发的 `grant_id → grant_terms_digest` 与当前 revision digest，公开路径不得用同一 ID 替换条款，也不得把返回的 grant/context proof 当作账本事实来源；撤销或 one-shot 消费产生新的 grant revision/digest，使旧 AuthorizationContext 立即失效。AuthorizationContext 还必须私下绑定签发它的 exact ConsentLedger 对象，另一个内容相同的 ledger 不能验证或复用该 context。当前内存 Ledger 不是持久化或跨进程撤销证据，PrivacyGate 也不监听当前 Registry/Policy authority；W05 只提供显式 `ledger.revoke()`，热重载产生新 generation 但不会主动撤销尚未到期的旧 generation 授权。接入产品前必须定义持久 authority、恢复语义以及 Registry/Policy reload → grant/context lease 的行政撤销传播，并在 W09 每次 attempt 前复核。`AuthorizationContext.valid_until` 取所有有限 grant expiry 与相关 `PolicySnapshot.expires_at` 的最小值；后续 CallContext 还必须再与 monotonic request deadline、EgressApproval 和 session expiry 取最小值。
 
 持久 grant 可以只覆盖 `selected_region` 类别，但每次上传仍必须由 EgressApproval 绑定实际 scope fingerprint；若 grant 自身绑定了 fingerprint，任何显示器拓扑、缩放、坐标或选区变化都会使它失效。任何未来允许的 `full_screen` grant 必须绑定本次 `request_id`、`one_shot=true`，且消费后不能复用；Phase 1 的 remote profile 不得产生此类 grant。
 
@@ -619,47 +620,82 @@ PreparedOutbound
   request_envelope_digest: Digest256
   body: ephemeral bytes
 
+EgressPreview
+  policy_version: "snapquiz.egress-policy.phase1-pass-through.v1"
+  request_id: UUID
+  plan_id / plan_digest / planned_execution_digest
+  registry_revision / registry_digest
+  privacy_authorization_id / privacy_authorization_digest
+  stage_id / operation_id / invocation_id / invocation_digest
+  source_ids[] / source_digests[]
+  capture_scope_fingerprint: Digest256 | not_applicable
+  provider_profile_id: string
+  http_method / canonical_url / content_type
+  non_secret_headers_digest / credential_binding_digest
+  outbound_data[]
+  body_digest / payload_byte_size / request_envelope_digest
+  preview_image_sha256 / MIME / width / height
+  user_hint_digest: Digest256
+  preview_subject_digest: Digest256
+  image_bytes / user_hint: private ephemeral exact review content
+
+EgressPreviewDecision
+  decision_id: UUID
+  preview_subject_digest: Digest256
+  decided_at: timestamp
+  approved: bool
+  decision_digest: Digest256
+  preview: private exact EgressPreview identity
+
 EgressApproval
   approval_id: UUID
-  privacy_authorization_id: UUID
-  plan_id: UUID
-  plan_digest: Digest256
-  stage_id: UUID
-  operation_id: UUID
-  source_digests[]: Digest256
+  policy_version: "snapquiz.egress-policy.phase1-pass-through.v1"
+  request_id: UUID
+  plan_id / plan_digest / planned_execution_digest
+  registry_revision / registry_digest
+  privacy_authorization_id / privacy_authorization_digest
+  stage_id / operation_id / invocation_id / invocation_digest
+  source_ids[] / source_digests[]
   capture_scope_fingerprint: Digest256 | not_applicable
-  http_method: string
-  canonical_url: normalized concrete URL
-  content_type: string
-  non_secret_headers_digest: Digest256
-  credential_binding_digest: Digest256 | not_applicable
-  body_digest: Digest256
-  payload_byte_size: positive int
-  request_envelope_digest: Digest256
+  preview_decision_id / preview_decision_digest
+  http_method / canonical_url / content_type
+  non_secret_headers_digest / credential_binding_digest
   outbound_data[]: image | ocr_text | user_hint | provider_response_text
+  body_digest / payload_byte_size / request_envelope_digest
   max_network_attempts: positive int
+  billable: bool | unknown
   approved_at: timestamp
   expires_at: timestamp
   consumed_at: timestamp | null
+  revoked_at: timestamp | null
+  approval_terms_digest: Digest256
+  approval_digest: Digest256              # current lifecycle revision
 
 AuthorizedSendSession
   session_id: UUID
+  policy_version: "snapquiz.send-session.static-w08.v1"
   approval_id: UUID
-  privacy_authorization_id: UUID
-  operation_id: UUID
-  request_envelope_digest: Digest256
-  credential_binding_digest: Digest256 | not_applicable
-  credential_handle_id: opaque string | not_applicable
-  attempts_remaining: non-negative int
-  global_network_budget_id: UUID
-  billable_budget_id: UUID
-  authorization_lease_id: UUID
-  runtime_deadline: MonotonicDeadline
-  valid_until: monotonic instant
-  cancellation_token_id: UUID
-  revoked_at: monotonic instant | null
+  approval_terms_digest / consumed_approval_digest
+  request_id: UUID
+  plan_id / plan_digest / planned_execution_digest
+  registry_revision / registry_digest
+  privacy_authorization_id / privacy_authorization_digest
+  stage_id / operation_id / invocation_id / invocation_digest
+  source_ids[] / source_digests[]
+  capture_scope_fingerprint: Digest256 | not_applicable
+  http_method / canonical_url / content_type
+  non_secret_headers_digest / credential_binding_digest
+  outbound_data[]
+  body_digest / payload_byte_size / request_envelope_digest
+  max_network_attempts: positive int
+  billable: bool | unknown
+  issued_at: timestamp
+  valid_until: timestamp
+  revoked_at: timestamp | null
+  session_terms_digest: Digest256
+  session_digest: Digest256                # current lifecycle revision
 
-CallContext
+CallContext                                # W09 target; absent from W08 session
   runtime_deadline: MonotonicDeadline
   global_network_budget: AtomicBudget
   billable_budget: AtomicBudget
@@ -667,11 +703,17 @@ CallContext
   cancellation_token: CancellationToken
 ```
 
-PayloadPreparer 必须是确定性的纯本地步骤。`request_envelope_digest` 必须覆盖 method、完整规范化 URL（含非敏感 query）、content type、应用控制的非敏感 headers、credential-binding digest（无认证时为明确的 `not_applicable` 标记）与 body digest。EgressGate 每次只审批一个 PreparedOutbound，并重新证明 AuthorizationContext/grants 未过期、未撤销且与 plan digest 匹配。SendSessionFactory 在读取 secret（如适用）或构造 SDK client 前原子消费 approval，核对冻结的 profile/capability/adapter/endpoint/network/TLS/credential-binding snapshot，然后创建一个 AuthorizedSendSession；消费失败时 secret resolver 与网络调用均为零。
+PayloadPreparer 必须是确定性的纯本地步骤。`request_envelope_digest` 必须覆盖 method、完整规范化 URL（含非敏感 query）、content type、应用控制的非敏感 headers、credential-binding digest（无认证时为明确的 `not_applicable` 标记）与 body digest。W08 的 EgressGate 每次只审批一个 PreparedOutbound，并重新证明 AuthorizationContext/grants 未过期、未撤销且与 plan digest 匹配；当前 phase1 pass-through policy 还在预览前后分别调用可信、Registry-bound GLM Adapter 的 `prepare()`，逐项比较所有 PreparedOutbound 字段与 exact body bytes，禁止调用方用另一个自洽 envelope 冒充 Adapter 产物。未来 Adapter 必须接入等价的可信 preparer dispatch，不能删除该 provenance 证明。
 
-Transport 只能向 envelope 的已批准 slot 注入由该 binding 解析出的 Authorization/API-key secret；binding 为 `not_applicable` 时禁止注入任何认证 header/query。禁止添加其他数据承载 header/query，禁止修改 method、URL、非敏感 headers、content type 或 body。非秘密 header/query 的值只能来自冻结 Profile、transport policy 或协议固定元数据，不得依赖 StageInvocation、截图、OCR 文本、答案或 user hint。Host、Content-Length 等库派生 header 必须由已批准 URL/body 确定，并受版本化 transport policy 约束。Phase 1 的 canonical query 必须为空，任何用户内容都只能位于已批准 body；session 的 credential handle id 与 binding digest 必须匹配，否则零网络失败。
+EgressPreview 与 EgressPreviewDecision 均只能由受控 factory 构造、不可变且绑定 exact 原对象身份；决策不能被缓存后用于另一个 preview。图片 bytes 与 user hint 只在受控 preview boundary 内短暂可读，通用 repr/safe metadata 不得暴露它们或内容摘要。PreviewController 的异常必须归一为无 cause/context 的安全错误；取消不签发 approval。同一 decision ID 在 EgressApprovalLedger 中最多产生一个 approval，即使多个线程并发也只有一个成功。ApprovalLedger 只保留 decision ID → approval ID，不持久化 preview/decision/图片/hint；trusted controller 必须在 approve/cancel/failure 终态释放自己的 UI buffer 与对象引用。这里只能保证引用生命周期，不能宣称 Python immutable bytes 已安全擦除；W09 负责 pipeline 统一终态清理，W12 还需验证真实 NSPanel 清理。W08 测试使用确定性 fake controller，只证明 boundary、exactness 和 one-shot 合同；真实展示与真人动作证据仍属于 W12。
 
-`valid_until` 必须取 request deadline、approval expiry、AuthorizationContext expiry 与所有 ConsentGrant expiry 的最早有效时刻。M5 还必须接入 Registry/Policy authority 的行政撤销 revision，把 reload/revocation 传播到尚未发送或准备 retry 的旧 generation lease。一次 `network_attempt` 定义为：在任何 DNS/socket 动作前，先对 session attempt、pipeline 全局网络预算，以及 `billable=true|unknown` 时的计费预算各原子扣减一次，随后完成这一次端到端发送尝试；底层 DNS/连接/HTTP 子步骤不重复计数。每次 attempt 前以及可中断的退避等待后，必须重新检查 authority generation/revision、cancellation token、authorization lease、有效期和 envelope/binding digest。即使连接中断也计数；用户取消或 grant 撤销必须原子阻止后续 attempt，已在途请求只能 best-effort 取消但不得再发下一次。session 只允许向同一 canonical URL 重放完全相同的 request envelope，不能用于另一个 operation、stage、Provider 或 fallback。OCR route 因此可有两个独立 approval/session；direct route 只有一个。过期、撤销、重复消费、并发双消费、选区/显示器变化、payload mutation 或任一 snapshot/digest 不一致均返回 `EndpointPolicyError` 并保持零网络。
+EgressApproval 的有效期为确认时刻之后最多五分钟，并受 AuthorizationContext expiry 与 `authorized_at + plan.timeout_budget_ms` 的 wall-clock 上界共同收紧；确认发生在该上界或之后必须失败。这个 wall-clock 上界不能替代 W09 的唯一 monotonic deadline。W08 暂只接受 persistent ConsentGrant；one-shot grant 在 authority lease/消费语义由 W09 完成前 fail-closed。
+
+SendSessionFactory 固定按 `ConsentLedger → EgressApprovalLedger → SendSessionLedger` 加锁：先重验 exact Consent/Authorization 与所有 envelope binding，再将 approval 的 consumed revision 不可逆写入其账本，之后才允许纯本地构造并登记静态 AuthorizedSendSession。session issue 失败会烧毁 approval，不能回滚成可复用状态。factory 成功返回以前严禁 secret resolution、credential handle、client construction 或 I/O；W08 session 刻意不包含 attempt counter、monotonic deadline、budget、cancellation、credential handle 或 HTTP state。Approval/Session ledger 的 `validate_active` 只证明各自账本的 lifecycle，不是完整发送授权；W09 每个 attempt 必须在同一可信路径重验 Consent/Authorization、consumed approval digest、session revision、Registry/Policy generation lease、monotonic deadline、取消与预算。
+
+W09 Transport 只能在上述静态 session 成功返回后，向 envelope 的已批准 slot 注入由 exact binding 解析出的 Authorization/API-key secret；binding 为 `not_applicable` 时禁止注入任何认证 header/query。禁止添加其他数据承载 header/query，禁止修改 method、URL、非敏感 headers、content type 或 body。非秘密 header/query 的值只能来自冻结 Profile、transport policy 或协议固定元数据，不得依赖 StageInvocation、截图、OCR 文本、答案或 user hint。Host、Content-Length 等库派生 header 必须由已批准 URL/body 确定，并受版本化 transport policy 约束。Phase 1 的 canonical query 必须为空，任何用户内容都只能位于已批准 body；运行时 credential handle 与 session 中的 binding digest 必须匹配，否则零网络失败。
+
+W08 静态 session 的 `valid_until` 等于 approval expiry。W09 必须将其映射为 request monotonic deadline、approval/session expiry、AuthorizationContext 与 ConsentGrant expiry 的最早有效时刻，并接入 Registry/Policy authority 的行政撤销 revision，把 reload/revocation 传播到尚未发送或准备 retry 的旧 generation lease。一次 `network_attempt` 定义为：在任何 DNS/socket 动作前，先对 operation attempt、pipeline 全局网络预算，以及 `billable=true|unknown` 时的计费预算各原子扣减一次，随后完成这一次端到端发送尝试；底层 DNS/连接/HTTP 子步骤不重复计数。每次 attempt 前以及可中断的退避等待后，必须重新检查 authority generation/revision、cancellation token、authorization lease、有效期和 envelope/binding digest。即使连接中断也计数；用户取消或 grant 撤销必须原子阻止后续 attempt，已在途请求只能 best-effort 取消但不得再发下一次。session 只允许向同一 canonical URL 重放完全相同的 request envelope，不能用于另一个 operation、stage、Provider 或 fallback。OCR route 因此可有两个独立 approval/session；direct route 只有一个。过期、撤销、重复消费、并发双消费、选区/显示器变化、payload mutation 或任一 snapshot/digest 不一致均返回 `EndpointPolicyError` 并保持零网络。
 
 严格 `local_verified` 且 `network_operations=[]` 的 in-process stage 走 `LocalExecutor.execute_local(invocation, frozen_runtime)`，不构造 PreparedOutbound、EgressApproval、credential 或 send session。loopback HTTP 仍属于网络操作，不能借 local 标签绕过该链路。
 
@@ -1012,7 +1054,7 @@ Provider 特有的格式控制、reasoning 参数、图片 detail 和 token 参�
 
 ### 8.2 捕获与上传
 
-- `CaptureAuthorizationLedger` 及其 authority token/private state 属于 trusted core orchestrator 的 TCB，只能由受控的 CapturePolicy、CaptureArtifactFactory 与 InputValidator 路径持有；ConsentLedger 同样属于 TCB，但由 trusted ConsentController 与 PrivacyGate 持有并执行签发、撤销、消费和复核，普通 UI callback 只能上报明确动作。两个 ledger 必须独立快照当前 authority revision digest，不能把返回的 proof/grant 对象本身当作唯一权威版本；跨账本 commit 固定按 `ConsentLedger → CaptureAuthorizationLedger` 加锁，并在同一 consent revision 下完成最终 PrivacyGate 复核与 issue/consume/validation transition，使并发 revoke 要么先发生并阻断，要么在线性化 commit 之后发生。禁止把 ledger 交给 Adapter、Provider SDK、普通 UI callback、脚本或插件。外部层只能获得不可变 authorization/consumption proof 或 `ValidatedCapture` lease；
+- `CaptureAuthorizationLedger` 及其 authority token/private state 属于 trusted core orchestrator 的 TCB，只能由受控的 CapturePolicy、CaptureArtifactFactory 与 InputValidator 路径持有；ConsentLedger 同样属于 TCB，但由 trusted ConsentController 与 PrivacyGate 持有并执行签发、撤销、消费和复核，普通 UI callback 只能上报明确动作。EgressApprovalLedger 与 SendSessionLedger 也只能由 trusted Egress/Transport core 持有。每个 ledger 都必须独立快照首次 terms digest、当前 authority revision digest 与 exact 原对象 identity，不能把返回的 proof/grant/approval/session 对象本身当作账本事实来源；Capture 跨账本 commit 固定按 `ConsentLedger → CaptureAuthorizationLedger` 加锁，W08 出站签发固定按 `ConsentLedger → EgressApprovalLedger → SendSessionLedger` 加锁。approval consumed revision 必须先不可逆提交，之后才能登记 session；任一步并发 revoke 要么先发生并阻断，要么在线性化 commit 之后发生。禁止把 ledger 交给 Adapter、Provider SDK、普通 UI callback、脚本或插件。外部层只能获得不可变 authorization/consumption proof、`ValidatedCapture` lease、approval 或静态 session capability；
 - 当前 Python 进程不是恶意插件沙箱：能够任意反射、导入私有 token 或直接修改 ledger 私有容器的代码已经进入 TCB。若未来支持不可信插件，必须使用进程隔离与窄 IPC capability，不能宣称 `__slots__`、下划线或 digest 能抵抗任意同进程代码执行；
 - Phase 1 的 remote 与 `compute_location=unknown` profile 必须禁止全屏捕获；
 - 首次使用、选区改变、Provider/host 改变时必须重新展示数据去向；
@@ -1246,9 +1288,9 @@ capabilities_ref = "zhipu/glm-4.6v-flash@verified-date"
 - `M7`：把 macOS 真实选区接入已经通过 M0–M6 的同一安全链，并保持 `experimental`；
 - 严格验证结果，禁止空 JSON 成功；GLM 不进入默认用户列表；当前 fail-open、默认全屏、任意 endpoint、raw fallback 与不受控重试均不属于兼容目标。
 
-**当前实现状态（2026-08-31 工作区）**：M0–M4/W07 的离线合同已完成并进入远端 `main`；M5–M9 均未完成。W05、W06、W07 分别为 `65c867e`、`14a099a`、`1066a99`。W05 已提供受控 GLM exact Registry → pre-capture Plan、同代 PlannedExecution 与进程内 Consent/Authorization authority；W06 已提供 topology-bound Plan、probe-only PermissionObservation、selected physical region CapturePolicy、ledger-owned one-shot artifact/validation authority、canonical PNG InputValidator 与 ValidatedCapture lease；W07 已提供 intent-bound PlannedExecution v3、SolveRequest/StageInvocation authority、exact raw-Base64 PNG request serialization、bounded response/candidate contracts、strict decoder、GLM HTTP/business-code typed error mapping 与零 I/O 纯 Adapter。GLM 仍没有 VerificationRecord，因此只派生 `experimental`。应用仍被有意冻结，没有真实 Quartz/TCC 证明、真实 topology/选区/截图、Egress/session/HTTP Transport、密钥解析、SDK 构造、Provider API 调用、live smoke 或真实 macOS E2E。Phase 1 的 query 固定为空；`QueryPolicyKind.EXACT` 仍未启用。DNS 全结果、连接 peer 与 rebinding 防护仍属于 M5，离线 endpoint/Planner/Consent/Capture/Adapter 契约不证明传输或用户路径安全。
+**当前实现状态（2026-08-31 工作区）**：M0–M4/W07 的离线合同已完成并进入远端 `main@c4e3843`；M5 正在进行，W08 已在工作区完成但尚未提交，W09 及 M6–M9 尚未完成。W05、W06、W07 的功能提交分别为 `65c867e`、`14a099a`、`1066a99`。W05 已提供受控 GLM exact Registry → pre-capture Plan、同代 PlannedExecution 与进程内 Consent/Authorization authority；W06 已提供 topology-bound Plan、probe-only PermissionObservation、selected physical region CapturePolicy、ledger-owned one-shot artifact/validation authority、canonical PNG InputValidator 与 ValidatedCapture lease；W07 已提供 intent-bound PlannedExecution v3、SolveRequest/StageInvocation authority、exact raw-Base64 PNG request serialization、bounded response/candidate contracts、strict decoder、GLM HTTP/business-code typed error mapping 与零 I/O 纯 Adapter。W08 已提供 phase1 pass-through exact preview boundary、原对象绑定的 preview decision、一次性 EgressApproval、三账本固定锁序、先不可逆消费 approval 再签发的静态 AuthorizedSendSession，以及 mutation/replay/concurrency/revoke/expiry/零副作用离线证据；它没有真实 UI、credential handle、attempt/deadline/budget/cancel 或 HTTP 能力。GLM 仍没有 VerificationRecord，因此只派生 `experimental`。应用仍被有意冻结，没有真实 Quartz/TCC 证明、真实 topology/选区/截图、NSPanel 人机预览、HTTP Transport、密钥解析、SDK 构造、Provider API 调用、live smoke 或真实 macOS E2E。Phase 1 的 query 固定为空；`QueryPolicyKind.EXACT` 仍未启用。DNS 全结果、连接 peer 与 rebinding 防护仍属于 W09，离线 endpoint/Planner/Consent/Capture/Adapter/Egress/session 契约不证明传输或用户路径安全。
 
-`M1–M4` 的离线脚手架已经完成；任何真实 Provider、真实截图或默认入口切换仍必须严格按 M5→M6→M7 的剩余门禁推进。详细工作包、依赖和当前状态以 Implementation Plan 为准；Plan 不得弱化本 Spec 的约束。
+`M1–M4` 与 M5/W08 的离线脚手架已经完成；任何真实 Provider、真实截图或默认入口切换仍必须严格完成 W09 后再按 M6→M7 的剩余门禁推进。详细工作包、依赖和当前状态以 Implementation Plan 为准；Plan 不得弱化本 Spec 的约束。
 
 **验收**：迁移后的纯逻辑测试通过；新增安全与契约测试；GLM 合成题图 live smoke 通过；真实用户远程截图路径只有在最小选区/预览/Egress 链完整且 M0–M6 全部通过时才可启用。所有 pre-gate 失败均为零 secret resolve、零 SDK 构造、零 DNS/socket/HTTP。
 

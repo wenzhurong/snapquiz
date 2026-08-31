@@ -900,6 +900,7 @@ class AuthorizationContext:
         "authorized_at",
         "valid_until",
         "authorization_digest",
+        "_consent_ledger",
     )
 
     def __init__(
@@ -913,11 +914,16 @@ class AuthorizationContext:
         consent_grant_digests: tuple[Digest256, ...],
         authorized_at: datetime,
         valid_until: datetime | None,
+        _consent_ledger: ConsentLedger | None = None,
         _authority: object | None = None,
     ) -> None:
         if _authority is not _AUTHORIZATION_AUTHORITY:
             raise TypeError(
                 "AuthorizationContext can only be created by PrivacyGate"
+            )
+        if type(_consent_ledger) is not ConsentLedger:
+            raise TypeError(
+                "AuthorizationContext requires its issuing ConsentLedger"
             )
         require_uuid(authorization_id, "authorization_id")
         require_uuid(plan_id, "plan_id")
@@ -967,6 +973,7 @@ class AuthorizationContext:
             ("consent_grant_digests", consent_grant_digests),
             ("authorized_at", authorized_at),
             ("valid_until", valid_until),
+            ("_consent_ledger", _consent_ledger),
         ):
             object.__setattr__(self, name, value)
         object.__setattr__(
@@ -1026,6 +1033,7 @@ class AuthorizationContext:
                 consent_grant_digests=self.consent_grant_digests,
                 authorized_at=self.authorized_at,
                 valid_until=self.valid_until,
+                _consent_ledger=self._consent_ledger,
                 _authority=_AUTHORIZATION_AUTHORITY,
             )
         except ValueError:
@@ -1205,6 +1213,7 @@ class PrivacyGate:
             consent_grant_digests=tuple(pair[1] for pair in pairs),
             authorized_at=now,
             valid_until=valid_until,
+            _consent_ledger=ledger,
             _authority=_AUTHORIZATION_AUTHORITY,
         )
         context.validate_integrity()
@@ -1227,7 +1236,8 @@ class PrivacyGate:
         except ValueError as error:
             raise _privacy_error("隐私授权完整性校验失败。") from error
         if (
-            authorization.plan_id != planned.plan.plan_id
+            authorization._consent_ledger is not ledger
+            or authorization.plan_id != planned.plan.plan_id
             or authorization.plan_digest != planned.plan.plan_digest
             or authorization.planned_execution_digest
             != planned.planned_execution_digest
