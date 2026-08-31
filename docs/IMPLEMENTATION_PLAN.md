@@ -2,9 +2,9 @@
 
 > **状态**：Active
 >
-> **实施基线**：`2026-08-31`，本地 `main` 已包含 W06/W07 两个未推送提交（`origin/main@65c867e`）
+> **实施基线**：`2026-08-31`，W06/W07 已进入本地及远端 `main`
 >
-> **工作区实现快照**：M0–M4/W07 的离线合同已完成并分别本地提交，均尚未推送；M5–M9 未开始。除用户已有的 `README.md` 改动外，W07 提交后工作区干净。应用仍被有意冻结，没有真实截图、出站传输或可执行解题链。
+> **工作区实现快照**：M0–M4/W07 的离线合同已完成、提交并推送；M5–M9 未开始。除用户已有的 `README.md` 改动外，W07 提交后工作区干净。应用仍被有意冻结，没有真实截图、出站传输或可执行解题链。
 >
 > **规范来源**：[`ARCHITECTURE.md`](./ARCHITECTURE.md) 是目标行为与安全约束的唯一规范；本文只负责依赖顺序、工作包、状态和验收证据，不能弱化 Spec。
 
@@ -255,6 +255,6 @@ W01/W02 可以与 W03 并行，但 W04 之后的任何运行时接线都必须�
 - 完成 M2-B/W05：新增 deterministic RoutePlanner、generation-bound PlannedExecution、processing-region/retention/data/cost 分维度 unknown consent、grant terms/revision digest、进程内 ConsentLedger 与可撤销复核的 AuthorizationContext；intent timeout/token 与 trusted capture bounds 只能收紧，hint 缺失时 Plan 只声明 image，remote full-screen、过期/未来 policy、潜在计费却无费用政策、grant 缺失/重绑/撤销/消费、授权 ID 别名、旧 context/新 generation 与额外 consent 均 fail-closed。
 - W05 专项离线 `unittest` 为 30/30，提交 `65c867e feat: add plan-bound consent authorization` 已推送到 `origin/main`；包含固定 W05 identifier/digest vector、fresh-process poison env/import/capture/secret/network 边界、16 组 all-unknown confirmation 子集、四个 single-unknown profile、grant expiry 半开边界、one-shot 并发单赢家、热重载/代际混用、typed-error 收敛与 digest/slot 篡改。提交与推送未触发截图、真实 secret、SDK/client、DNS/socket/HTTP、live API、合并或部署。
 - 完成 M3/W06：新增 probe-only tri-state PermissionObservation、trusted topology/scope 合同、Plan-bound CaptureAuthorization、ledger-owned one-shot artifact/validation state、strict canonical PNG InputValidator 与可幂等 release 的 ValidatedCapture lease；Plan/Planner/PlannedExecution schema 因新增 topology binding 升为 v2，并为 permission/topology/scope/capture authorization/consumption/artifact/validation 冻结端到端 literal golden vector。权限或 topology 在授权前、捕获前、捕获后任一变化均阻断；同 capture id 重绑、跨 entry alias、返回 proof 状态回滚、并发 revoke、直接消费 ledger、artifact swap、失败后重试、并发重复物化/签发、RGBA 透明度、伪 PNG、CRC/解压/尺寸/黑帧/空白帧均有负测。
-- W06 完整离线 `unittest` 为 247/247，并通过 Python 3.10 grammar、compileall 与 diff 静态检查；实现已本地提交为 `14a099a feat: add fail-closed capture contracts`，但尚未推送。该提交明确排除了用户已有的 `README.md` 改动；未调用真实 Quartz/TCC、截图 backend、secret、SDK/client、DNS/socket/HTTP 或 Provider live API，也未执行合并或部署。
+- W06 完整离线 `unittest` 为 247/247，并通过 Python 3.10 grammar、compileall 与 diff 静态检查；实现已提交并随 W07 推送为 `14a099a feat: add fail-closed capture contracts`。该提交明确排除了用户已有的 `README.md` 改动；未调用真实 Quartz/TCC、截图 backend、secret、SDK/client、DNS/socket/HTTP 或 Provider live API，也未执行合并或部署。
 - 完成 M4/W07：新增完整 SolveIntent digest 与 PlannedExecution v3、authority-only SolveRequest/StageInvocation、内容寻址 prompt policy、GLM raw-Base64 OpenAI Chat-compatible pure Adapter、bounded TransportResponse、execution-bound AnswerCandidateResult、correlation-first ResultValidator 入口、HTTP + GLM business-code/finish typed-error mapping，以及 literal request/response fixtures 与并发/release/冻结参数/篡改/strict JSON/usage/零 I/O 负向矩阵；同步更新 Registry generation 与 W05/W06 transitive golden vectors。
-- W07 专项离线 `unittest` 为 26/26（其中一个用例固定覆盖当前官方 34 个 GLM business code 的 status/type/retryability 全矩阵），工作区完整离线 `unittest` 为 273/273；`compileall`、76 个 Python 文件的 3.10 AST grammar 与 `git diff --check` 均通过。本机实际运行时为 Python 3.12.13，真实 Python 3.10 runtime suite 证据仍缺失。实现与验证未使用真实截图、secret、SDK/client、DNS/socket/HTTP、Provider live API 或真实 macOS TCC/E2E；W07 已本地提交为 `feat: add pure multimodal adapter contracts`，尚未推送，`README.md` 用户改动仍保持未暂存且未被修改。
+- W07 专项离线 `unittest` 为 26/26（其中一个用例固定覆盖当前官方 34 个 GLM business code 的 status/type/retryability 全矩阵），工作区完整离线 `unittest` 为 273/273；`compileall`、76 个 Python 文件的 3.10 AST grammar 与 `git diff --check` 均通过。本机实际运行时为 Python 3.12.13，真实 Python 3.10 runtime suite 证据仍缺失。实现与验证未使用真实截图、secret、SDK/client、DNS/socket/HTTP、Provider live API 或真实 macOS TCC/E2E；W07 已提交并推送为 `1066a99 feat: add pure multimodal adapter contracts`，`README.md` 用户改动仍保持未暂存且未被修改。
