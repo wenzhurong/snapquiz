@@ -92,6 +92,7 @@ def _intent(
 def _trusted_capture_constraints() -> CaptureConstraints:
     return CaptureConstraints(
         allowed_display_ids=("display-2", "display-1"),
+        display_topology_revision=_digest("7"),
         max_width_px=3_000,
         max_height_px=2_000,
         max_pixels=6_000_000,
@@ -505,6 +506,7 @@ class RoutePlannerContractTest(unittest.TestCase):
                 build_builtin_registry,
             )
             from snapquiz.domain.capture import CaptureConstraints, CaptureScopeKind
+            from snapquiz.domain.digest import Digest256
             from snapquiz.domain.intent import (
                 SOLVE_INTENT_SCHEMA_VERSION,
                 OutputTokenLimit,
@@ -533,6 +535,7 @@ class RoutePlannerContractTest(unittest.TestCase):
                 registry=build_builtin_registry(),
                 trusted_capture_constraints=CaptureConstraints(
                     allowed_display_ids=('display-1',),
+                    display_topology_revision=Digest256('7' * 64),
                     max_width_px=2_000,
                     max_height_px=2_000,
                     max_pixels=4_000_000,
@@ -599,23 +602,23 @@ class ConsentAuthorizationContractTest(unittest.TestCase):
 
         self.assertEqual(
             str(planned.plan.plan_id),
-            "e18dc6bf-cc7a-53f3-8c17-daa5f138e1be",
+            "20e1e5e8-be58-5885-8ec3-11f106ffdddb",
         )
         self.assertEqual(
             str(planned.plan.stages[0].stage_id),
-            "78381bfa-28f1-58bd-90ec-d7f7e56f72dc",
+            "6a50fd6f-7fba-5584-9c6f-dd9b00bfa5e5",
         )
         self.assertEqual(
             str(operation.operation_id),
-            "2b902d37-a3d4-5a54-b72f-0bb44bb8b2f0",
+            "d95911bb-d4c4-5470-a601-93e01d7bde9c",
         )
         self.assertEqual(
             str(planned.plan.plan_digest),
-            "931df5adbb3a1cc5b34936285ecaf3243a5503adb28be38e14e8a30d691943a1",
+            "58498029ed338f32149f5ffc98f63d679228cce6fdbd886b759609f2314183f8",
         )
         self.assertEqual(
             str(planned.planned_execution_digest),
-            "bceefe89fbd2464973762d3cb8296b9adaa2cf686c43b2e0911c74607c2b48f2",
+            "79768471d7973c4819ae904831e066c0c95bf47411358d8152cfaf02ab4a1a1f",
         )
         self.assertEqual(
             str(consent_operation.contract_digest()),
@@ -631,11 +634,11 @@ class ConsentAuthorizationContractTest(unittest.TestCase):
         )
         self.assertEqual(
             str(authorization.authorization_id),
-            "5a8e0441-f6ff-5541-9ae3-f3f28fa2cf19",
+            "14399e4e-e898-5a3b-88de-378b0f1fe52a",
         )
         self.assertEqual(
             str(authorization.authorization_digest),
-            "35be73d2220ff3e4b2c0ae1f5d2368f5b947a1764db218f68874205e738d2780",
+            "19965376b15db70ba069316bae0c42ab0209635ee60f4c81a83b08486d144864",
         )
 
     def test_exact_unknown_confirmations_issue_and_authorize(self):
@@ -885,6 +888,76 @@ class ConsentAuthorizationContractTest(unittest.TestCase):
         object.__setattr__(grant, "grant_digest", grant.recompute_digest())
         with self.assertRaises(EndpointPolicyError):
             ledger.snapshot_for_ids((grant.grant_id,))
+
+    def test_ledger_detects_returned_status_revision_rollback(self):
+        planned = _planned()
+        for transition in ("revoke", "consume"):
+            with self.subTest(transition=transition):
+                ledger, grant = _issue(
+                    planned,
+                    one_shot=transition == "consume",
+                )
+                authorization = PrivacyGate().authorize(
+                    planned=planned,
+                    ledger=ledger,
+                    consent_grant_ids=(grant.grant_id,),
+                    now=NOW,
+                )
+                changed_at = NOW + timedelta(seconds=1)
+                if transition == "revoke":
+                    current = ledger.revoke(
+                        grant_id=grant.grant_id,
+                        revoked_at=changed_at,
+                    )
+                    object.__setattr__(current, "revoked_at", None)
+                else:
+                    current = ledger.consume(
+                        grant_id=grant.grant_id,
+                        consumed_at=changed_at,
+                    )
+                    object.__setattr__(current, "consumed_at", None)
+                object.__setattr__(
+                    current,
+                    "grant_digest",
+                    current.recompute_digest(),
+                )
+                current.validate_integrity()
+
+                with self.assertRaises(EndpointPolicyError):
+                    ledger.snapshot_for_ids((grant.grant_id,))
+                with self.assertRaises(EndpointPolicyError):
+                    PrivacyGate().validate_authorization(
+                        planned=planned,
+                        authorization=authorization,
+                        ledger=ledger,
+                        now=NOW + timedelta(seconds=2),
+                    )
+
+    def test_grant_object_cannot_alias_another_ledger_entry(self):
+        planned = _planned()
+        ledger, grant_a = _issue(planned)
+        grant_b_id = UUID("00000000-0000-0000-0000-000000000098")
+        _, grant_b = _issue(
+            planned,
+            ledger=ledger,
+            grant_id=grant_b_id,
+        )
+        object.__setattr__(grant_a, "grant_id", grant_b.grant_id)
+        object.__setattr__(
+            grant_a,
+            "grant_terms_digest",
+            grant_a.recompute_terms_digest(),
+        )
+        object.__setattr__(
+            grant_a,
+            "grant_digest",
+            grant_a.recompute_digest(),
+        )
+        grant_a.validate_integrity()
+
+        with self.assertRaises(EndpointPolicyError):
+            ledger.snapshot_for_ids((GRANT_ID,))
+        self.assertIs(ledger.snapshot_for_ids((grant_b_id,))[0], grant_b)
 
     def test_one_shot_concurrent_consume_has_one_winner(self):
         planned = _planned()

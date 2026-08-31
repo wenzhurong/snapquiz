@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from threading import RLock
+from typing import Callable, TypeVar
 from uuid import UUID, uuid5
 
 from snapquiz.domain._validation import (
@@ -55,7 +56,10 @@ AUTHORIZATION_CONTEXT_SCHEMA_VERSION = "snapquiz.authorization-context.v1"
 
 _GRANT_AUTHORITY = object()
 _AUTHORIZATION_AUTHORITY = object()
+_ATOMIC_PRIVACY_AUTHORITY = object()
 _AUTHORIZATION_UUID_NAMESPACE = UUID("3f2f5b36-d01d-5094-bf86-0273671fe5dd")
+
+_T = TypeVar("_T")
 
 
 class UnknownPolicyDimension(str, Enum):
@@ -630,12 +634,19 @@ class ConsentGrant:
 class ConsentLedger:
     """Thread-safe in-memory authority for immutable grant revisions."""
 
-    __slots__ = ("_lock", "_grants", "_issued_terms", "_revision")
+    __slots__ = (
+        "_lock",
+        "_grants",
+        "_issued_terms",
+        "_current_grant_digests",
+        "_revision",
+    )
 
     def __init__(self) -> None:
         object.__setattr__(self, "_lock", RLock())
         object.__setattr__(self, "_grants", {})
         object.__setattr__(self, "_issued_terms", {})
+        object.__setattr__(self, "_current_grant_digests", {})
         object.__setattr__(self, "_revision", 0)
 
     def safe_metadata(self) -> dict[str, int]:
@@ -737,6 +748,7 @@ class ConsentLedger:
                 raise _privacy_error("同意记录标识已存在，不能替换原条款。")
             self._grants[grant_id] = grant
             self._issued_terms[grant_id] = grant.grant_terms_digest
+            self._current_grant_digests[grant_id] = grant.grant_digest
             object.__setattr__(self, "_revision", self._revision + 1)
         return grant
 
@@ -753,19 +765,34 @@ class ConsentLedger:
                 grant = self._grants.get(grant_id)
                 if grant is None:
                     raise _privacy_error("隐私授权引用的同意记录不存在。")
-                self._validate_issued_terms(grant)
+                self._validate_issued_terms(
+                    grant,
+                    expected_grant_id=grant_id,
+                )
                 grants.append(grant)
             return tuple(grants)
 
-    def _validate_issued_terms(self, grant: ConsentGrant) -> None:
+    def _validate_issued_terms(
+        self,
+        grant: ConsentGrant,
+        *,
+        expected_grant_id: UUID,
+    ) -> None:
         if type(grant) is not ConsentGrant:
             raise _privacy_error("同意记录完整性校验失败。")
+        if grant.grant_id != expected_grant_id:
+            raise _privacy_error("同意记录标识与账本索引不一致。")
         try:
             grant.validate_integrity()
         except (ValueError, TypeError, AttributeError) as error:
             raise _privacy_error("同意记录完整性校验失败。") from error
         if self._issued_terms.get(grant.grant_id) != grant.grant_terms_digest:
             raise _privacy_error("同意记录标识不能重新绑定其他条款。")
+        if (
+            self._current_grant_digests.get(grant.grant_id)
+            != grant.grant_digest
+        ):
+            raise _privacy_error("同意记录状态版本与账本不一致。")
 
     def revoke(self, *, grant_id: UUID, revoked_at: datetime) -> ConsentGrant:
         require_uuid(grant_id, "grant_id")
@@ -774,7 +801,10 @@ class ConsentLedger:
             current = self._grants.get(grant_id)
             if current is None:
                 raise _privacy_error("无法撤销不存在的同意记录。")
-            self._validate_issued_terms(current)
+            self._validate_issued_terms(
+                current,
+                expected_grant_id=grant_id,
+            )
             if current.revoked_at is not None:
                 raise _privacy_error("同意记录已经撤销。")
             replacement = current._with_status(
@@ -782,6 +812,7 @@ class ConsentLedger:
                 revoked_at=revoked_at,
             )
             self._grants[grant_id] = replacement
+            self._current_grant_digests[grant_id] = replacement.grant_digest
             object.__setattr__(self, "_revision", self._revision + 1)
             return replacement
 
@@ -792,7 +823,10 @@ class ConsentLedger:
             current = self._grants.get(grant_id)
             if current is None:
                 raise _privacy_error("无法消费不存在的同意记录。")
-            self._validate_issued_terms(current)
+            self._validate_issued_terms(
+                current,
+                expected_grant_id=grant_id,
+            )
             if not current.one_shot:
                 raise _privacy_error("持久同意记录不能作为 one-shot 消费。")
             try:
@@ -804,6 +838,7 @@ class ConsentLedger:
                 revoked_at=current.revoked_at,
             )
             self._grants[grant_id] = replacement
+            self._current_grant_digests[grant_id] = replacement.grant_digest
             object.__setattr__(self, "_revision", self._revision + 1)
             return replacement
 
@@ -1100,6 +1135,36 @@ class PrivacyGate:
     """Prove exact grant coverage and issue a time-bounded context."""
 
     __slots__ = ()
+
+    def _run_authorized_action(
+        self,
+        *,
+        planned: PlannedExecution,
+        authorization: AuthorizationContext,
+        ledger: ConsentLedger,
+        now: datetime,
+        action: Callable[[], _T],
+        _authority: object | None = None,
+    ) -> _T:
+        """Linearize a trusted state transition against grant revisions."""
+
+        if _authority is not _ATOMIC_PRIVACY_AUTHORITY:
+            raise TypeError("atomic privacy actions require trusted core authority")
+        if type(ledger) is not ConsentLedger:
+            raise TypeError("ledger must be ConsentLedger")
+        if not callable(action):
+            raise TypeError("action must be callable")
+        # The lock order for combined W06 transitions is always ConsentLedger
+        # then CaptureAuthorizationLedger. No capture-ledger operation acquires
+        # this lock, so revoke/consume and capture transitions are linearizable.
+        with ledger._lock:
+            self.validate_authorization(
+                planned=planned,
+                authorization=authorization,
+                ledger=ledger,
+                now=now,
+            )
+            return action()
 
     def authorize(
         self,

@@ -2,9 +2,9 @@
 
 > **状态**：Active
 >
-> **实施基线**：`2026-08-29`，`main@5852501`
+> **实施基线**：`2026-08-29`，`main@65c867e`
 >
-> **工作区实现快照**：M0、M1 与 M2/W05 已完成；W04 已提交并推送为 `5852501`，W05 是当前未提交工作区改动；M3–M9 未开始。应用仍被有意冻结，没有可执行的截图解题链。
+> **工作区实现快照**：M0–M3/W06 的离线合同已完成；W05 已提交并推送为 `65c867e`，W06 是当前未提交工作区改动；M4–M9 未开始。应用仍被有意冻结，没有真实截图、Adapter、出站或可执行解题链。
 >
 > **规范来源**：[`ARCHITECTURE.md`](./ARCHITECTURE.md) 是目标行为与安全约束的唯一规范；本文只负责依赖顺序、工作包、状态和验收证据，不能弱化 Spec。
 
@@ -56,7 +56,7 @@ MVP-0 的 45 个 `unittest` 是当前行为刻画，不是 v3 的兼容门槛。
 | M0 | complete | 冻结 MVP-0 真实截图远程旁路 | 所有可达入口无 v3 plan/gate 时均不能 capture、resolve secret、构造 SDK 或联网；fixture-only 入口也不能读取屏幕/真实 key |
 | M1 | complete | 纯领域契约、typed errors、canonical digest、严格结果 Validator | 纯标准库测试；无 Quartz/mss/OpenAI import；malformed 输出全拒绝；digest golden vectors |
 | M2 | complete | Registry snapshot、能力、Planner、Consent/Authorization、可信 endpoint profile | 截图前得到不可变单-stage Plan；未知 capability/endpoint 拒绝；policy unknown 分维度额外确认；compute unknown 按 remote 约束 |
-| M3 | pending | fail-closed 权限、明确选区、CapturePolicy、InputValidator、清理 | 权限 unknown/denied、无选区、越界/拓扑变化、图片超限均零 secret/网络 |
+| M3 | complete | fail-closed 权限、明确选区合同、CapturePolicy、InputValidator、引用清理 | 纯离线权限/拓扑/一次性授权/真实 PNG 解码负向矩阵通过；零真实 capture/secret/SDK/network |
 | M4 | pending | 纯 GLM/OpenAI-compatible Adapter 与 typed response/error mapping | prepare/decode 零 I/O；request/response fixtures 和 golden envelope 全通过 |
 | M5 | pending | Egress、session、Transport、预算、取消、授权租约、延迟密钥与统一清理 | 完整负向矩阵；approval 并发只能一次成功；每次 attempt 重验 valid_until/撤销；exact envelope；无 redirect/隐式 retry |
 | M6 | pending | GLM 固定合成题图 opt-in live smoke | 单次、无自动 retry；记录非内容证据；仍为 experimental |
@@ -118,11 +118,25 @@ M2 的 `complete` 只证明离线 authority snapshot、不可变性、exact bind
 
 ### M3：本地捕获安全
 
-交付三态 PermissionGate、明确选区、显示器 geometry revision/fingerprint、Provider-neutral 图片 bytes、硬限制、空白/黑帧检查和终态清理。Quartz 不可用或 API 异常必须是 unknown 并阻断；Phase 1 remote/unknown profile 必须拒绝 full-screen。
+交付三态 PermissionGate、明确选区、显示器 geometry revision/fingerprint、Provider-neutral 图片 bytes、硬限制、空白/黑帧检查和 `ValidatedCapture` lease 引用释放合同。Quartz 不可用或 API 异常必须是 unknown 并阻断；Phase 1 remote/unknown profile 必须拒绝 full-screen。
+
+当前 W06 已完成的离线边界：
+
+- `PermissionObservation` 只能由显式 platform probe 构造，记录 `granted/denied/unknown` 及不可用平台、API 缺失、API 异常、非法返回等 reason；旧布尔 helper 永久返回 false；
+- Plan 的 `CaptureConstraints` 绑定 trusted display topology revision，相关 ExecutionPlan/RoutePlanner/PlannedExecution schema 升为 v2；W06 只接受 display-local `physical_pixels` 明确选区，拒绝 stale/unknown/out-of-bounds/whole-display 伪选区；
+- `ConsentLedger` 与 `CaptureAuthorizationLedger` 都以账本私有摘要快照和原始 proof identity 校验当前 revision，不能通过修改返回 proof/grant、重算公开摘要或跨 ledger entry alias 来回滚/替换状态；最终 authorization issue、capture consume 与 validation commit 固定按 `ConsentLedger → CaptureAuthorizationLedger` 加锁，在同一 consent revision 内复核并迁移，因此并发 revoke 要么先阻断，要么排在线性化 commit 之后。CapturePolicy 在授权与真正捕获前分别复核 PrivacyGate、permission、topology 和可选 consent scope fingerprint，并原子限制同一 `capture_id`、授权消费、artifact attempt 与 validation attempt 各最多一次；
+- `CaptureArtifactFactory` 只物化一次，并在此阶段限制非空 bytes、PNG MIME、尺寸、时间和 Plan 上限；canonical PNG 只能由后续 InputValidator 建立。InputValidator 在捕获后再次复核 privacy/permission/topology/Plan，完整解析 PNG signature/chunk CRC/zlib/真实尺寸，仅接受 8-bit、非交错 RGB 或全不透明 RGBA，并拒绝 ancillary/APNG、截断、尾随、解压超限、黑帧、空白帧和透明帧；
+- 下游只能取得 authority-only `ValidatedCapture` lease；其 digest 绑定 Plan、同意、捕获授权、初始 authorization、捕获前 consumption、捕获后 validation 三阶段的权限/topology 证据以及完整 artifact metadata。初始阶段绑定 topology revision，捕获前后另绑定对应 snapshot digest。`release()` 只保证幂等丢弃该 lease 的 Python 引用，不宣称 immutable bytes 已被安全擦除。
+
+W06 的 `complete` 不包含真实 Quartz/TCC 验收、权限请求 UI、真实 display source/scale/rotation transform、图形选区、截图 backend、JPEG decoder、实际预览、deadline/cancel 编排或应用入口接线。这些分别留给 W08–W12；W12 前禁止把真实用户截图接入远程链。
+
+CaptureAuthorizationLedger 只允许 trusted core orchestrator 持有，禁止下放给 Adapter、Provider SDK、UI callback 或插件。W06 证明 public proof/正常调用与并发下 fail-closed，不宣称 Python 私有字段能抵抗已经取得任意同进程代码执行的恶意插件；未来插件必须用进程隔离和窄 IPC capability。
 
 ### M4：GLM 纯 Adapter
 
 保留的 legacy 兼容面仅限已冻结的官方 GLM exact profile、模型和 Chat Completions wire shape。`prepare()` 生成确定性的 endpoint/headers/body bytes 与 envelope digest，`decode()` 只产生 candidate/typed error；二者都不能读取环境、创建 SDK、sleep、重试或联网。
+
+W07 必须消费同一 `PlannedExecution` 的 frozen `ResolvedStageBinding` 与 active `ValidatedCapture`，禁止接受 raw `CaptureArtifact`、调用方自带 MIME/限制或重新查询当前 Registry。当前 W06 只签发 canonical PNG，因此首个 Adapter fixture 也必须从 PNG 输入确定性生成 exact inline image payload；若 Adapter 需要 JPEG/缩放，必须先新增版本化 preprocessing policy 和同等严格的本地验证，不能在 Adapter 内暗中转换。
 
 本地 repair 最多允许版本化、确定性的单层 JSON fence 移除；从任意正文中搜索 JSON 或远程 repair 均禁止。
 
@@ -163,8 +177,8 @@ live smoke 必须显式 opt-in、一次调用、无自动 retry，只用固定�
 | W03 | 冻结 legacy 远程入口 | Spec-0 | `app.py`、旧 orchestrator/config tests | stdin/hotkey/app/orchestrator/legacy Provider 全部零 capture/secret/SDK/network |
 | W04 | profile/capability Registry | W01 | `config/`、`routing/registry.py` | exact binding、digest、legacy mapping |
 | W05 | Planner/Consent/Authorization | W04 | `routing/planner.py`、`privacy/consent.py` | 单 stage、空 fallback、过期/撤销/热重载 |
-| W06 | 权限、选区与 CapturePolicy | W01,W05 | `core/permissions.py`、`capture/` | tri-state、边界、fingerprint、零副作用 |
-| W07 | GLM 纯 Adapter | W02,W04 | `adapters/openai_chat_compatible.py` | request/response fixtures、零 I/O |
+| W06 | 权限、拓扑、一次性 CapturePolicy 与严格 InputValidator | W01,W05 | `core/permissions.py`、`capture/` | tri-state、Plan/topology/scope binding、canonical PNG、one-shot ledger、零副作用 |
+| W07 | GLM 纯 Adapter | W02,W04,W05,W06 | `adapters/openai_chat_compatible.py` | request/response fixtures、零 I/O |
 | W08 | Egress 与 one-shot session | W05,W06,W07 | `privacy/egress.py`、`transport/session.py` | mutation、并发消费、撤销 |
 | W09 | HTTP Transport 与预算 | W08 | `transport/http.py`、`runtime/` | TLS/redirect、attempt/deadline/cancel |
 | W10 | 新 multimodal pipeline | W06,W07,W09 | `pipelines/multimodal.py` | 完整 gate 顺序和故障矩阵 |
@@ -176,7 +190,7 @@ live smoke 必须显式 opt-in、一次调用、无自动 retry，只用固定�
 
 W01/W02 可以与 W03 并行，但 W04 之后的任何运行时接线都必须等待 W03；W11/W13 的任何 synthetic live 之前均必须完成 W03/M0；W12 之前禁止真实用户截图远程发送。
 
-当前工作包状态：W01、W02、W03、W04、W05 complete；W06 是下一工作包；W06–W15 pending。complete 仅表示对应离线代码与证据存在，不表示应用、Provider、macOS 捕获或发布链可用。
+当前工作包状态：W01–W06 complete；W07 是下一工作包；W07–W15 pending。W06 complete 仅表示离线权限/拓扑/捕获授权/输入校验合同与证据存在，不表示应用、Provider、真实 macOS 捕获或发布链可用。
 
 ## 6. 测试与证据矩阵
 
@@ -201,17 +215,16 @@ W01/W02 可以与 W03 并行，但 W04 之后的任何运行时接线都必须�
 | eval | 分题型质量、拒答、校准与限制 | UI、TCC、进程退出安全 |
 | macOS E2E | 真实选区/预览/确认/展示用户路径 | 未来 OS/模型版本持续有效 |
 
-普通 CI 与本地默认测试不得依赖 secret 或网络。live smoke 必须使用独立命令和显式环境开关，不能被 `unittest discover` 或 `pytest` 自动收集执行。
+普通 CI 与本地默认测试不得依赖 secret 或网络。live smoke 必须使用独立命令和显式环境开关，不能被 `unittest discover` 或 `pytest` 自动收集执行。项目声明 `requires-python >=3.10`，因此 CI 必须至少在真实 Python 3.10 与当前主版本各跑一次完整离线 suite；`ast.parse(feature_version=(3, 10))` 只能作为语法补充证据，不能替代 3.10 runtime 证据。
 
 ## 7. 近期执行顺序
 
-1. 实现 M3/W06 的 fail-closed 三态权限、trusted display topology、selected-region CaptureArtifact、CapturePolicy 与 InputValidator；
-2. 实现 M4/W07 的纯 Adapter 和严格 response fixtures，且只消费 W05 冻结的 PlannedExecution/ResolvedStageBinding；
-3. 实现 M5/W08–W09 的 Egress/session/Transport，并跑完整安全负向矩阵；
-4. 完成 M4/M5 后组装 W10 新 multimodal pipeline；
-5. M6/W11 synthetic live smoke 通过后，再进入 M7/W12 的真实 macOS 选区纵切；
-6. 选定不同协议族并实施 M8-A/W13，再以 M8-B/W14 完成选择 UX 与两个 binding 的正式支持证明；
-7. 实施 M9/W15 学习 UX；Phase 1 exit gate 全部满足后再启动 Phase 2 的 OCR 实现。
+1. 实现 M4/W07 的纯 Adapter 和严格 response fixtures，且只消费 W05/W06 冻结的 PlannedExecution/ValidatedCapture authority；
+2. 实现 M5/W08–W09 的 Egress/session/Transport，并跑完整安全负向矩阵；
+3. 完成 M4/M5 后组装 W10 新 multimodal pipeline；
+4. M6/W11 synthetic live smoke 通过后，再进入 M7/W12 的真实 macOS topology/选区/截图纵切；
+5. 选定不同协议族并实施 M8-A/W13，再以 M8-B/W14 完成选择 UX 与两个 binding 的正式支持证明；
+6. 实施 M9/W15 学习 UX；Phase 1 exit gate 全部满足后再启动 Phase 2 的 OCR 实现。
 
 每个里程碑结束时必须记录：代码 SHA、测试命令与结果、是否联网、是否使用真实用户数据、未覆盖项、状态变化依据。合并、发布、部署或 live API 调用均是独立授权边界，不由本文自动授权。
 
@@ -226,4 +239,6 @@ W01/W02 可以与 W03 并行，但 W04 之后的任何运行时接线都必须�
 - 完成 M2-A/W04：把旧 secret-bearing `config.py` 隔离为未接线的 `legacy_config.py`，建立无 I/O 的 `config/` 包、Provider-neutral capability/profile snapshots、受控 GLM exact Registry 与纯 legacy 非秘密映射；未知 profile/model/capability 不回退，非空 query、自定义 legacy endpoint、generic serialization、摘要篡改与快照代际混用均 fail-closed；W04 已独立提交并推送为 `5852501 feat: add immutable model registry`，未调用 Provider API、合并或部署。
 - W04 完整离线 `unittest` 为 138/138，其中 Registry contract/security 为 25/25；固定 Registry golden digest、fresh-process poison-import/secret/network 探针、Python 3.10 grammar、compileall 与 diff 静态检查均通过。2026-08-29 只读复核了官方 GLM model 与 Chat Completions/OpenAI-compatible 文档，但未使用真实 secret、截图、SDK client 或 Provider live 调用。
 - 完成 M2-B/W05：新增 deterministic RoutePlanner、generation-bound PlannedExecution、processing-region/retention/data/cost 分维度 unknown consent、grant terms/revision digest、进程内 ConsentLedger 与可撤销复核的 AuthorizationContext；intent timeout/token 与 trusted capture bounds 只能收紧，hint 缺失时 Plan 只声明 image，remote full-screen、过期/未来 policy、潜在计费却无费用政策、grant 缺失/重绑/撤销/消费、授权 ID 别名、旧 context/新 generation 与额外 consent 均 fail-closed。
-- W05 专项离线 `unittest` 当前为 30/30，完整离线 `unittest` 为 168/168；包含固定 W05 identifier/digest vector、fresh-process poison env/import/capture/secret/network 边界、16 组 all-unknown confirmation 子集、四个 single-unknown profile、grant expiry 半开边界、one-shot 并发单赢家、热重载/代际混用、typed-error 收敛与 digest/slot 篡改。W05 当前未提交、未推送；实现与验证未截图、未读取真实 secret、未构造 SDK/client、未做 DNS/socket/HTTP 或 live API 调用，也未合并或部署。
+- W05 专项离线 `unittest` 为 30/30，提交 `65c867e feat: add plan-bound consent authorization` 已推送到 `origin/main`；包含固定 W05 identifier/digest vector、fresh-process poison env/import/capture/secret/network 边界、16 组 all-unknown confirmation 子集、四个 single-unknown profile、grant expiry 半开边界、one-shot 并发单赢家、热重载/代际混用、typed-error 收敛与 digest/slot 篡改。提交与推送未触发截图、真实 secret、SDK/client、DNS/socket/HTTP、live API、合并或部署。
+- 完成 M3/W06：新增 probe-only tri-state PermissionObservation、trusted topology/scope 合同、Plan-bound CaptureAuthorization、ledger-owned one-shot artifact/validation state、strict canonical PNG InputValidator 与可幂等 release 的 ValidatedCapture lease；Plan/Planner/PlannedExecution schema 因新增 topology binding 升为 v2，并为 permission/topology/scope/capture authorization/consumption/artifact/validation 冻结端到端 literal golden vector。权限或 topology 在授权前、捕获前、捕获后任一变化均阻断；同 capture id 重绑、跨 entry alias、返回 proof 状态回滚、并发 revoke、直接消费 ledger、artifact swap、失败后重试、并发重复物化/签发、RGBA 透明度、伪 PNG、CRC/解压/尺寸/黑帧/空白帧均有负测。
+- W06 工作区完整离线 `unittest` 为 247/247，并通过 Python 3.10 grammar、compileall 与 diff 静态检查；本机实际运行时为 Python 3.12.13，尚无真实 Python 3.10 runtime suite 证据。未调用真实 Quartz/TCC、截图 backend、secret、SDK/client、DNS/socket/HTTP 或 Provider live API，也未执行提交、推送、合并或部署。真实 macOS source/selection/capture、预览和完整终态 cleanup 仍是 W08–W12 的后续门禁。

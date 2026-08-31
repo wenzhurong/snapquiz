@@ -37,8 +37,8 @@ from snapquiz.routing.registry import (
     ResolvedStageBinding,
 )
 
-ROUTE_PLANNER_SCHEMA_VERSION = "snapquiz.route-planner.v1"
-PLANNED_EXECUTION_SCHEMA_VERSION = "snapquiz.planned-execution.v1"
+ROUTE_PLANNER_SCHEMA_VERSION = "snapquiz.route-planner.v2"
+PLANNED_EXECUTION_SCHEMA_VERSION = "snapquiz.planned-execution.v2"
 
 _PLANNER_UUID_NAMESPACE = UUID("10f036ee-5208-5e28-9b12-943a816fe823")
 _PLANNED_EXECUTION_AUTHORITY = object()
@@ -66,6 +66,7 @@ def _capture_constraints_payload(
 ) -> dict[str, object]:
     return {
         "allowed_display_ids": constraints.allowed_display_ids,
+        "display_topology_revision": constraints.display_topology_revision,
         "max_width_px": constraints.max_width_px,
         "max_height_px": constraints.max_height_px,
         "max_pixels": constraints.max_pixels,
@@ -209,6 +210,7 @@ def _tighten_capture_constraints(
         raise _config_error("模型图片能力上限缺少精确证据。")
     return CaptureConstraints(
         allowed_display_ids=tuple(sorted(trusted.allowed_display_ids)),
+        display_topology_revision=trusted.display_topology_revision,
         max_width_px=min(trusted.max_width_px, profile.max_image_width_px),
         max_height_px=min(trusted.max_height_px, profile.max_image_height_px),
         max_pixels=min(

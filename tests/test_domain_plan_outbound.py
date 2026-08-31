@@ -121,6 +121,7 @@ def _remote_direct_plan(
         capture_scope_kind=capture_scope_kind,
         capture_constraints=CaptureConstraints(
             allowed_display_ids=("display-1",),
+            display_topology_revision=_digest("7"),
             max_width_px=2_000,
             max_height_px=2_000,
             max_pixels=4_000_000,
@@ -237,7 +238,7 @@ class ExecutionPlanContractTest(unittest.TestCase):
         validate_phase1_remote_direct_plan(plan)
         self.assertEqual(
             plan.plan_digest,
-            "b43169602a29a513c6e1024ddbc2ddebcfee6e94b32445d16a1152bfd9ba19eb",
+            "8e73f9968cf300e043244cac6a41104f1c9a055324adcefb831f9e8cb6f66131",
         )
         changed_policy_plan = _remote_direct_plan(policy=_policy(content_digest=_digest("a")))
         self.assertNotEqual(plan.plan_digest, changed_policy_plan.plan_digest)

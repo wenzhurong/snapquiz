@@ -14,6 +14,7 @@ from snapquiz.domain.capture import (
     validate_capture_artifact,
 )
 from snapquiz.domain.errors import CaptureError, PayloadTooLargeError
+from snapquiz.domain.digest import Digest256
 
 
 def selected_scope(**overrides):
@@ -22,7 +23,7 @@ def selected_scope(**overrides):
         "display_id": "display-1",
         "coordinate_space": CoordinateSpace.PHYSICAL_PIXELS,
         "rect": CaptureRect(left=10, top=-20, width=640, height=480),
-        "display_geometry_revision": "geometry-v1",
+        "display_geometry_revision": "1" * 64,
     }
     values.update(overrides)
     return CaptureScope(**values)
@@ -45,6 +46,7 @@ def artifact(scope=None, **overrides):
 def constraints(**overrides):
     values = {
         "allowed_display_ids": ("display-1",),
+        "display_topology_revision": Digest256("1" * 64),
         "max_width_px": 2_000,
         "max_height_px": 2_000,
         "max_pixels": 4_000_000,
@@ -64,12 +66,12 @@ class CaptureContractTest(unittest.TestCase):
     def test_scope_fingerprint_is_deterministic_and_geometry_bound(self):
         first = selected_scope()
         same = selected_scope()
-        changed = selected_scope(display_geometry_revision="geometry-v2")
+        changed = selected_scope(display_geometry_revision="2" * 64)
         self.assertEqual(first.fingerprint, same.fingerprint)
         self.assertNotEqual(first.fingerprint, changed.fingerprint)
         self.assertEqual(
             first.fingerprint,
-            "96f1d0e42c8f16210619fb4a8f4368adece94fe78aba9c02c93be9f70418ecfb",
+            "c033a26af0a97dad94251e0e8ba784fbc2705d4102068b03962c9c7c1e5359e9",
         )
 
     def test_selected_region_requires_rect(self):
@@ -123,7 +125,7 @@ class CaptureContractTest(unittest.TestCase):
             display_id="display-1",
             coordinate_space=CoordinateSpace.PHYSICAL_PIXELS,
             rect=None,
-            display_geometry_revision="geometry-v1",
+            display_geometry_revision="1" * 64,
         )
         with self.assertRaises(CaptureError):
             validate_capture_artifact(artifact(scope), constraints())

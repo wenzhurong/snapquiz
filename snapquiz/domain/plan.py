@@ -33,7 +33,7 @@ from snapquiz.domain.policy import (
 )
 from snapquiz.domain.solve import PipelineKind, SOLVE_RESULT_SCHEMA_VERSION, StageRole
 
-EXECUTION_PLAN_SCHEMA_VERSION = "snapquiz.execution-plan.v1"
+EXECUTION_PLAN_SCHEMA_VERSION = "snapquiz.execution-plan.v2"
 _LAN_LITERAL_NETWORKS = tuple(
     ip_network(value)
     for value in (
@@ -691,6 +691,9 @@ class ExecutionPlan:
             "capture_scope_kind": self.capture_scope_kind.value,
             "capture_constraints": {
                 "allowed_display_ids": self.capture_constraints.allowed_display_ids,
+                "display_topology_revision": (
+                    self.capture_constraints.display_topology_revision
+                ),
                 "max_width_px": self.capture_constraints.max_width_px,
                 "max_height_px": self.capture_constraints.max_height_px,
                 "max_pixels": self.capture_constraints.max_pixels,

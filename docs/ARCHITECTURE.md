@@ -1,6 +1,6 @@
 # snapquiz 产品与技术规格（v3 · 多模型双通道）
 
-> **状态**：v3 实现基准。本文描述目标架构；当前工作区已完成 M0、M1 与 M2/W05 的离线 Registry、Planner、Consent/Authorization 契约，不代表 v3 用户链路已经可用。交付顺序、状态与逐项验收见 [`IMPLEMENTATION_PLAN.md`](./IMPLEMENTATION_PLAN.md)。
+> **状态**：v3 实现基准。本文描述目标架构；当前工作区已完成 M0–M3/W06 的离线 Registry、Planner、Consent、Permission、CapturePolicy 与 InputValidator 契约，不代表 v3 用户链路已经可用。交付顺序、状态与逐项验收见 [`IMPLEMENTATION_PLAN.md`](./IMPLEMENTATION_PLAN.md)。
 >
 > **已定方向**：模型能力分为两条推理通道：
 >
@@ -28,9 +28,10 @@
 - **M0 complete**：stdin、全局热键、app/orchestrator、legacy GLM Provider 与截图入口全部 fail-closed；CLI 只解释参数并以退出码 `3` 说明 legacy pipeline 已禁用，不读取 `.env`、权限或屏幕，也不构造 SDK/联网；
 - **M1 complete**：已建立纯标准库 canonical digest、Capture/Intent/Policy/ExecutionPlan/PreparedOutbound、typed errors、严格 `SolveResult` 与本地 Validator；敏感值对象禁止通用 dataclass 序列化并在运行时禁止继承；
 - **M2-A/W04 complete（`main@5852501`）**：已建立不可变、内容寻址、精确匹配的 Endpoint/Credential Binding/Provider/Capability/Pipeline Registry snapshot；冻结 GLM profile 只解析为 `experimental`，legacy 映射只处理固定 endpoint/model 与 `env:GLM_API_KEY` 引用，不读取 key 值；
-- **M2-B/W05 complete（当前未提交工作区）**：RoutePlanner 已把 explicit `SolveIntent + Registry generation + trusted CaptureConstraints` 确定性映射为 Phase 1 单 stage Plan，并以 `PlannedExecution` 原子绑定同代 resolution；ConsentLedger、ConsentGrant、PrivacyGate 与 AuthorizationContext 已实现处理地域/保留/数据/费用四个 unknown 维度的独立确认、半开有效期、grant 条款不可替换、撤销/消费复核和热重载隔离；
-- **尚不可用**：没有三态权限/真实选区、纯 Adapter、实际 payload 预览、Egress/session/Transport 或任何 live/eval/E2E 证据，因此当前仍没有可执行的解题用户路径；Registry 中的 `experimental` 只是 exact binding 状态，不代表应用链已可运行，更不能称为 `supported`；
-- legacy `Config`、权限探测、parse/notify 与 `AnswerResult` 仍留在源码树中，但被 M0 产品入口隔离；M3/M4 必须替换而不得重新接回。W05 仍是纯本地规划/授权契约，不读取 secret、不截图、不构造 SDK 或联网；DNS 全结果、连接 peer 与 rebinding 防护属于 M5。
+- **M2-B/W05 complete（`main@65c867e`）**：RoutePlanner 已把 explicit `SolveIntent + Registry generation + trusted CaptureConstraints` 确定性映射为 Phase 1 单 stage Plan，并以 `PlannedExecution` 原子绑定同代 resolution；ConsentLedger、ConsentGrant、PrivacyGate 与 AuthorizationContext 已实现处理地域/保留/数据/费用四个 unknown 维度的独立确认、半开有效期、grant 条款不可替换、撤销/消费复核和热重载隔离；
+- **M3/W06 complete（当前未提交工作区）**：新增 probe-only 三态 PermissionObservation、trusted display topology/selected-region 合同、Plan-bound 一次性 CaptureAuthorization、canonical PNG 真解码 InputValidator 与 authority-only ValidatedCapture lease；授权、捕获前和捕获后分别复核 consent/permission/topology，ledger 持有不可由返回 proof 重置的原子 attempt 状态；
+- **尚不可用**：没有真实 Quartz/TCC 验收、真实 display/选区/截图 source、纯 Adapter、实际 payload 预览、Egress/session/Transport 或任何 live/eval/E2E 证据，因此当前仍没有可执行的解题用户路径；Registry 中的 `experimental` 只是 exact binding 状态，不代表应用链已可运行，更不能称为 `supported`；
+- legacy `Config`、parse/notify 与 `AnswerResult` 仍留在源码树中，但被 M0 产品入口隔离；旧布尔权限 helper 已永久 fail-closed，新 W06 入口尚未接入应用。W06 不读取 secret、不截图、不构造 SDK 或联网；DNS 全结果、连接 peer 与 rebinding 防护属于 M5。
 
 因此本文必须区分：
 
@@ -92,7 +93,9 @@ snapquiz 是 macOS 上的个人学习辅助工具。一次显式触发后，它�
 ```text
 显式触发
    ↓
-RoutePlanner（显式 profile + 能力 + endpoint + 总预算）
+trusted DisplayTopologySnapshot（W06 为离线数据；真实 source 在 W12）
+   ↓
+RoutePlanner（显式 profile + 能力 + endpoint + topology revision + 总预算）
    ↓
 ExecutionPlan（不可变，列出所有阶段、接收方与数据类型）
    ↓
@@ -102,16 +105,22 @@ AuthorizationContext（绑定 plan 与实际 privacy grants）
    ↓
 PermissionGate（macOS 上未知状态也 fail-closed）
    ↓
-CapturePolicy（选区 / 预览 / 尺寸限制）
+CapturePolicy（精确选区 + Plan/consent/permission/topology 一次性授权）
    ↓
-CaptureArtifact（bytes + mime + dimensions + scope + digest）
+捕获前 fresh permission/topology recheck → ConsumedCaptureAuthorization
    ↓
-InputValidator（MIME / 像素 / 字节 / 空白帧 / 黑帧）
+CaptureArtifactFactory（一次物化；Provider-neutral bytes + metadata）
+   ↓
+捕获后 fresh privacy/permission/topology recheck
+   ↓
+InputValidator（真实 PNG 解码 / MIME / 像素 / 字节 / 空白帧 / 黑帧）
+   ↓
+ValidatedCapture（authority-only sensitive lease）
    ↓
 SolveRequest → PipelineExecutor
-   ├─ direct_multimodal：StageInvocation(CaptureArtifact)
+   ├─ direct_multimodal：StageInvocation(ValidatedCapture)
    └─ ocr_text（Phase 2）：
-        StageInvocation(CaptureArtifact)
+        StageInvocation(ValidatedCapture)
           → QuestionDocumentValidator / OcrQualityGate
           → StageInvocation(QuestionDocument)
 
@@ -138,22 +147,23 @@ SolveRequest → PipelineExecutor
 1. 用户触发一次查询。
 2. RoutePlanner 在截屏前读取显式 profile，校验通道、模态、credential reference/binding 元数据、endpoint、能力与总 timeout budget，并生成不可变 `ExecutionPlan`；此时禁止读取密钥值、联网鉴权或远程模型发现。
 3. PrivacyGate 根据计划中的 Provider、origin、地域和数据类型校验同意；不满足时停止，截图与网络调用次数均为零。
-4. PermissionGate 必须明确确认屏幕录制权限；macOS 上导入或预检异常等同未授权。
-5. Phase 1 的 remote profile 必须要求有效选区并拒绝整屏；`full_screen` 只保留给已验证本地通道或未来另行批准的设计。
-6. 捕获层返回 Provider-neutral 的 `CaptureArtifact`，不生成 OpenAI 专用 data URL，并按 profile 限制验证 MIME、像素与字节。
-7. InputValidator 检查实际 artifact；direct pipeline 形成唯一的 `StageInvocation`，Adapter 的纯本地 PayloadPreparer 依据 plan snapshot 生成待发送 payload 与摘要，不得读取密钥、联网或改变计划。
-8. EgressGate 复核选区、实际预览、AuthorizationContext、plan snapshot、exact endpoint/data-kind，以及最终 payload 的 digest/字节数；通过后为该 network operation 产生限时、单次 `EgressApproval`。Gate 失败、取消或 payload 不匹配时，密钥读取、DNS、socket 与 HTTP 调用次数都必须为零，并立即释放临时 artifact/payload。
-9. SendSessionFactory 原子消费 approval 后，才可按 plan 解析所需 credential（明确无需认证时为 `not_applicable`）、构造 transport，并创建仅允许同一 operation/endpoint/payload 的 `AuthorizedSendSession`。Phase 1 请求期间禁止远程 model discovery；未来若需要，必须作为独立预声明 operation，且结果不能修改当前 plan。
-10. RemoteTransport 在 session 的 attempt budget 内发送已经获批的 payload。Phase 1 direct plan 只允许请求内 inline bytes / raw base64 / Data URI 的 inference operation，禁止预上传、file id、公共 URL 与远程 repair。
-11. Adapter 优先使用 Provider/模型真实支持的结构化输出能力；无原生能力时才使用 prompt JSON。
-12. 所有响应必须经过本地 Schema 与语义校验。
-13. Presenter 展示题面摘要，让用户先确认模型读到的是正确题目，再展示答案与解析。
-14. 日志与 metrics 只记录非内容元数据。StudyStore 的内容持久化默认关闭；首次启用必须经过独立 StoragePolicy/同意并显示保留期，且支持查看、导出与删除。即使启用，也默认不保存截图、prompt、原始响应或密钥。
+4. PermissionGate 必须使用 platform probe 签发的同一时刻 Observation 明确确认屏幕录制权限；外部自报 granted、非 macOS、导入/API 异常或非严格布尔结果均 fail-closed。
+5. CapturePolicy 将 PlannedExecution、AuthorizationContext、permission observation、topology revision 和 exact physical-pixel selected scope 绑定为一次性 CaptureAuthorization；grant 自身若绑定 scope fingerprint，必须 exact 相等。Phase 1 remote/unknown 拒绝 `full_screen`、越界以及覆盖整块 display 的伪 selected-region。
+6. 真正捕获前必须以 fresh permission/topology snapshot 再校验并由 trusted ledger 原子消费授权；同一 `capture_id`、capture permit、artifact attempt 与 validation attempt 均最多一次。真实 screen-point/scale/rotation transform 和 capture backend 属于 W12。
+7. CaptureArtifactFactory 返回 Provider-neutral `CaptureArtifact`，不生成 OpenAI 专用 data URL。W06 只接受 canonical PNG；InputValidator 在捕获后再次复核 privacy/permission/topology/Plan，并真解码图片、核对 magic/CRC/zlib/真实尺寸/像素/字节/空白/黑帧，成功后只签发绑定完整 artifact metadata 的 `ValidatedCapture` lease。JPEG 支持必须先加入同等严格的 decoder/policy/version，不得因为领域枚举允许 JPEG 就自动放行。
+8. direct pipeline 只能消费 active ValidatedCapture，形成唯一的 `StageInvocation`；Adapter 的纯本地 PayloadPreparer 依据 plan snapshot 生成待发送 payload 与摘要，不得读取密钥、联网或改变计划。
+9. EgressGate 复核选区、实际预览、AuthorizationContext、plan snapshot、exact endpoint/data-kind，以及最终 payload 的 digest/字节数；通过后为该 network operation 产生限时、单次 `EgressApproval`。Gate 失败、取消或 payload 不匹配时，密钥读取、DNS、socket 与 HTTP 调用次数都必须为零，并立即释放临时 artifact/payload。
+10. SendSessionFactory 原子消费 approval 后，才可按 plan 解析所需 credential（明确无需认证时为 `not_applicable`）、构造 transport，并创建仅允许同一 operation/endpoint/payload 的 `AuthorizedSendSession`。Phase 1 请求期间禁止远程 model discovery；未来若需要，必须作为独立预声明 operation，且结果不能修改当前 plan。
+11. RemoteTransport 在 session 的 attempt budget 内发送已经获批的 payload。Phase 1 direct plan 只允许请求内 inline bytes / raw base64 / Data URI 的 inference operation，禁止预上传、file id、公共 URL 与远程 repair。
+12. Adapter 优先使用 Provider/模型真实支持的结构化输出能力；无原生能力时才使用 prompt JSON。
+13. 所有响应必须经过本地 Schema 与语义校验。
+14. Presenter 展示题面摘要，让用户先确认模型读到的是正确题目，再展示答案与解析。
+15. 日志与 metrics 只记录非内容元数据。StudyStore 的内容持久化默认关闭；首次启用必须经过独立 StoragePolicy/同意并显示保留期，且支持查看、导出与删除。即使启用，也默认不保存截图、prompt、原始响应或密钥。
 
 ### 3.2 第二阶段数据流：`ocr_text`
 
 ```text
-CaptureArtifact
+ValidatedCapture
   → OCR StageInvocation
   → [若 OCR 远程：独立 Prepare / EgressGate / AuthorizedSendSession]
   → OcrAdapter / LocalExecutor
@@ -219,13 +229,66 @@ CaptureArtifact
   sha256: Digest256            # 本地缓存键；日志中不得输出完整值
 ```
 
+W06 还冻结以下 authority 与 topology 合同：
+
+```text
+PermissionObservation
+  state: granted | denied | unknown
+  reason: granted | denied | unsupported_platform | api_unavailable | api_error | invalid_result
+  source: macos_quartz_current_process
+  observed_at: timestamp
+  observation_digest: Digest256
+
+DisplayGeometrySnapshot
+  display_id: string
+  screen_point_bounds: CaptureRect
+  pixel_width_px: positive int
+  pixel_height_px: positive int
+  geometry_digest: Digest256
+
+DisplayTopologySnapshot
+  displays[]: canonical unique DisplayGeometrySnapshot
+  observed_at: timestamp
+  topology_revision: Digest256   # 只覆盖规范 geometry generation
+  snapshot_digest: Digest256     # 另覆盖 observed_at
+
+CaptureAuthorization
+  capture_authorization_id: UUID
+  capture_id: UUID
+  request_id / plan_id / plan_digest / planned_execution_digest
+  privacy_authorization_id / privacy_authorization_digest
+  permission_observation_digest
+  topology_revision
+  exact scope / Plan capture constraints
+  authorized_at / valid_until
+  capture_authorization_digest: Digest256
+
+ConsumedCaptureAuthorization
+  CaptureAuthorization
+  consumed_at
+  pre_capture_permission_observation_digest
+  pre_capture_topology_snapshot_digest
+  consumption_digest: Digest256
+
+ValidatedCapture
+  request / plan / privacy / capture authorization / consumption bindings
+  post_capture_permission_observation_digest
+  topology_revision / topology_snapshot_digest / scope_fingerprint
+  artifact id / sha256 / mime / dimensions / byte_size / captured_at
+  image_preprocessing_policy_version / validated_at / validation_digest
+  active artifact reference                  # release 后不可再读取
+```
+
 约束：
 
 - `width_px`、`height_px`、`byte_size` 必须有硬上限；
+- `CaptureConstraints` 必须包含 trusted `display_topology_revision`；ExecutionPlan v2、RoutePlanner v2 与 PlannedExecution v2 都把它纳入 deterministic ID/digest，旧 topology 不能与新 Plan 混用；
 - 远程调用前必须确认选区落在有效显示器范围内，并以解析后的 display、坐标空间、rect 与 geometry revision 重算 fingerprint；
 - 显示器拓扑、缩放、坐标空间或 rect 变化会产生新的 fingerprint，并使既有 EgressApproval 失效；
 - 编码与缩放策略属于 CapturePolicy，不属于 Provider；
 - 传输序列化属于 Adapter，不属于 Capture。
+- W06 只实现 display-local physical-pixel 范围校验和 canonical PNG（8-bit、non-interlaced RGB/opaque RGBA）；真实 screen-point scale/rotation transform、Quartz display source、JPEG 与截图 backend 均保留给 W12 或后续版本化 policy；
+- ValidatedCapture 的 `release()` 只丢弃该 lease 的引用；Python immutable bytes 不能宣称已安全擦除。完整 pipeline 仍须在所有成功、失败、取消和超时终态统一释放其他 owner 的引用。
 
 ### 4.2 `QuestionDocument`（第二阶段）
 
@@ -286,7 +349,7 @@ ExecutionPlan
   result_validator_version: string
   image_preprocessing_policy_version: string
   capture_scope_kind: selected_region | full_screen
-  capture_constraints: {allowed_display_ids[], max_width_px, max_height_px, max_pixels, max_bytes}
+  capture_constraints: {allowed_display_ids[], display_topology_revision, max_width_px, max_height_px, max_pixels, max_bytes, allow_full_screen}
   preview_required: bool
   required_consent_scopes[]:
     binding_id: string
@@ -355,7 +418,7 @@ SolveRequest
   schema_version: "snapquiz.solve-request.v1"
   request_id: UUID
   plan_id: UUID
-  input: CaptureArtifact
+  input: ValidatedCapture
   requested_result_schema_version: "snapquiz.solve-result.v2"
   locale: BCP-47
   user_hint: optional string
@@ -365,11 +428,11 @@ StageInvocation
   request_id: UUID
   plan_id: UUID
   stage_id: UUID
-  input: CaptureArtifact | QuestionDocument
+  input: ValidatedCapture | QuestionDocument
   input_digest: Digest256
 ```
 
-`SolveRequest` 只能在 ExecutionPlan、PrivacyGate、PermissionGate、CapturePolicy 与 InputValidator 全部通过后交给 PipelineExecutor；结果 Schema、token 上限与 runtime timeout 一律从 plan/CallContext 读取，SolveRequest 没有覆盖入口。PipelineExecutor 为每个 stage 构造独立 StageInvocation；direct pipeline 只有图片 invocation，OCR pipeline 的第二个 invocation 必须绑定已验证 `QuestionDocument.content_digest`。AuthorizationContext、EgressApproval、AuthorizedSendSession 与运行时 `MonotonicDeadline` 属于调用上下文或 transport capability，不写回 SolveRequest，因此不存在“先有 approval 才能 prepare、先 prepare 才能 approval”的构造循环。
+`SolveRequest` 只能在 ExecutionPlan、PrivacyGate、PermissionGate、CapturePolicy 与 InputValidator 全部通过并取得 active `ValidatedCapture` 后交给 PipelineExecutor；结果 Schema、token 上限与 runtime timeout 一律从 plan/CallContext 读取，SolveRequest 没有 raw CaptureArtifact 或调用方约束覆盖入口。PipelineExecutor 为每个 stage 构造独立 StageInvocation；direct pipeline 只有图片 invocation，OCR pipeline 的第二个 invocation 必须绑定已验证 `QuestionDocument.content_digest`。AuthorizationContext、EgressApproval、AuthorizedSendSession 与运行时 `MonotonicDeadline` 属于调用上下文或 transport capability，不写回 SolveRequest，因此不存在“先有 approval 才能 prepare、先 prepare 才能 approval”的构造循环。
 
 ### 4.6 `SolveResult`
 
@@ -896,13 +959,17 @@ Provider 特有的格式控制、reasoning 参数、图片 detail 和 token 参�
 
 ### 8.1 屏幕权限
 
+- PermissionObservation 只能由显式 platform probe 构造并绑定 source/reason/observed_at digest；Gate 不得接受调用方自行构造的 `granted`，也不得自动弹出系统权限请求；
+- CapturePolicy 授权、实际捕获前与 InputValidator 捕获后必须分别使用对应时刻的新 observation，旧 observation 不能跨步骤重放；
 - macOS 上 `denied`、`unknown`、API 不可用、导入异常都必须 fail-closed；
 - 权限不明时网络调用次数必须为零；
 - 非 macOS 必须显式报告 unsupported 或走单独实现，不能因为 Quartz 不存在就自动放行；
-- 权限主体必须在 UI 中说明：Terminal/Python 仅用于开发，成品使用签名固定 bundle identity。
+- 权限主体必须在 UI 中说明：W06 的 `current_process` 只定义开发期 probe subject；Terminal/Python 仅用于开发，成品使用签名固定 bundle identity，并在 W12 以真实 TCC/E2E 证明该 identity。
 
 ### 8.2 捕获与上传
 
+- `CaptureAuthorizationLedger` 及其 authority token/private state 属于 trusted core orchestrator 的 TCB，只能由受控的 CapturePolicy、CaptureArtifactFactory 与 InputValidator 路径持有；ConsentLedger 同样属于 TCB，但由 trusted ConsentController 与 PrivacyGate 持有并执行签发、撤销、消费和复核，普通 UI callback 只能上报明确动作。两个 ledger 必须独立快照当前 authority revision digest，不能把返回的 proof/grant 对象本身当作唯一权威版本；跨账本 commit 固定按 `ConsentLedger → CaptureAuthorizationLedger` 加锁，并在同一 consent revision 下完成最终 PrivacyGate 复核与 issue/consume/validation transition，使并发 revoke 要么先发生并阻断，要么在线性化 commit 之后发生。禁止把 ledger 交给 Adapter、Provider SDK、普通 UI callback、脚本或插件。外部层只能获得不可变 authorization/consumption proof 或 `ValidatedCapture` lease；
+- 当前 Python 进程不是恶意插件沙箱：能够任意反射、导入私有 token 或直接修改 ledger 私有容器的代码已经进入 TCB。若未来支持不可信插件，必须使用进程隔离与窄 IPC capability，不能宣称 `__slots__`、下划线或 digest 能抵抗任意同进程代码执行；
 - Phase 1 的 remote 与 `compute_location=unknown` profile 必须禁止全屏捕获；
 - 首次使用、选区改变、Provider/host 改变时必须重新展示数据去向；
 - 捕获时必须有可见状态，避免用户误以为未截图；
@@ -1135,9 +1202,9 @@ capabilities_ref = "zhipu/glm-4.6v-flash@verified-date"
 - `M7`：把 macOS 真实选区接入已经通过 M0–M6 的同一安全链，并保持 `experimental`；
 - 严格验证结果，禁止空 JSON 成功；GLM 不进入默认用户列表；当前 fail-open、默认全屏、任意 endpoint、raw fallback 与不受控重试均不属于兼容目标。
 
-**当前实现状态（2026-08-29 工作区）**：M0、M1 与 M2/W05 已完成；M3–M9 均未完成。W04 已提交并推送为 `main@5852501`；W05 当前仍是未提交工作区改动。W05 已提供受控 GLM exact Registry → pre-capture Plan、同代 PlannedExecution 与进程内 Consent/Authorization authority；GLM 仍没有 VerificationRecord，因此只派生 `experimental`。应用仍被有意冻结，没有权限放行、真实选区、截图、密钥解析、SDK 构造、Provider API 调用、live smoke 或真实 macOS E2E。Phase 1 的 query 固定为空；`QueryPolicyKind.EXACT` 仍未启用。DNS 全结果、连接 peer 与 rebinding 防护仍属于 M5，离线 endpoint/Planner/Consent 契约不证明传输安全。
+**当前实现状态（2026-08-29 工作区）**：M0–M3/W06 的离线合同已完成；M4–M9 均未完成。W05 已提交并推送为 `main@65c867e`；W06 当前仍是未提交工作区改动。W05 已提供受控 GLM exact Registry → pre-capture Plan、同代 PlannedExecution 与进程内 Consent/Authorization authority；W06 已提供 topology-bound Plan、probe-only PermissionObservation、selected physical region CapturePolicy、ledger-owned one-shot artifact/validation authority、canonical PNG InputValidator 与 ValidatedCapture lease。GLM 仍没有 VerificationRecord，因此只派生 `experimental`。应用仍被有意冻结，没有真实 Quartz/TCC 证明、真实 topology/选区/截图、密钥解析、SDK 构造、Provider API 调用、live smoke 或真实 macOS E2E。Phase 1 的 query 固定为空；`QueryPolicyKind.EXACT` 仍未启用。DNS 全结果、连接 peer 与 rebinding 防护仍属于 M5，离线 endpoint/Planner/Consent/Capture 契约不证明传输或用户路径安全。
 
-`M1` 的离线脚手架已与 `M0` 并行完成；任何真实 Provider、真实截图或默认入口切换仍必须严格按 M3→M4→M5→M6→M7 的剩余门禁推进。详细工作包、依赖和当前状态以 Implementation Plan 为准；Plan 不得弱化本 Spec 的约束。
+`M1–M3` 的离线脚手架已经完成；任何真实 Provider、真实截图或默认入口切换仍必须严格按 M4→M5→M6→M7 的剩余门禁推进。详细工作包、依赖和当前状态以 Implementation Plan 为准；Plan 不得弱化本 Spec 的约束。
 
 **验收**：迁移后的纯逻辑测试通过；新增安全与契约测试；GLM 合成题图 live smoke 通过；真实用户远程截图路径只有在最小选区/预览/Egress 链完整且 M0–M6 全部通过时才可启用。所有 pre-gate 失败均为零 secret resolve、零 SDK 构造、零 DNS/socket/HTTP。
 
