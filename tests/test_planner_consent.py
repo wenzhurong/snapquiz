@@ -52,7 +52,7 @@ from snapquiz.routing.registry import (
 )
 
 
-NOW = datetime(2026, 8, 29, 12, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 8, 31, 12, 0, tzinfo=timezone.utc)
 REQUEST_ID = UUID("00000000-0000-0000-0000-000000000001")
 GRANT_ID = UUID("00000000-0000-0000-0000-000000000099")
 ALL_UNKNOWN_CONFIRMATIONS = (
@@ -541,7 +541,7 @@ class RoutePlannerContractTest(unittest.TestCase):
                     max_pixels=4_000_000,
                     max_bytes=5_242_880,
                 ),
-                now=datetime(2026, 8, 29, tzinfo=timezone.utc),
+                now=datetime(2026, 8, 31, tzinfo=timezone.utc),
             )
             planned.validate_integrity()
             ledger = ConsentLedger()
@@ -551,7 +551,7 @@ class RoutePlannerContractTest(unittest.TestCase):
                 grant_id=UUID('00000000-0000-0000-0000-000000000099'),
                 request_id=None,
                 capture_scope_fingerprint=None,
-                issued_at=datetime(2026, 8, 29, tzinfo=timezone.utc),
+                issued_at=datetime(2026, 8, 31, tzinfo=timezone.utc),
                 expires_at=None,
                 one_shot=False,
                 confirmed_unknown_policies=(
@@ -565,13 +565,13 @@ class RoutePlannerContractTest(unittest.TestCase):
                 planned=planned,
                 ledger=ledger,
                 consent_grant_ids=(grant.grant_id,),
-                now=datetime(2026, 8, 29, tzinfo=timezone.utc),
+                now=datetime(2026, 8, 31, tzinfo=timezone.utc),
             )
             PrivacyGate().validate_authorization(
                 planned=planned,
                 authorization=authorization,
                 ledger=ledger,
-                now=datetime(2026, 8, 29, tzinfo=timezone.utc),
+                now=datetime(2026, 8, 31, tzinfo=timezone.utc),
             )
             """
         )
@@ -602,23 +602,23 @@ class ConsentAuthorizationContractTest(unittest.TestCase):
 
         self.assertEqual(
             str(planned.plan.plan_id),
-            "20e1e5e8-be58-5885-8ec3-11f106ffdddb",
+            "759d3730-e78d-553f-be84-f414a03281ba",
         )
         self.assertEqual(
             str(planned.plan.stages[0].stage_id),
-            "6a50fd6f-7fba-5584-9c6f-dd9b00bfa5e5",
+            "9f05b219-ee0b-56a7-a829-8046926a14b5",
         )
         self.assertEqual(
             str(operation.operation_id),
-            "d95911bb-d4c4-5470-a601-93e01d7bde9c",
+            "89dd2a02-63b1-5878-916e-0fe015b53647",
         )
         self.assertEqual(
             str(planned.plan.plan_digest),
-            "58498029ed338f32149f5ffc98f63d679228cce6fdbd886b759609f2314183f8",
+            "3634912d99c4bd4eb3e5a347729b6162099a429dff7dc247ed6ca206fb61bd0e",
         )
         self.assertEqual(
             str(planned.planned_execution_digest),
-            "79768471d7973c4819ae904831e066c0c95bf47411358d8152cfaf02ab4a1a1f",
+            "50370adce28b90a424d00f6d1d3a4795cc2982ddcc731277dfdbd6e208f06aa7",
         )
         self.assertEqual(
             str(consent_operation.contract_digest()),
@@ -626,19 +626,19 @@ class ConsentAuthorizationContractTest(unittest.TestCase):
         )
         self.assertEqual(
             str(grant.grant_terms_digest),
-            "0488f1de1d5a72fa2267d1f5d39720d563216ba13d3556460b3aa5eb0960d244",
+            "ce34265da15e3cc3d74ffeae195d560cea812f024648b44bd614900ee2b02887",
         )
         self.assertEqual(
             str(grant.grant_digest),
-            "057591c84c46d19d4cb3785ecc23b666dda8f75b6a3453251af2e0ec976f97b5",
+            "ef8e168d0da80a3d5d145416f8af2800a80675a6e453342b6e15641262db7428",
         )
         self.assertEqual(
             str(authorization.authorization_id),
-            "14399e4e-e898-5a3b-88de-378b0f1fe52a",
+            "07f7f6d4-2ce9-5bdb-a47c-147a9f16f9ea",
         )
         self.assertEqual(
             str(authorization.authorization_digest),
-            "19965376b15db70ba069316bae0c42ab0209635ee60f4c81a83b08486d144864",
+            "695889a32002b56bc440c05b2430b01747674916735f836b456d05c407c031e3",
         )
 
     def test_exact_unknown_confirmations_issue_and_authorize(self):

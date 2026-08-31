@@ -1001,9 +1001,6 @@ class AuthorizationContext:
             "authorization_id": str(self.authorization_id),
             "plan_id": str(self.plan_id),
             "plan_digest_prefix": _short_digest(self.plan_digest),
-            "planned_execution_digest_prefix": _short_digest(
-                self.planned_execution_digest
-            ),
             "grant_count": len(self.consent_grant_ids),
             "valid_until": self.valid_until,
             "authorization_digest_prefix": _short_digest(

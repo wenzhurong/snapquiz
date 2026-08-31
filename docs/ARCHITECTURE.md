@@ -1,6 +1,6 @@
 # snapquiz 产品与技术规格（v3 · 多模型双通道）
 
-> **状态**：v3 实现基准。本文描述目标架构；当前工作区已完成 M0–M3/W06 的离线 Registry、Planner、Consent、Permission、CapturePolicy 与 InputValidator 契约，不代表 v3 用户链路已经可用。交付顺序、状态与逐项验收见 [`IMPLEMENTATION_PLAN.md`](./IMPLEMENTATION_PLAN.md)。
+> **状态**：v3 实现基准。本文描述目标架构；当前工作区已完成 M0–M4/W07 的离线 Registry、Planner、Consent、Permission、CapturePolicy、InputValidator、请求/阶段 authority 与纯 GLM Adapter 契约，不代表 v3 用户链路已经可用。交付顺序、状态与逐项验收见 [`IMPLEMENTATION_PLAN.md`](./IMPLEMENTATION_PLAN.md)。
 >
 > **已定方向**：模型能力分为两条推理通道：
 >
@@ -29,9 +29,10 @@
 - **M1 complete**：已建立纯标准库 canonical digest、Capture/Intent/Policy/ExecutionPlan/PreparedOutbound、typed errors、严格 `SolveResult` 与本地 Validator；敏感值对象禁止通用 dataclass 序列化并在运行时禁止继承；
 - **M2-A/W04 complete（`main@5852501`）**：已建立不可变、内容寻址、精确匹配的 Endpoint/Credential Binding/Provider/Capability/Pipeline Registry snapshot；冻结 GLM profile 只解析为 `experimental`，legacy 映射只处理固定 endpoint/model 与 `env:GLM_API_KEY` 引用，不读取 key 值；
 - **M2-B/W05 complete（`main@65c867e`）**：RoutePlanner 已把 explicit `SolveIntent + Registry generation + trusted CaptureConstraints` 确定性映射为 Phase 1 单 stage Plan，并以 `PlannedExecution` 原子绑定同代 resolution；ConsentLedger、ConsentGrant、PrivacyGate 与 AuthorizationContext 已实现处理地域/保留/数据/费用四个 unknown 维度的独立确认、半开有效期、grant 条款不可替换、撤销/消费复核和热重载隔离；
-- **M3/W06 complete（当前未提交工作区）**：新增 probe-only 三态 PermissionObservation、trusted display topology/selected-region 合同、Plan-bound 一次性 CaptureAuthorization、canonical PNG 真解码 InputValidator 与 authority-only ValidatedCapture lease；授权、捕获前和捕获后分别复核 consent/permission/topology，ledger 持有不可由返回 proof 重置的原子 attempt 状态；
-- **尚不可用**：没有真实 Quartz/TCC 验收、真实 display/选区/截图 source、纯 Adapter、实际 payload 预览、Egress/session/Transport 或任何 live/eval/E2E 证据，因此当前仍没有可执行的解题用户路径；Registry 中的 `experimental` 只是 exact binding 状态，不代表应用链已可运行，更不能称为 `supported`；
-- legacy `Config`、parse/notify 与 `AnswerResult` 仍留在源码树中，但被 M0 产品入口隔离；旧布尔权限 helper 已永久 fail-closed，新 W06 入口尚未接入应用。W06 不读取 secret、不截图、不构造 SDK 或联网；DNS 全结果、连接 peer 与 rebinding 防护属于 M5。
+- **M3/W06 complete（本地 `main@14a099a`，尚未推送）**：新增 probe-only 三态 PermissionObservation、trusted display topology/selected-region 合同、Plan-bound 一次性 CaptureAuthorization、canonical PNG 真解码 InputValidator 与 authority-only ValidatedCapture lease；授权、捕获前和捕获后分别复核 consent/permission/topology，ledger 持有不可由返回 proof 重置的原子 attempt 状态；
+- **M4/W07 complete（已本地提交，尚未推送）**：新增完整 `SolveIntent → PlannedExecution v3 → SolveRequest → StageInvocation` authority/digest 链、纯 `openai_chat_compatible` GLM Adapter、exact canonical request fixture、bounded `TransportResponse`、strict candidate decode/typed error mapping 与 `AnswerCandidateResult → ResultValidator` 绑定；`prepare/decode` 不读取 secret、环境或文件，不构造 SDK client、不 sleep/retry，也不执行 DNS/socket/HTTP；
+- **尚不可用**：没有真实 Quartz/TCC 验收、真实 display/选区/截图 source、实际 payload 预览、EgressApproval/session/HTTP Transport 或任何 live/eval/E2E 证据，因此当前仍没有可执行的解题用户路径；Registry 中的 `experimental` 只是 exact binding 状态，不代表应用链已可运行，更不能称为 `supported`；
+- legacy `Config`、parse/notify 与 `AnswerResult` 仍留在源码树中，但被 M0 产品入口隔离；旧布尔权限 helper 已永久 fail-closed，新 W06/W07 链尚未接入应用。当前离线链不读取 secret、不截图、不构造 SDK 或联网；DNS 全结果、连接 peer 与 rebinding 防护属于 M5。
 
 因此本文必须区分：
 
@@ -192,7 +193,7 @@ ValidatedCapture
 
 以下为逻辑 Schema；最终可用 dataclass、Pydantic 或等价实现，但字段语义必须稳定。本文的 `Digest256` 是 64 字符小写十六进制 SHA-256。所有安全 digest 统一按 `Digest(type_tag, schema_version, canonical_serializer_version, canonical(fields_except_own_digest))` 计算，并对各段做长度定界/类型域分离；禁止对普通字典的偶然遍历顺序做 hash。
 
-具体排除规则必须进入契约：`CaptureScope.fingerprint` 排除自身，`ExecutionPlan.plan_digest` 排除自身，`QuestionDocument.content_digest` 排除自身，request-envelope digest 排除自身和真实 secret 值、但包含 credential-binding digest。`planned_execution_digest` 排除自身并覆盖 Plan、Registry、pipeline 与 stage-binding digests；`grant_terms_digest` 排除自身及消费/撤销状态并覆盖全部不可变条款，`grant_digest` 只覆盖 terms digest 与消费/撤销 revision；`authorization_id` 由除自身以外的授权绑定字段确定性派生，`authorization_digest` 排除自身并覆盖该 ID 及全部绑定字段。Profile、capability、credential-binding 等受控对象也必须有版本化字段清单。Contract tests 必须提供固定 golden vectors，覆盖字段顺序、Unicode、数字规范化与类型域分离。
+具体排除规则必须进入契约：`CaptureScope.fingerprint` 排除自身，`ExecutionPlan.plan_digest` 排除自身，`QuestionDocument.content_digest` 排除自身，request-envelope digest 排除自身和真实 secret 值、但包含 credential-binding digest。`SolveIntent.intent_digest` 排除自身并覆盖完整截屏前请求，包括 `user_hint` 的实际内容而非仅覆盖其 presence；`planned_execution_digest` 排除自身并覆盖 Plan、Registry、pipeline、stage-binding 与 `solve_intent_digest`。`SolveRequest.solve_request_digest` 再覆盖 intent、plan/planned execution、validated input、locale、结果 Schema 与 hint digest；`StageInvocation.invocation_digest` 覆盖 deterministic invocation id、同一 SolveRequest 与 exact stage/input。`grant_terms_digest` 排除自身及消费/撤销状态并覆盖全部不可变条款，`grant_digest` 只覆盖 terms digest 与消费/撤销 revision；`authorization_id` 由除自身以外的授权绑定字段确定性派生，`authorization_digest` 排除自身并覆盖该 ID 及全部绑定字段。Profile、capability、credential-binding 等受控对象也必须有版本化字段清单。Contract tests 必须提供固定 golden vectors，覆盖字段顺序、Unicode、数字规范化与类型域分离。
 
 所有会影响同意或路由的数据、保留与费用政策必须以不可变快照引用，不能只保存可变名称：
 
@@ -328,9 +329,10 @@ SolveIntent
   max_output_tokens: positive int | profile_default
   requested_result_schema_version: "snapquiz.solve-result.v2"
   user_hint: optional string
+  intent_digest: Digest256
 ```
 
-`SolveIntent` 是截屏前输入。它不得包含尚未产生的 `CaptureArtifact`；RoutePlanner 使用它和本地 Registry 生成计划。
+`SolveIntent` 是截屏前输入。它不得包含尚未产生的 `CaptureArtifact`；RoutePlanner 使用它和本地 Registry 生成计划，并把 exact `intent_digest` 写入 `PlannedExecution`。同一 request、相同 hint presence 但替换 hint 内容会产生不同 digest，不能与原计划、SolveRequest 或 StageInvocation 配对。`repr` 与普通 safe metadata 不得暴露 hint 正文。
 
 ### 4.4 `ExecutionPlan`
 
@@ -409,6 +411,16 @@ ExecutionPlan
 
 Plan 中每个 stage 是 Registry/安全配置的完整快照，不是运行时重新解析的松散 ID。CredentialResolver、PayloadPreparer 与 Transport 必须核对所有 digest/version；profile 热重载或 Registry 变化不能影响已经生成的计划。运行过程中禁止更改 pipeline、模型、endpoint、数据类型、输出 token 上限或结果 Schema。任何未来 fallback 分支都必须包含在初始计划中并一次性通过 PrivacyGate；动态发现“另一个可用模型”不能自动扩展本次计划。
 
+```text
+PlannedExecution
+  plan: ExecutionPlan
+  resolved_pipeline: ResolvedPipelineProfile
+  solve_intent_digest: Digest256
+  planned_execution_digest: Digest256
+```
+
+`snapquiz.planned-execution.v3` 是上述 digest payload 的版本；`PlannedExecution` 对象本身不另存一个可变 schema 字段。它是 Plan、同一 Registry generation resolution 与完整 pre-capture intent digest 的 runtime-final authority。RoutePlanner 算法与 ExecutionPlan 本身仍为 v2；v3 升版只表示 PlannedExecution 的 authority/payload 新增 `solve_intent_digest`，旧 v2 planned digest 不得与新链混用。
+
 `not_applicable` 表示经契约证明该政策/操作不适用，`unknown` 表示缺少资料，二者禁止混用；retention、data 或 cost 为 `unknown` 时必须显著披露并额外确认。Phase 1 的 remote direct stage 只能有一个 inline `inference` operation；`upload`、`delete`、`remote_repair` 与 `model_discovery` 均不可出现在 Phase 1 计划中。
 
 ### 4.5 `SolveRequest`
@@ -418,21 +430,34 @@ SolveRequest
   schema_version: "snapquiz.solve-request.v1"
   request_id: UUID
   plan_id: UUID
-  input: ValidatedCapture
+  plan_digest: Digest256
+  planned_execution_digest: Digest256
+  solve_intent_digest: Digest256
+  capture_id: UUID
+  input: private ValidatedCapture
+  input_digest: Digest256
   requested_result_schema_version: "snapquiz.solve-result.v2"
   locale: BCP-47
   user_hint: optional string
+  user_hint_digest: Digest256
+  solve_request_digest: Digest256
 
 StageInvocation
   invocation_id: UUID
   request_id: UUID
   plan_id: UUID
+  plan_digest: Digest256
+  planned_execution_digest: Digest256
   stage_id: UUID
-  input: ValidatedCapture | QuestionDocument
+  solve_request_digest: Digest256
+  input: private ValidatedCapture | QuestionDocument
   input_digest: Digest256
+  invocation_digest: Digest256
 ```
 
-`SolveRequest` 只能在 ExecutionPlan、PrivacyGate、PermissionGate、CapturePolicy 与 InputValidator 全部通过并取得 active `ValidatedCapture` 后交给 PipelineExecutor；结果 Schema、token 上限与 runtime timeout 一律从 plan/CallContext 读取，SolveRequest 没有 raw CaptureArtifact 或调用方约束覆盖入口。PipelineExecutor 为每个 stage 构造独立 StageInvocation；direct pipeline 只有图片 invocation，OCR pipeline 的第二个 invocation 必须绑定已验证 `QuestionDocument.content_digest`。AuthorizationContext、EgressApproval、AuthorizedSendSession 与运行时 `MonotonicDeadline` 属于调用上下文或 transport capability，不写回 SolveRequest，因此不存在“先有 approval 才能 prepare、先 prepare 才能 approval”的构造循环。
+`SolveRequest` 与 `StageInvocation` 只能由受控 factory 构造，均为不可继承、不可变且禁止通用 dataclass 序列化的 runtime-final authority。`SolveRequestFactory` 只能接收原始 `SolveIntent + 同一 PlannedExecution + active ValidatedCapture`，并 exact 复核 intent digest、Plan 收紧结果、hint 对应的 outbound data kind、capture/plan/preprocessing binding；它不接受 raw CaptureArtifact、调用方自带 MIME/限制或新 Registry lookup。StageInvocation 的 UUID 与 digest 从同一 SolveRequest、stage 和 input 确定性派生并在完整性检查时重算，locale/user hint 只能从该 SolveRequest 取得，不能由 Adapter 调用方另行注入。
+
+`SolveRequest` 只能在 ExecutionPlan、PrivacyGate、PermissionGate、CapturePolicy 与 InputValidator 全部通过并取得 active `ValidatedCapture` 后交给 PipelineExecutor；结果 Schema、token 上限与 runtime timeout 一律从 plan/CallContext 读取。PipelineExecutor 为每个 stage 构造独立 StageInvocation；direct pipeline 只有图片 invocation，OCR pipeline 的第二个 invocation 必须绑定已验证 `QuestionDocument.content_digest`。SolveRequest/StageInvocation 本身不授予出站权限；AuthorizationContext、EgressApproval、AuthorizedSendSession 与运行时 `MonotonicDeadline` 属于调用上下文或 transport capability，不写回 SolveRequest，因此不存在“先有 approval 才能 prepare、先 prepare 才能 approval”的构造循环。
 
 ### 4.6 `SolveResult`
 
@@ -497,6 +522,7 @@ RateLimitError
 NetworkError
 TimeoutError
 ProviderUnavailableError
+ProviderRequestError
 ProviderServerError
 ContentPolicyError
 PayloadTooLargeError
@@ -743,10 +769,9 @@ verification_evidence:
 
 ```text
 StageAdapter.prepare(
+  planned: PlannedExecution,
   invocation: StageInvocation,
-  frozen_stage: ExecutionPlanStage,
-  frozen_operation: ExecutionPlanNetworkOperation,
-  frozen_binding: ResolvedStageBinding
+  operation_id: UUID
 ) -> PreparedOutbound
 
 RemoteTransport.send(
@@ -757,10 +782,10 @@ RemoteTransport.send(
 ) -> TransportResponse
 
 StageAdapter.decode(
-  response: TransportResponse,
-  frozen_stage: ExecutionPlanStage,
-  frozen_operation: ExecutionPlanNetworkOperation,
-  frozen_binding: ResolvedStageBinding
+  planned: PlannedExecution,
+  invocation: StageInvocation,
+  prepared: PreparedOutbound,
+  response: TransportResponse
 ) -> StageResult
 
 LocalStageAdapter.execute_local(
@@ -770,16 +795,18 @@ LocalStageAdapter.execute_local(
 ) -> StageResult
 ```
 
-`prepare` 的返回 `operation_id` 必须与显式传入的 frozen operation 一致，Adapter 不能自行挑选 stage 内的其他 operation。`prepare` 不得读取 credential、构造可能触网的 SDK client 或执行 I/O；`send` 只能消费 session 已批准的原始 body，不能重建或修改它。`execute_local` 只适用于 plan snapshot 证明 `compute_location=local_verified`、`network_scope=none`、`network_operations=[]` 的 in-process stage；否则必须走远程传输链。
+`prepare` 必须从显式传入的 `PlannedExecution` 取得同一 Registry generation 的 frozen stage/operation/binding，并要求返回的 `operation_id` 与调用方指定的 operation exact 一致；Adapter 不能自行挑选 stage 内其他 operation，也不能重新查询当前 Registry。`decode` 必须同时消费原 PlannedExecution、同一 StageInvocation、exact PreparedOutbound 与 TransportResponse，在解析响应 body 前完成 source/plan/stage/operation/envelope correlation。`prepare` 不得读取 credential、构造可能触网的 SDK client 或执行 I/O；`send` 只能消费 session 已批准的原始 body，不能重建或修改它。`execute_local` 只适用于 plan snapshot 证明 `compute_location=local_verified`、`network_scope=none`、`network_operations=[]` 的 in-process stage；否则必须走远程传输链。
 
 Adapter 负责：
 
 - 图片传输编码；
 - Provider 专用消息角色与请求字段；
 - 结构化输出参数；
-- Provider SDK 异常映射；
+- Provider 专用 HTTP/business status、finish reason 与响应 Schema 映射；
 - usage/request id 提取；
 - 原始响应到统一候选结果的转换。
+
+DNS、TLS、socket、redirect、client/SDK I/O 异常与 timeout 的归一化属于 Transport；纯 Adapter 不能为了错误映射而构造 SDK client。Adapter 只允许检查 Transport 已绑定、限长的 status/body，并输出不含 Provider 原始 message/body 的 typed error。
 
 Adapter 不负责：
 
@@ -799,17 +826,22 @@ TransportResponse
   request_envelope_digest: Digest256
   http_status: int
   provider_request_id: string | null
-  usage: object | null
-  raw_response: ephemeral object | bytes | null
+  response_body_digest: Digest256
+  response_byte_size: non-negative int
+  body: ephemeral bounded bytes
 
 StageResult = AnswerCandidateResult | OcrCandidateResult | OperationReceipt
 
 AnswerCandidateResult
-  candidate_payload: object | string | null
+  request_id / plan_id / plan_digest
+  stage_id / operation_id / invocation_digest
+  request_envelope_digest / response_body_digest
+  candidate_payload_digest / candidate_digest
+  candidate_payload: object | null
   refusal: normalized refusal | null
   finish_reason: string | null
   provider_request_id: string | null
-  usage: object | null
+  usage: UsageSummary | null
 
 OcrCandidateResult
   candidate_document: object
@@ -822,9 +854,21 @@ OperationReceipt
   opaque_reference: ephemeral string | null
 ```
 
-`ResolvedStageBinding` 只能由一个不可变 Registry generation 创建，除 profile/capability 对象外还必须冻结 Adapter 实际选择的 image encoding、structured-output 模式、system/reasoning/usage 开关和受控非秘密参数。W05 的 `PlannedExecution` 是非 dataclass、runtime-final 的 `{ExecutionPlan, ResolvedPipelineProfile, planned_execution_digest}`；Plan/stage/operation UUID 由 request、Registry digest、受控计划字段与对应 binding/template digest 做 domain-separated 确定性派生，A 代 Plan 与 B 代 resolution 即使 nested profile 内容相同也不能配对。其 pipeline/provider/capability/adapter/endpoint/credential digests 和版本逐项一致后才能进入 prepare。这样 M4 Adapter 不重新读取“当前 Registry”、不根据 model 字符串猜能力，也不把 Provider 参数硬编码成未纳入 Plan 的旁路。热重载只产生新的 generation，不改变旧 `PlannedExecution`；M4 Adapter 必须接收 PlannedExecution/ResolvedStageBinding，不得只接 Plan 后重新查询 Registry。
+`ResolvedStageBinding` 只能由一个不可变 Registry generation 创建，除 profile/capability 对象外还必须冻结 Adapter 实际选择的 image encoding、structured-output 模式、system/reasoning/usage 开关和受控非秘密参数。当前 `PlannedExecution v3` 是非 dataclass、runtime-final 的 `{ExecutionPlan, ResolvedPipelineProfile, solve_intent_digest, planned_execution_digest}`；Plan/stage/operation UUID 由 request、Registry digest、受控计划字段与对应 binding/template digest 做 domain-separated 确定性派生，A 代 Plan 与 B 代 resolution 即使 nested profile 内容相同也不能配对。其 pipeline/provider/capability/adapter/endpoint/credential digests 和版本逐项一致后才能进入 prepare。这样 Adapter 不重新读取“当前 Registry”、不根据 model 字符串猜能力，也不把 Provider 参数硬编码成未纳入 Plan 的旁路。热重载只产生新的 generation，不改变旧 PlannedExecution；Adapter 必须接收 PlannedExecution，不得只接 Plan 后重新查询 Registry。
 
-TransportResponse 的 plan/stage/operation/envelope 必须与 session 和显式 frozen operation 完全一致，否则在 decode 前失败。`raw_response` 只允许在当前调用栈内用于 Decoder/ErrorMapper，默认不得持久化或记录。只有 AnswerCandidateResult 可以进入 ResultValidator 并转换为 SolveResult；OcrCandidateResult 必须先进入 QuestionDocumentValidator 与 OcrQualityGate；未来 upload/delete/model-discovery 使用 OperationReceipt，不能冒充答案结果。Adapter 不得自行绕过对应 Validator。
+TransportResponse 只承载至多 2 MiB 的 opaque response bytes、状态与 exact binding，不解析 usage。其 plan/stage/operation/envelope 必须与 session、PreparedOutbound 和显式 frozen operation 完全一致，否则在 body decode 前失败。Adapter 才能从 Provider body 提取并规范化 usage 到 AnswerCandidateResult；原始 body 只允许在当前调用栈内用于 Decoder/ErrorMapper，默认不得持久化或记录。只有 AnswerCandidateResult 可以进入 ResultValidator 并转换为 SolveResult；OcrCandidateResult 必须先进入 QuestionDocumentValidator 与 OcrQualityGate；未来 upload/delete/model-discovery 使用 OperationReceipt，不能冒充答案结果。Adapter 不得自行绕过对应 Validator。
+
+当前 W07 的 GLM v1 具体合同为：
+
+- Registry revision 为 `snapquiz.builtin-registry@2026-08-31-m4`，Adapter version 为 `snapquiz.openai-chat-compatible.glm-4.6v-flash.v1`，prompt ref 为 `snapquiz.prompt-policy.solve-result-v2.v1`，图片 preprocessing version 为 `snapquiz.image-preprocessing.canonical-png-pass-through.v1`；
+- `prepare` 只接受 active、Plan-bound canonical PNG `ValidatedCapture`，对原始 PNG bytes 做一次标准 Base64，裸字符串写入 `messages[].content[].image_url.url`；禁止 Data URI 前缀、公共 URL、换行、JPEG 转换、resize 或任何隐藏 preprocessing；
+- body 只含冻结 model、max tokens、system instruction 与 image/text user message，并使用 canonical JSON bytes；v1 选择 `prompt_only`、不发送 reasoning control。虽然通用 binding 可冻结 `fixed_non_secret_parameters`，GLM Adapter v1 尚未实现任何 fixed parameter 消费，因此该 tuple 必须为空，非空时在序列化前 fail-closed；
+- `prepare` 可确定性重复执行且不消费未来的 send authority；release 先发生时 fail-closed，prepare/release 竞争只能线性化为 exact body 或 CaptureError，不能产生部分 payload；
+- success wrapper 必须是严格 JSON object、model 与 frozen binding exact 相等、`choices` 长度恰为 1，且唯一 choice 的 `index` 必须是 exact int `0`，不能把 bool/float/string 强制转换为整数；message 必须是 assistant、content 非空、不得含非空 tool calls 或 audio，完整结果只能以 `finish_reason=stop` 接受；
+- binding 声明 `expect_usage=true`，因此 `prompt_tokens/completion_tokens/total_tokens` 必须全部是非负 exact int，并满足 `total_tokens = prompt_tokens + completion_tokens`；usage 只进入 AnswerCandidateResult/StageProvenance，不属于 TransportResponse；
+- candidate 正文只接受一个 JSON object，或恰好包住整个 object 的单层 fenced block；opening fence 只能带 exact `json` 标签或不带标签，并且 opening/object/closing 之间必须使用约定的换行。BOM、重复 key、非有限数、超限数字/深度、局部/多层 fence、前后说明文字、从正文搜索 JSON 与远程 repair 全部拒绝；
+- 400–599 响应先尝试严格解析 `body.error.code`：只接受四位 ASCII 十进制 string 或 1000–9999 exact int，且 code 必须出现在 v1 固定表并与该 code 的预期 HTTP status exact 匹配。认证类 `1000/1001/1003/1005/1220/1309/1311/1314/1315`、请求类 `1113/1210–1215/1221/1222`、服务端类 `1200/1230/1234`、限流类 `1302/1308/1310/1313/1316–1321` 分别映射为对应 typed error；其中只有普通速率限制 `1302` 为 retryable，额度/周期/公平策略/余额上限 `1308/1310/1313/1316–1321` 在当前请求内均为 non-retryable。`1261` 映射 PayloadTooLargeError，`1301` 映射 ContentPolicyError，`1305` 映射 ProviderUnavailableError。unknown、malformed、duplicate、类型错误或 status 不匹配的 code 不得覆盖 HTTP fallback；
+- HTTP fallback 固定为：3xx → EndpointPolicyError，401/403 → AuthError，408/504 → TimeoutError，413 → PayloadTooLargeError，429 → RateLimitError，503 → ProviderUnavailableError，其余 5xx → ProviderServerError，其余 4xx → ProviderRequestError，非 200 的其他成功状态 → InvalidOutputError。`error.message` 和原始错误 body 不得进入异常、repr、safe metadata 或日志；business map 的任何变化都必须升级 Adapter version 并重跑 fixtures。
 
 第二阶段的 OCR 最小能力契约为：
 
@@ -857,7 +901,7 @@ OCR stage 可以使用 `component_id/version`，不强制伪装成生成模型 `
 
 | Provider | Adapter family | 图片序列化 | 结构化输出基线 | 角色 |
 |---|---|---|---|---|
-| 智谱 GLM | `openai_chat_compatible` + `zhipu` profile | exact GLM-4.6V-Flash profile 首版冻结为 `image_url` 中的 raw Base64；公开 URL 仅记为能力，不进入 Phase 1 本地截图路径 | 视觉型号首版按 `prompt_only`，实测后才能升级 | Phase 1A 显式开发迁移起点，不是发布默认项 |
+| 智谱 GLM | `openai_chat_compatible` + `zhipu` profile | exact GLM-4.6V-Flash v1 冻结为 canonical PNG bytes 经过一次标准 Base64 后直接写入 `image_url.url`；无 Data URI 前缀、无公开 URL、无转码/resize | 视觉型号首版按 `prompt_only`，实测后才能升级 | Phase 1A 已完成离线 Adapter，仍是 experimental，不是发布默认项 |
 | OpenAI | `openai_responses` | `input_image` URL / Data URI / file id | 支持的型号可用原生 JSON Schema；按 profile/model 验证 | 不同协议族候选 |
 | Anthropic Claude API | `anthropic_messages` | image block：base64 / URL / file id | 支持的型号/平台可用原生 JSON Schema | 不同协议族候选；不依赖其兼容层 |
 | Google Gemini | `gemini_interactions` 或 `openai_chat_compatible` + `gemini_beta` profile | Interactions：`image.data` raw base64 / `image.uri`；兼容层：`image_url` Data URI | 按 adapter/profile 验证 Schema | native profile 钉住 API version 并设置 `store=false`；兼容层仍按 beta 对待 |
@@ -872,7 +916,7 @@ OCR stage 可以使用 `component_id/version`，不强制伪装成生成模型 `
 
 当前官方参考：
 
-- 智谱：[GLM-4.6V-Flash](https://docs.bigmodel.cn/cn/guide/models/free/glm-4.6v-flash)、[OpenAI API 兼容](https://docs.bigmodel.cn/cn/guide/develop/openai/introduction)、[Chat Completions API](https://docs.bigmodel.cn/api-reference/模型-api/对话补全)
+- 智谱：[GLM-4.6V-Flash](https://docs.bigmodel.cn/cn/guide/models/free/glm-4.6v-flash)、[OpenAI API 兼容](https://docs.bigmodel.cn/cn/guide/develop/openai/introduction)、[Chat Completions API](https://docs.bigmodel.cn/api-reference/模型-api/对话补全)、[HTTP 与业务错误码](https://docs.bigmodel.cn/cn/api/api-code)
 - OpenAI：[Responses API](https://developers.openai.com/api/reference/cli/resources/responses/methods/create)、[Image inputs](https://developers.openai.com/api/docs/guides/images-vision)、[Structured Outputs](https://developers.openai.com/api/docs/guides/structured-outputs)、[Data controls / retention](https://developers.openai.com/api/docs/guides/your-data)
 - Anthropic：[Vision](https://platform.claude.com/docs/en/build-with-claude/vision)、[Structured Outputs](https://platform.claude.com/docs/en/build-with-claude/structured-outputs)、[OpenAI compatibility limits](https://platform.claude.com/docs/zh-CN/cli-sdks-libraries/libraries/openai-sdk)
 - Google：[Interactions API](https://ai.google.dev/gemini-api/docs/interactions-overview)、[API versions](https://ai.google.dev/gemini-api/docs/api-versions)、[Gemini OpenAI compatibility](https://ai.google.dev/gemini-api/docs/openai)、[Image understanding](https://ai.google.dev/gemini-api/docs/image-understanding)、[Structured Outputs](https://ai.google.dev/gemini-api/docs/structured-output)
@@ -1002,7 +1046,7 @@ Provider 特有的格式控制、reasoning 参数、图片 detail 和 token 参�
 - Presenter 必须把模型输出当作不可信纯文本；禁止渲染 HTML、Markdown 图片、自动链接预览或任何会产生二次网络请求的富文本；
 - 通知可关闭或隐藏答案预览；
 - 允许记录的字段：request id、profile id、模型、pipeline、图片尺寸/字节、阶段耗时、重试次数、错误类别和 usage；
-- 完整图片 hash 只用于本地缓存，不进入普通日志。
+- 完整图片 hash 只用于本地缓存，不进入普通日志；`planned_execution_digest` 由完整 SolveIntent 间接派生，因此连其短前缀也不得进入 PlannedExecution/AuthorizationContext 的 `repr`、safe metadata 或普通日志。受控验证记录若确需关联执行，必须使用不反推出该 digest 的独立 record id；
 - 所有成功、失败、超时和取消终态都必须在统一 `finally` 中释放 CaptureArtifact bytes、PreparedOutbound body、credential handle 与 raw response，并关闭临时流/文件；可变 secret buffer 做 best-effort 清零，但不得声称 Python immutable bytes 可安全擦除；
 - 终态后 StudyStore、日志、回调、retry timer 与后台任务不得继续持有上述内容对象，除非用户已通过独立 StoragePolicy 明确授权的字段。
 
@@ -1020,7 +1064,7 @@ Provider 特有的格式控制、reasoning 参数、图片 detail 和 token 参�
 | 可验证的语义拒答 | 不重试，映射为 `SolveResult.refused` |
 | API 在生成结果前的内容策略阻断 | 不重试，映射为 `ContentPolicyError` |
 | 输出 Schema 损坏 | Phase 1 最多一次本地确定性格式修复；网络调用 0 次；失败返回 `InvalidOutputError` |
-| 429 | 仅遵守 `Retry-After` 且预算允许时重试 |
+| 429 | 已知额度/周期/公平策略/余额上限业务码不重试；普通速率限制或未知 HTTP fallback 仅在 W08/W09 验证 `Retry-After` 且预算允许时重试 |
 | 网络中断、连接超时、可重试 5xx | 有限指数退避 + jitter |
 
 ### 9.2 总预算
@@ -1115,7 +1159,7 @@ capabilities_ref = "zhipu/glm-4.6v-flash@verified-date"
 ### 11.1 测试层级
 
 1. **纯领域单测**：Schema、路由硬条件、权限 fail-closed、配置、错误映射、预算计算，以及各安全 digest 的 canonical golden vectors；
-2. **Adapter contract tests**：用录制 fixture 验证请求序列化、响应解析、usage、错误映射，禁止触网；
+2. **Adapter contract tests**：用仓库内固定的非敏感合成/受控 fixture 验证请求序列化、响应解析、usage、错误映射，禁止触网；生产响应录制不能进入普通测试资产；
 3. **安全回归**，至少覆盖：
    - consent、权限、选区、输入校验或 EgressGate 任一失败时，secret resolver、SDK client/model discovery、DNS/socket/HTTP 均为零；
    - scope fingerprint 或 credential binding 不匹配时零网络，exact endpoint 由 network spy 验证；
@@ -1202,9 +1246,9 @@ capabilities_ref = "zhipu/glm-4.6v-flash@verified-date"
 - `M7`：把 macOS 真实选区接入已经通过 M0–M6 的同一安全链，并保持 `experimental`；
 - 严格验证结果，禁止空 JSON 成功；GLM 不进入默认用户列表；当前 fail-open、默认全屏、任意 endpoint、raw fallback 与不受控重试均不属于兼容目标。
 
-**当前实现状态（2026-08-29 工作区）**：M0–M3/W06 的离线合同已完成；M4–M9 均未完成。W05 已提交并推送为 `main@65c867e`；W06 当前仍是未提交工作区改动。W05 已提供受控 GLM exact Registry → pre-capture Plan、同代 PlannedExecution 与进程内 Consent/Authorization authority；W06 已提供 topology-bound Plan、probe-only PermissionObservation、selected physical region CapturePolicy、ledger-owned one-shot artifact/validation authority、canonical PNG InputValidator 与 ValidatedCapture lease。GLM 仍没有 VerificationRecord，因此只派生 `experimental`。应用仍被有意冻结，没有真实 Quartz/TCC 证明、真实 topology/选区/截图、密钥解析、SDK 构造、Provider API 调用、live smoke 或真实 macOS E2E。Phase 1 的 query 固定为空；`QueryPolicyKind.EXACT` 仍未启用。DNS 全结果、连接 peer 与 rebinding 防护仍属于 M5，离线 endpoint/Planner/Consent/Capture 契约不证明传输或用户路径安全。
+**当前实现状态（2026-08-31 工作区）**：M0–M4/W07 的离线合同已完成；M5–M9 均未完成。W05 已提交并推送为 `main@65c867e`；W06 已本地提交为 `main@14a099a`，W07 已本地提交为 `feat: add pure multimodal adapter contracts`，二者均尚未推送。W05 已提供受控 GLM exact Registry → pre-capture Plan、同代 PlannedExecution 与进程内 Consent/Authorization authority；W06 已提供 topology-bound Plan、probe-only PermissionObservation、selected physical region CapturePolicy、ledger-owned one-shot artifact/validation authority、canonical PNG InputValidator 与 ValidatedCapture lease；W07 已提供 intent-bound PlannedExecution v3、SolveRequest/StageInvocation authority、exact raw-Base64 PNG request serialization、bounded response/candidate contracts、strict decoder、GLM HTTP/business-code typed error mapping 与零 I/O 纯 Adapter。GLM 仍没有 VerificationRecord，因此只派生 `experimental`。应用仍被有意冻结，没有真实 Quartz/TCC 证明、真实 topology/选区/截图、Egress/session/HTTP Transport、密钥解析、SDK 构造、Provider API 调用、live smoke 或真实 macOS E2E。Phase 1 的 query 固定为空；`QueryPolicyKind.EXACT` 仍未启用。DNS 全结果、连接 peer 与 rebinding 防护仍属于 M5，离线 endpoint/Planner/Consent/Capture/Adapter 契约不证明传输或用户路径安全。
 
-`M1–M3` 的离线脚手架已经完成；任何真实 Provider、真实截图或默认入口切换仍必须严格按 M4→M5→M6→M7 的剩余门禁推进。详细工作包、依赖和当前状态以 Implementation Plan 为准；Plan 不得弱化本 Spec 的约束。
+`M1–M4` 的离线脚手架已经完成；任何真实 Provider、真实截图或默认入口切换仍必须严格按 M5→M6→M7 的剩余门禁推进。详细工作包、依赖和当前状态以 Implementation Plan 为准；Plan 不得弱化本 Spec 的约束。
 
 **验收**：迁移后的纯逻辑测试通过；新增安全与契约测试；GLM 合成题图 live smoke 通过；真实用户远程截图路径只有在最小选区/预览/Egress 链完整且 M0–M6 全部通过时才可启用。所有 pre-gate 失败均为零 secret resolve、零 SDK 构造、零 DNS/socket/HTTP。
 
@@ -1260,7 +1304,8 @@ snapquiz/
 │   └── profiles.py
 ├── domain/
 │   ├── capture.py              # CaptureArtifact
-│   ├── solve.py                # SolveRequest / SolveResult
+│   ├── solve.py                # SolveResult / provenance / usage
+│   ├── adapter.py              # TransportResponse / AnswerCandidateResult
 │   ├── digest.py               # versioned canonical digest
 │   ├── errors.py
 │   └── capabilities.py
@@ -1271,10 +1316,12 @@ snapquiz/
 │   ├── registry.py
 │   └── planner.py
 ├── pipelines/
+│   ├── contracts.py            # SolveRequest / StageInvocation authority
 │   ├── multimodal.py
 │   └── ocr_text.py             # Phase 2 前不可运行
 ├── adapters/
-│   ├── base.py
+│   ├── base.py                 # future shared multi-family interface
+│   ├── prompt.py               # content-addressed SolveResult v2 prompt
 │   ├── openai_chat_compatible.py
 │   ├── openai_responses.py
 │   ├── anthropic_messages.py

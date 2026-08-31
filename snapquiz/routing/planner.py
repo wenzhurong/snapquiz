@@ -38,7 +38,7 @@ from snapquiz.routing.registry import (
 )
 
 ROUTE_PLANNER_SCHEMA_VERSION = "snapquiz.route-planner.v2"
-PLANNED_EXECUTION_SCHEMA_VERSION = "snapquiz.planned-execution.v2"
+PLANNED_EXECUTION_SCHEMA_VERSION = "snapquiz.planned-execution.v3"
 
 _PLANNER_UUID_NAMESPACE = UUID("10f036ee-5208-5e28-9b12-943a816fe823")
 _PLANNED_EXECUTION_AUTHORITY = object()
@@ -228,7 +228,9 @@ def _tighten_capture_constraints(
 
 
 def _planned_execution_payload(
-    plan: ExecutionPlan, resolved: ResolvedPipelineProfile
+    plan: ExecutionPlan,
+    resolved: ResolvedPipelineProfile,
+    solve_intent_digest: Digest256,
 ) -> dict[str, object]:
     return {
         "plan_id": plan.plan_id,
@@ -242,6 +244,7 @@ def _planned_execution_payload(
         "stage_binding_digests": tuple(
             stage.stage_binding.stage_binding_digest for stage in resolved.stages
         ),
+        "solve_intent_digest": solve_intent_digest,
     }
 
 
@@ -253,13 +256,19 @@ class PlannedExecution:
     lookup against a mutable "current" Registry.
     """
 
-    __slots__ = ("plan", "resolved_pipeline", "planned_execution_digest")
+    __slots__ = (
+        "plan",
+        "resolved_pipeline",
+        "solve_intent_digest",
+        "planned_execution_digest",
+    )
 
     def __init__(
         self,
         *,
         plan: ExecutionPlan,
         resolved_pipeline: ResolvedPipelineProfile,
+        solve_intent_digest: Digest256,
         _authority: object | None = None,
     ) -> None:
         if _authority is not _PLANNED_EXECUTION_AUTHORITY:
@@ -268,8 +277,11 @@ class PlannedExecution:
             raise ValueError("plan must be ExecutionPlan")
         if type(resolved_pipeline) is not ResolvedPipelineProfile:
             raise ValueError("resolved_pipeline must be ResolvedPipelineProfile")
+        if type(solve_intent_digest) is not Digest256:
+            raise ValueError("solve_intent_digest must be Digest256")
         object.__setattr__(self, "plan", plan)
         object.__setattr__(self, "resolved_pipeline", resolved_pipeline)
+        object.__setattr__(self, "solve_intent_digest", solve_intent_digest)
         self._validate_pair()
         object.__setattr__(
             self,
@@ -277,7 +289,11 @@ class PlannedExecution:
             digest256(
                 "PlannedExecution",
                 PLANNED_EXECUTION_SCHEMA_VERSION,
-                _planned_execution_payload(plan, resolved_pipeline),
+                _planned_execution_payload(
+                    plan,
+                    resolved_pipeline,
+                    solve_intent_digest,
+                ),
             ),
         )
 
@@ -294,9 +310,7 @@ class PlannedExecution:
             "PlannedExecution("
             f"plan_id={self.plan.plan_id!r}, "
             f"pipeline_profile_id={self.plan.pipeline_profile_id!r}, "
-            f"availability={self.resolved_pipeline.availability.value!r}, "
-            "planned_execution_digest_prefix="
-            f"{_short_digest(self.planned_execution_digest)!r})"
+            f"availability={self.resolved_pipeline.availability.value!r})"
         )
 
     def safe_metadata(self) -> dict[str, object]:
@@ -308,16 +322,17 @@ class PlannedExecution:
             ),
             "pipeline_profile_id": self.plan.pipeline_profile_id,
             "availability": self.resolved_pipeline.availability.value,
-            "planned_execution_digest_prefix": _short_digest(
-                self.planned_execution_digest
-            ),
         }
 
     def recompute_digest(self) -> Digest256:
         return digest256(
             "PlannedExecution",
             PLANNED_EXECUTION_SCHEMA_VERSION,
-            _planned_execution_payload(self.plan, self.resolved_pipeline),
+            _planned_execution_payload(
+                self.plan,
+                self.resolved_pipeline,
+                self.solve_intent_digest,
+            ),
         )
 
     def validate_integrity(self) -> None:
@@ -328,6 +343,8 @@ class PlannedExecution:
                 raise ValueError(
                     "planned execution contains an invalid resolution"
                 )
+            if type(self.solve_intent_digest) is not Digest256:
+                raise ValueError("planned execution contains an invalid intent digest")
             if type(self.planned_execution_digest) is not Digest256:
                 raise ValueError("planned execution digest has an invalid type")
             self._validate_pair()
@@ -525,6 +542,10 @@ class RoutePlanner:
     ) -> PlannedExecution:
         if type(intent) is not SolveIntent:
             raise TypeError("intent must be SolveIntent")
+        try:
+            intent.validate_integrity()
+        except (TypeError, ValueError, AttributeError) as error:
+            raise _config_error("请求意图完整性校验失败。") from error
         if type(registry) is not RegistrySnapshot:
             raise TypeError("registry must be RegistrySnapshot")
         if type(trusted_capture_constraints) is not CaptureConstraints:
@@ -740,6 +761,7 @@ class RoutePlanner:
         return PlannedExecution(
             plan=plan,
             resolved_pipeline=resolved,
+            solve_intent_digest=intent.intent_digest,
             _authority=_PLANNED_EXECUTION_AUTHORITY,
         )
 

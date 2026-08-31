@@ -61,7 +61,7 @@ from snapquiz.routing.registry import (
 
 
 REGISTRY_GOLDEN_DIGEST = (
-    "577f8882ea7260d8d665de1fc4484ee7675ee1983093df5c6673c921dc7c39c4"
+    "9a04c537f6119e49a0bf4a84e476dd8c832321573779fbb9583856ea845aa112"
 )
 
 

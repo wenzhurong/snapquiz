@@ -13,6 +13,14 @@ from snapquiz.domain.capture import (
     CoordinateSpace,
     validate_capture_artifact,
 )
+from snapquiz.domain.adapter import (
+    ANSWER_CANDIDATE_SCHEMA_VERSION,
+    MAX_PROVIDER_RESPONSE_BYTES,
+    TRANSPORT_RESPONSE_SCHEMA_VERSION,
+    AnswerCandidateResult,
+    NormalizedRefusal,
+    TransportResponse,
+)
 from snapquiz.domain.capabilities import (
     CapabilityRole,
     CredentialBindingMetadata,
@@ -37,6 +45,7 @@ from snapquiz.domain.digest import (
 )
 from snapquiz.domain.intent import (
     MAX_USER_HINT_CHARS,
+    SOLVE_INTENT_DIGEST_SCHEMA_VERSION,
     SOLVE_INTENT_SCHEMA_VERSION,
     OutputTokenLimit,
     SolveIntent,
@@ -84,6 +93,8 @@ from snapquiz.domain.solve import (
 
 __all__ = [
     "CANONICAL_SERIALIZER_VERSION",
+    "ANSWER_CANDIDATE_SCHEMA_VERSION",
+    "AnswerCandidateResult",
     "CaptureArtifact",
     "CaptureConstraints",
     "CaptureRect",
@@ -108,6 +119,7 @@ __all__ = [
     "ImageInputKind",
     "InputModality",
     "MAX_USER_HINT_CHARS",
+    "MAX_PROVIDER_RESPONSE_BYTES",
     "ModelCapabilitiesSnapshot",
     "NON_SECRET_HEADERS_SCHEMA_VERSION",
     "NetworkOperationPurpose",
@@ -115,6 +127,7 @@ __all__ = [
     "NonSecretHeader",
     "OutboundDataKind",
     "OutputTokenLimit",
+    "NormalizedRefusal",
     "PipelineKind",
     "PipelineProfileSnapshot",
     "PREPARED_BODY_SCHEMA_VERSION",
@@ -128,6 +141,7 @@ __all__ = [
     "RequiredConsentScope",
     "RedirectPolicy",
     "SOLVE_INTENT_SCHEMA_VERSION",
+    "SOLVE_INTENT_DIGEST_SCHEMA_VERSION",
     "SolveIntent",
     "SolveProvenance",
     "SolveResult",
@@ -136,6 +150,8 @@ __all__ = [
     "StageProvenance",
     "StageBindingSnapshot",
     "StructuredOutputKind",
+    "TRANSPORT_RESPONSE_SCHEMA_VERSION",
+    "TransportResponse",
     "UsageSummary",
     "canonical_json_bytes",
     "digest256",

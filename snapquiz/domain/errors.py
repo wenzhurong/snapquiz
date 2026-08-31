@@ -94,6 +94,11 @@ class ProviderUnavailableError(OperationError):
     default_retryable = True
 
 
+class ProviderRequestError(OperationError):
+    default_code = "provider_request_error"
+    default_message = "模型服务拒绝了请求。"
+
+
 class ProviderServerError(OperationError):
     default_code = "provider_server_error"
     default_message = "模型服务发生错误。"

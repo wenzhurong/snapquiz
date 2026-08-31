@@ -1084,39 +1084,39 @@ class W06GoldenVectorTest(unittest.TestCase):
 
         expected = {
             "permission_observation_digest": (
-                "561e71a5d080e6981e6be6bbb7b64991"
-                "ad2adc6a9da107b945fb1002d20e1831"
+                "29d7200b61b33b56bd2aacd3415f7936"
+                "d0f66d5a8ea76a42eab2719eeeed823a"
             ),
             "topology_revision": (
                 "44427e62ca3bcb355264ee5b0f65d18c"
                 "cfbf0582114990a6cf215f659c3f058a"
             ),
             "topology_snapshot_digest": (
-                "baba2b8e73c64065dc05269574a7071a"
-                "43428b82789abf7e2339f8f50e59c645"
+                "447fbdb93ce846d872bb2a7755d77477"
+                "db1ef516c1a5ff63a94678381bed3cad"
             ),
             "scope_fingerprint": (
                 "7de10e3855b0a350ddb932963551f9df"
                 "9862e8ecb6fe63e2d1d9f5dd970755ad"
             ),
             "capture_authorization_id": (
-                "b373057b-417e-584b-bc7f-a2a07689d3b2"
+                "65559638-a4fe-5a04-be45-97dec454291b"
             ),
             "capture_authorization_digest": (
-                "389407e6ee86dc1eba1eba3926e6501a"
-                "05eb8ffc851df5246640a39aefa25251"
+                "5d8feede1f21c7e79be5a83d70ce2e1e"
+                "88be75510b3534fec5ef1eae5643d420"
             ),
             "consumption_digest": (
-                "58234d733ae66d1b65c588f32e1d7ab"
-                "3f420be6ae5cec26b158c05c376331032"
+                "6b23c7ce37a3e8fa264fa5db9c4b0e69"
+                "c05f04edc71c90d620cbe2ef3b39bea7"
             ),
             "artifact_sha256": (
                 "5589c8bdac912d404d5fb722a09eefad"
                 "0a68bae711f7d5748508bacc0fbdb50c"
             ),
             "validation_digest": (
-                "830c5b457dd21d4166ce8ba8ab341a7f"
-                "f03c8528dd4dbf07da2b5cde1c987b73"
+                "0d0ab8a8ac7792535c0f51a330e75fe4"
+                "5a0d6278abcfbc0789f4080a94d092bc"
             ),
         }
         actual = {

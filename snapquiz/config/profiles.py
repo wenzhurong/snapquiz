@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+from snapquiz.adapters.prompt import PROMPT_POLICY_DIGEST, PROMPT_POLICY_REF
 from snapquiz.domain.capabilities import (
     CapabilityRole,
     CredentialBindingMetadata,
@@ -25,7 +26,7 @@ from snapquiz.domain.capabilities import (
     StructuredOutputKind,
 )
 from snapquiz.domain.capture import CaptureScopeKind
-from snapquiz.domain.digest import Digest256, digest256
+from snapquiz.domain.digest import Digest256
 from snapquiz.domain.plan import (
     CanonicalQueryPolicy,
     ComputeLocation,
@@ -40,19 +41,19 @@ from snapquiz.domain.solve import PipelineKind, SOLVE_RESULT_SCHEMA_VERSION, Sta
 from snapquiz.result.validator import RESULT_VALIDATOR_VERSION
 from snapquiz.routing.registry import RegistryAuthority, RegistrySnapshot
 
-BUILTIN_REGISTRY_REVISION = "snapquiz.builtin-registry@2026-08-29"
-BUILTIN_REGISTRY_PUBLISHED_AT = datetime(2026, 8, 29, tzinfo=timezone.utc)
+BUILTIN_REGISTRY_REVISION = "snapquiz.builtin-registry@2026-08-31-m4"
+BUILTIN_REGISTRY_PUBLISHED_AT = datetime(2026, 8, 31, tzinfo=timezone.utc)
 
 GLM_PROVIDER_ID = "zhipu"
 GLM_MODEL_ID = "glm-4.6v-flash"
 GLM_PROVIDER_PROFILE_ID = "provider.zhipu.official.v4"
-GLM_CAPABILITIES_REF = "capabilities:zhipu/glm-4.6v-flash@2026-08-29"
+GLM_CAPABILITIES_REF = "capabilities:zhipu/glm-4.6v-flash@2026-08-31"
 GLM_BINDING_ID = "binding:zhipu/glm-4.6v-flash@openai-chat.v1"
-GLM_PIPELINE_PROFILE_ID = "direct-zhipu-glm-4.6v-flash-legacy"
+GLM_PIPELINE_PROFILE_ID = "direct-zhipu-glm-4.6v-flash-v1"
 GLM_ENDPOINT_POLICY_VERSION = "zhipu-official-chat-completions.v1"
 GLM_NETWORK_POLICY_VERSION = "remote-https.v1"
 GLM_TLS_POLICY_REF = "system-trust-hostname-verify.v1"
-GLM_CREDENTIAL_BINDING_REF = "registry:zhipu-official-glm-legacy.v1"
+GLM_CREDENTIAL_BINDING_REF = "registry:zhipu-official-glm.v1"
 GLM_CREDENTIAL_REF = "env:GLM_API_KEY"
 
 GLM_ALLOWED_ORIGIN = "https://open.bigmodel.cn:443/"
@@ -63,16 +64,12 @@ GLM_CHAT_COMPLETIONS_ENDPOINT = (
 GLM_LEGACY_BASE_URL = "https://open.bigmodel.cn/api/paas/v4"
 
 GLM_ADAPTER_FAMILY = "openai_chat_compatible"
-# The adapter is intentionally not implemented in W04.  M4 must replace this
-# version and will therefore invalidate every transitive profile digest.
-GLM_ADAPTER_VERSION = "snapquiz.openai-chat-compatible.pending-m4.v1"
-GLM_IMAGE_PREPROCESSING_POLICY_VERSION = "snapquiz.image-preprocessing.pending-m4.v1"
-GLM_PROMPT_POLICY_REF = "snapquiz.prompt-policy.pending-m4.v1"
-GLM_PROMPT_POLICY_DIGEST = digest256(
-    "PromptPolicyReference",
-    "snapquiz.prompt-policy-reference.v1",
-    {"ref": GLM_PROMPT_POLICY_REF},
+GLM_ADAPTER_VERSION = "snapquiz.openai-chat-compatible.glm-4.6v-flash.v1"
+GLM_IMAGE_PREPROCESSING_POLICY_VERSION = (
+    "snapquiz.image-preprocessing.canonical-png-pass-through.v1"
 )
+GLM_PROMPT_POLICY_REF = PROMPT_POLICY_REF
+GLM_PROMPT_POLICY_DIGEST = PROMPT_POLICY_DIGEST
 
 
 def build_builtin_registry() -> RegistrySnapshot:
@@ -207,12 +204,15 @@ __all__ = [
     "GLM_CREDENTIAL_BINDING_REF",
     "GLM_CREDENTIAL_REF",
     "GLM_ENDPOINT_POLICY_VERSION",
+    "GLM_IMAGE_PREPROCESSING_POLICY_VERSION",
     "GLM_LEGACY_BASE_URL",
     "GLM_MODEL_ID",
     "GLM_NETWORK_POLICY_VERSION",
     "GLM_PIPELINE_PROFILE_ID",
     "GLM_PROVIDER_ID",
     "GLM_PROVIDER_PROFILE_ID",
+    "GLM_PROMPT_POLICY_DIGEST",
+    "GLM_PROMPT_POLICY_REF",
     "GLM_TLS_POLICY_REF",
     "build_builtin_registry",
     "builtin_registry_digest",

@@ -42,7 +42,7 @@ from snapquiz.privacy.consent import (
 )
 from snapquiz.routing.planner import PlannedExecution, RoutePlanner
 
-NOW = datetime(2026, 8, 29, 12, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 8, 31, 12, 0, tzinfo=timezone.utc)
 REQUEST_ID = UUID("10000000-0000-0000-0000-000000000001")
 GRANT_ID = UUID("10000000-0000-0000-0000-000000000002")
 CAPTURE_ID = UUID("10000000-0000-0000-0000-000000000003")

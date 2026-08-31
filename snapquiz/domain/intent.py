@@ -13,9 +13,11 @@ from snapquiz.domain._validation import (
     runtime_final,
 )
 from snapquiz.domain.capture import CaptureScopeKind
+from snapquiz.domain.digest import Digest256, digest256
 from snapquiz.domain.solve import SOLVE_RESULT_SCHEMA_VERSION
 
 SOLVE_INTENT_SCHEMA_VERSION = "snapquiz.solve-intent.v1"
+SOLVE_INTENT_DIGEST_SCHEMA_VERSION = "snapquiz.solve-intent-digest.v1"
 MAX_USER_HINT_CHARS = 4_000
 _BCP47_RE = re.compile(r"^[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8})*$")
 
@@ -37,6 +39,7 @@ class SolveIntent:
     max_output_tokens: int | OutputTokenLimit
     requested_result_schema_version: str
     user_hint: str | None
+    intent_digest: Digest256
 
     __slots__ = (
         "schema_version",
@@ -48,6 +51,7 @@ class SolveIntent:
         "max_output_tokens",
         "requested_result_schema_version",
         "user_hint",
+        "intent_digest",
     )
 
     def __init__(
@@ -95,6 +99,7 @@ class SolveIntent:
             ("user_hint", user_hint),
         ):
             object.__setattr__(self, name, value)
+        object.__setattr__(self, "intent_digest", self.recompute_digest())
 
     def __setattr__(self, name: str, value: object) -> None:
         raise AttributeError("SolveIntent is immutable")
@@ -113,3 +118,53 @@ class SolveIntent:
 
     def __deepcopy__(self, memo: dict[int, object]) -> "SolveIntent":
         return self
+
+    def recompute_digest(self) -> Digest256:
+        """Bind the complete pre-capture request without exposing its hint."""
+
+        return digest256(
+            "SolveIntent",
+            SOLVE_INTENT_DIGEST_SCHEMA_VERSION,
+            {
+                "schema_version": self.schema_version,
+                "request_id": self.request_id,
+                "pipeline_profile_id": self.pipeline_profile_id,
+                "capture_scope_preference": self.capture_scope_preference.value,
+                "locale": self.locale,
+                "timeout_budget_ms": self.timeout_budget_ms,
+                "max_output_tokens": (
+                    self.max_output_tokens.value
+                    if isinstance(self.max_output_tokens, OutputTokenLimit)
+                    else self.max_output_tokens
+                ),
+                "requested_result_schema_version": (
+                    self.requested_result_schema_version
+                ),
+                "user_hint": self.user_hint,
+            },
+        )
+
+    def validate_integrity(self) -> None:
+        try:
+            canonical = SolveIntent(
+                schema_version=self.schema_version,
+                request_id=self.request_id,
+                pipeline_profile_id=self.pipeline_profile_id,
+                capture_scope_preference=self.capture_scope_preference,
+                locale=self.locale,
+                timeout_budget_ms=self.timeout_budget_ms,
+                max_output_tokens=self.max_output_tokens,
+                requested_result_schema_version=(
+                    self.requested_result_schema_version
+                ),
+                user_hint=self.user_hint,
+            )
+        except ValueError:
+            raise
+        except (TypeError, AttributeError) as error:
+            raise ValueError("solve intent integrity mismatch") from error
+        if (
+            type(self.intent_digest) is not Digest256
+            or canonical.intent_digest != self.intent_digest
+        ):
+            raise ValueError("solve intent integrity mismatch")
