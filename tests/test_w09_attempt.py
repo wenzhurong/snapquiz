@@ -10,6 +10,7 @@ import socket
 import time
 import unittest
 from unittest.mock import patch
+from uuid import UUID, uuid5
 
 from snapquiz.adapters.openai_chat_compatible import (
     OpenAIChatCompatibleAdapter,
@@ -42,6 +43,27 @@ from tests.w09_helpers import make_w09_runtime
 
 
 SESSION_ISSUED_AT = NOW + timedelta(seconds=5)
+_TEST_HANDLE_NAMESPACE = UUID("10515800-6bd7-5f3c-ae75-a295863909b1")
+_TEST_CLAIM_NAMESPACE = UUID("6a7ee735-79dd-5192-bfb5-ab7b4f4cf4b2")
+
+
+def _handle_proof(
+    permit: CredentialResolutionPermit,
+) -> tuple[UUID, Digest256]:
+    handle_id = uuid5(_TEST_HANDLE_NAMESPACE, str(permit.permit_id))
+    return handle_id, digest256(
+        "TestCredentialHandle",
+        "snapquiz.test-credential-handle.v1",
+        {
+            "handle_id": handle_id,
+            "credential_permit_id": permit.permit_id,
+            "credential_permit_digest": permit.permit_digest,
+        },
+    )
+
+
+def _claim_id(permit: CredentialResolutionPermit) -> UUID:
+    return uuid5(_TEST_CLAIM_NAMESPACE, str(permit.permit_id))
 
 
 def _make_runtime():
@@ -93,13 +115,32 @@ def _authorize(runtime, gate: AttemptGate) -> CredentialResolutionPermit:
 
 
 def _resolve(gate: AttemptGate, permit: CredentialResolutionPermit) -> None:
+    claim_id = _claim_id(permit)
     gate._claim_credential_resolution(
         permit,
+        claim_id=claim_id,
         _authority=_CREDENTIAL_RESOLVER_AUTHORITY,
     )
+    handle_id, handle_digest = _handle_proof(permit)
     gate._confirm_credential_resolution(
         permit,
+        claim_id=claim_id,
         resolved_binding_digest=permit.credential_binding_digest,
+        handle_id=handle_id,
+        handle_digest=handle_digest,
+        _authority=_CREDENTIAL_RESOLVER_AUTHORITY,
+    )
+
+
+def _abandon_resolved(
+    gate: AttemptGate,
+    permit: CredentialResolutionPermit,
+) -> bool:
+    handle_id, handle_digest = _handle_proof(permit)
+    return gate._abandon_resolved_credential_resolution(
+        permit,
+        handle_id=handle_id,
+        handle_digest=handle_digest,
         _authority=_CREDENTIAL_RESOLVER_AUTHORITY,
     )
 
@@ -109,7 +150,12 @@ def _reserve(runtime, gate: AttemptGate) -> tuple[
 ]:
     credential = _authorize(runtime, gate)
     _resolve(gate, credential)
-    return credential, gate.reserve_attempt(credential_permit=credential)
+    handle_id, handle_digest = _handle_proof(credential)
+    return credential, gate.reserve_attempt(
+        credential_permit=credential,
+        credential_handle_id=handle_id,
+        credential_handle_digest=handle_digest,
+    )
 
 
 def _mutated_prepared(value: PreparedOutbound) -> PreparedOutbound:
@@ -291,7 +337,12 @@ class W09AttemptGateTest(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             attempt_clone.validate_integrity()
-        self.assertTrue(gate.abandon_attempt(attempt))
+        self.assertTrue(
+            gate.abandon_attempt(
+                attempt,
+                _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+            )
+        )
 
     def test_context_close_rejects_authorized_and_resolving_credential_activity(self):
         authorized = _make_runtime()
@@ -315,8 +366,10 @@ class W09AttemptGateTest(unittest.TestCase):
         resolving = _make_runtime()
         resolving_gate = AttemptGate()
         resolving_permit = _authorize(resolving, resolving_gate)
+        resolving_claim_id = _claim_id(resolving_permit)
         resolving_gate._claim_credential_resolution(
             resolving_permit,
+            claim_id=resolving_claim_id,
             _authority=_CREDENTIAL_RESOLVER_AUTHORITY,
         )
         with self.assertRaises(EndpointPolicyError):
@@ -327,6 +380,7 @@ class W09AttemptGateTest(unittest.TestCase):
             )
         resolving_gate._fail_credential_resolution(
             resolving_permit,
+            claim_id=resolving_claim_id,
             _authority=_CREDENTIAL_RESOLVER_AUTHORITY,
         )
         self.assertTrue(resolving.context_ledger.close(resolving.call_context))
@@ -345,27 +399,45 @@ class W09AttemptGateTest(unittest.TestCase):
         with self.assertRaises(AttributeError):
             credential.session_id = runtime.planned.plan.plan_id  # type: ignore[misc]
         with self.assertRaises(TypeError):
+            handle_id, handle_digest = _handle_proof(credential)
             gate._confirm_credential_resolution(
                 credential,
+                claim_id=_claim_id(credential),
                 resolved_binding_digest=credential.credential_binding_digest,
+                handle_id=handle_id,
+                handle_digest=handle_digest,
             )
         with self.assertRaises(EndpointPolicyError):
-            gate.reserve_attempt(credential_permit=credential)
+            handle_id, handle_digest = _handle_proof(credential)
+            gate.reserve_attempt(
+                credential_permit=credential,
+                credential_handle_id=handle_id,
+                credential_handle_digest=handle_digest,
+            )
         self.assertEqual(
             runtime.call_context.global_network_budget.snapshot().consumed,
             0,
         )
 
         _resolve(gate, credential)
-        attempt = gate.reserve_attempt(credential_permit=credential)
+        handle_id, handle_digest = _handle_proof(credential)
+        attempt = gate.reserve_attempt(
+            credential_permit=credential,
+            credential_handle_id=handle_id,
+            credential_handle_digest=handle_digest,
+        )
         self.assertEqual(
             ATTEMPT_PERMIT_SCHEMA_VERSION,
-            "snapquiz.attempt-permit.v1",
+            "snapquiz.attempt-permit.v2",
         )
         self.assertIs(type(attempt), AttemptPermit)
         self.assertIs(copy.deepcopy(attempt), attempt)
         self.assertEqual(attempt.context_id, runtime.call_context.context_id)
         self.assertEqual(attempt.session_id, runtime.session.session_id)
+        self.assertEqual(
+            (attempt.credential_handle_id, attempt.credential_handle_digest),
+            _handle_proof(credential),
+        )
         self.assertEqual(
             attempt.request_envelope_digest,
             runtime.prepared.request_envelope_digest,
@@ -444,11 +516,17 @@ class W09AttemptGateTest(unittest.TestCase):
         successes = []
         errors = []
 
-        def worker() -> None:
+        claim_ids = tuple(
+            uuid5(_TEST_CLAIM_NAMESPACE, f"{permit.permit_id}:{index}")
+            for index in range(2)
+        )
+
+        def worker(claim_id: UUID) -> None:
             barrier.wait()
             try:
                 result = gate._claim_credential_resolution(
                     permit,
+                    claim_id=claim_id,
                     _authority=_CREDENTIAL_RESOLVER_AUTHORITY,
                 )
             except BaseException as error:
@@ -456,9 +534,12 @@ class W09AttemptGateTest(unittest.TestCase):
                     errors.append(error)
             else:
                 with lock:
-                    successes.append(result)
+                    successes.append((result, claim_id))
 
-        threads = [Thread(target=worker) for _ in range(2)]
+        threads = [
+            Thread(target=worker, args=(claim_id,))
+            for claim_id in claim_ids
+        ]
         for thread in threads:
             thread.start()
         barrier.wait()
@@ -466,12 +547,17 @@ class W09AttemptGateTest(unittest.TestCase):
             thread.join(timeout=3)
 
         self.assertTrue(all(not thread.is_alive() for thread in threads))
-        self.assertEqual(successes, [permit])
+        self.assertEqual(len(successes), 1)
+        self.assertIs(successes[0][0], permit)
         self.assertEqual(len(errors), 1)
         self.assertIsInstance(errors[0], EndpointPolicyError)
+        handle_id, handle_digest = _handle_proof(permit)
         gate._confirm_credential_resolution(
             permit,
+            claim_id=successes[0][1],
             resolved_binding_digest=permit.credential_binding_digest,
+            handle_id=handle_id,
+            handle_digest=handle_digest,
             _authority=_CREDENTIAL_RESOLVER_AUTHORITY,
         )
 
@@ -484,6 +570,7 @@ class W09AttemptGateTest(unittest.TestCase):
         with self.assertRaises(CancelledError):
             revoked_gate._claim_credential_resolution(
                 revoked_permit,
+                claim_id=_claim_id(revoked_permit),
                 _authority=_CREDENTIAL_RESOLVER_AUTHORITY,
             )
         self.assertTrue(
@@ -556,6 +643,7 @@ class W09AttemptGateTest(unittest.TestCase):
         gate = AttemptGate()
         credential = _authorize(runtime, gate)
         _resolve(gate, credential)
+        handle_id, handle_digest = _handle_proof(credential)
         entered = Event()
         release = Event()
         original = CallContextLedger._reserve_attempt_budgets
@@ -570,7 +658,13 @@ class W09AttemptGateTest(unittest.TestCase):
 
         def reserve_worker() -> None:
             try:
-                result.append(gate.reserve_attempt(credential_permit=credential))
+                result.append(
+                    gate.reserve_attempt(
+                        credential_permit=credential,
+                        credential_handle_id=handle_id,
+                        credential_handle_digest=handle_digest,
+                    )
+                )
             except BaseException as error:
                 errors.append(error)
 
@@ -594,8 +688,18 @@ class W09AttemptGateTest(unittest.TestCase):
             runtime.context_ledger.safe_metadata()["in_flight_attempt_count"],
             1,
         )
-        self.assertTrue(gate.abandon_attempt(result[0]))
-        self.assertFalse(gate.abandon_attempt(result[0]))
+        self.assertTrue(
+            gate.abandon_attempt(
+                result[0],
+                _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+            )
+        )
+        self.assertFalse(
+            gate.abandon_attempt(
+                result[0],
+                _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+            )
+        )
         self.assertFalse(
             gate.finish_attempt(
                 result[0],
@@ -610,6 +714,52 @@ class W09AttemptGateTest(unittest.TestCase):
             runtime.call_context.global_network_budget.snapshot().consumed,
             1,
         )
+
+    def test_attempt_ledger_publish_fault_restores_resolved_without_phantom(self):
+        class InsertThenRaiseDict(dict):
+            def __init__(self, values):
+                super().__init__(values)
+                self._fail_once = True
+
+            def __setitem__(self, key, value):
+                super().__setitem__(key, value)
+                if self._fail_once:
+                    self._fail_once = False
+                    raise RuntimeError("injected attempt ledger publish failure")
+
+        runtime = _make_runtime()
+        gate = AttemptGate()
+        credential = _authorize(runtime, gate)
+        _resolve(gate, credential)
+        handle_id, handle_digest = _handle_proof(credential)
+        object.__setattr__(
+            gate,
+            "_attempt_permits",
+            InsertThenRaiseDict(gate._attempt_permits),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "attempt ledger publish"):
+            gate.reserve_attempt(
+                credential_permit=credential,
+                credential_handle_id=handle_id,
+                credential_handle_digest=handle_digest,
+            )
+
+        credential_state = gate._credential_permits[credential.permit_id]
+        self.assertEqual(credential_state.status, "resolved")
+        self.assertEqual(gate.safe_metadata()["attempt_permit_count"], 0)
+        self.assertEqual(
+            runtime.context_ledger.safe_metadata()["in_flight_attempt_count"],
+            0,
+        )
+        # A reservation consumes budget even when pure permit publication fails;
+        # only the phantom in-flight reservation and Gate publication roll back.
+        self.assertEqual(
+            runtime.call_context.global_network_budget.snapshot().consumed,
+            1,
+        )
+        self.assertTrue(_abandon_resolved(gate, credential))
+        self.assertTrue(runtime.context_ledger.close(runtime.call_context))
 
     def test_transport_claim_is_exactly_once_and_replay_fails(self):
         runtime = _make_runtime()
@@ -656,6 +806,45 @@ class W09AttemptGateTest(unittest.TestCase):
                 _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
             )
 
+    def test_transport_claim_rejects_gate_handle_proof_replacement_and_recovers(self):
+        runtime = _make_runtime()
+        gate = AttemptGate()
+        credential, attempt = _reserve(runtime, gate)
+        credential_state = gate._credential_permits[credential.permit_id]
+        original_digest = credential_state.credential_handle_digest
+        replacement_digest = Digest256("f" * 64)
+        self.assertNotEqual(replacement_digest, original_digest)
+        credential_state.credential_handle_digest = replacement_digest
+
+        with self.assertRaises(EndpointPolicyError):
+            gate._claim_attempt(
+                attempt,
+                _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+            )
+        self.assertEqual(
+            gate._attempt_permits[attempt.attempt_permit_id].status,
+            "active",
+        )
+
+        credential_state.credential_handle_digest = original_digest
+        self.assertIs(
+            gate._claim_attempt(
+                attempt,
+                _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+            ),
+            attempt,
+        )
+        self.assertTrue(
+            gate.finish_attempt(
+                attempt,
+                _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+            )
+        )
+        self.assertEqual(
+            runtime.context_ledger.safe_metadata()["in_flight_attempt_count"],
+            0,
+        )
+
     def test_paused_transport_claim_cannot_be_cleaned_or_reopened_by_non_owner(self):
         runtime = _make_runtime()
         gate = AttemptGate()
@@ -688,7 +877,10 @@ class W09AttemptGateTest(unittest.TestCase):
             thread.start()
             self.assertTrue(entered.wait(timeout=3))
             with self.assertRaises(EndpointPolicyError):
-                gate.abandon_attempt(attempt)
+                gate.abandon_attempt(
+                    attempt,
+                    _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+                )
             with self.assertRaises(TypeError):
                 gate.finish_attempt(attempt)
             with self.assertRaises(EndpointPolicyError):
@@ -751,9 +943,9 @@ class W09AttemptGateTest(unittest.TestCase):
                 _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
             )
 
-        # authorize, resolver claim, reserve and transport claim each rebuild
-        # the exact request through the trusted deterministic Adapter.
-        self.assertEqual(prepare.call_count, 4)
+        # Authorize, resolver claim, resolver post-read confirmation, reserve
+        # and transport claim each rebuild the exact trusted request.
+        self.assertEqual(prepare.call_count, 5)
         self.assertIsNotNone(credential)
         open_file.assert_not_called()
         getenv.assert_not_called()
@@ -782,14 +974,19 @@ class W09AttemptGateTest(unittest.TestCase):
 
         credential = _authorize(runtime, gate)
         _resolve(gate, credential)
+        handle_id, handle_digest = _handle_proof(credential)
         runtime.authority_ledger.revoke()
         with self.assertRaises(EndpointPolicyError):
-            gate.reserve_attempt(credential_permit=credential)
+            gate.reserve_attempt(
+                credential_permit=credential,
+                credential_handle_id=handle_id,
+                credential_handle_digest=handle_digest,
+            )
         self.assertEqual(
             runtime.call_context.global_network_budget.snapshot().consumed,
             0,
         )
-        self.assertTrue(gate.abandon_credential_resolution(credential))
+        self.assertTrue(_abandon_resolved(gate, credential))
 
     def test_session_deadline_is_exact_and_half_open_before_budget(self):
         runtime = _make_runtime()
@@ -832,20 +1029,29 @@ class W09AttemptGateTest(unittest.TestCase):
         runtime = _make_runtime()
         gate = AttemptGate()
         credential = _authorize(runtime, gate)
+        claim_id = _claim_id(credential)
         gate._claim_credential_resolution(
             credential,
+            claim_id=claim_id,
             _authority=_CREDENTIAL_RESOLVER_AUTHORITY,
         )
+        handle_id, handle_digest = _handle_proof(credential)
         with self.assertRaises(EndpointPolicyError):
             gate._confirm_credential_resolution(
                 credential,
+                claim_id=claim_id,
                 resolved_binding_digest=Digest256("0" * 64),
+                handle_id=handle_id,
+                handle_digest=handle_digest,
                 _authority=_CREDENTIAL_RESOLVER_AUTHORITY,
             )
         with self.assertRaises(EndpointPolicyError):
             gate._confirm_credential_resolution(
                 credential,
+                claim_id=claim_id,
                 resolved_binding_digest=credential.credential_binding_digest,
+                handle_id=handle_id,
+                handle_digest=handle_digest,
                 _authority=_CREDENTIAL_RESOLVER_AUTHORITY,
             )
         self.assertEqual(

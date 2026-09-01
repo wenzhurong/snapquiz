@@ -1,6 +1,6 @@
 # snapquiz 产品与技术规格（v3 · 多模型双通道）
 
-> **状态**：v3 实现基准。本文描述目标架构；远端 `main@8333adf` 已完成并推送 M0–M4 与 M5/W08 的离线 Registry、Planner、Consent、Capture、纯 Adapter、EgressApproval 与静态 send-session 契约；当前工作区已完成 W09-A 的 runtime authority、session-bound ConsentUseLease 与 two-stage permit 离线实现，并冻结 W09-B0 的 Credential/DNS/Transport 合同，均尚未提交，也不代表 v3 用户链路已经可用。交付顺序、状态与逐项验收见 [`IMPLEMENTATION_PLAN.md`](./IMPLEMENTATION_PLAN.md)。
+> **状态**：v3 实现基准。本文描述目标架构；远端 `main@8a50b7d` 已完成并推送 M0–M4、M5/W08、W09-A 的离线 Registry、Planner、Consent、Capture、纯 Adapter、Egress/session、runtime authority、ConsentUseLease 与 two-stage permit，并冻结 W09-B0 的 Credential/DNS/Transport 合同。本工作包又完成 W09-B1 的 CredentialHandle/frozen-binding resolver 与 secret lifecycle 离线实现；这仍不代表 v3 用户链路已经可用。交付顺序、状态与逐项验收见 [`IMPLEMENTATION_PLAN.md`](./IMPLEMENTATION_PLAN.md)。
 >
 > **已定方向**：模型能力分为两条推理通道：
 >
@@ -32,10 +32,11 @@
 - **M3/W06 complete（`main@14a099a`，已推送）**：新增 probe-only 三态 PermissionObservation、trusted display topology/selected-region 合同、Plan-bound 一次性 CaptureAuthorization、canonical PNG 真解码 InputValidator 与 authority-only ValidatedCapture lease；授权、捕获前和捕获后分别复核 consent/permission/topology，ledger 持有不可由返回 proof 重置的原子 attempt 状态；
 - **M4/W07 complete（`main@1066a99`，已推送）**：新增完整 `SolveIntent → PlannedExecution v3 → SolveRequest → StageInvocation` authority/digest 链、纯 `openai_chat_compatible` GLM Adapter、exact canonical request fixture、bounded `TransportResponse`、strict candidate decode/typed error mapping 与 `AnswerCandidateResult → ResultValidator` 绑定；`prepare/decode` 不读取 secret、环境或文件，不构造 SDK client、不 sleep/retry，也不执行 DNS/socket/HTTP；
 - **M5/W08 complete（`main@8333adf`，已推送）**：新增 phase1 pass-through 的 exact `EgressPreview → EgressPreviewDecision → EgressApproval` 合同、approval ledger、静态 one-shot `AuthorizedSendSession` 与 session ledger；Gate 在预览前后用可信 GLM Adapter 重建并逐字段/逐字节核对 `PreparedOutbound`，approval 必须先不可逆消费，随后才能签发 session；Consent/approval/session 均绑定原始账本身份与账本私有当前摘要；
-- **M5/W09-A complete（当前工作区、尚未提交）**：已建立 triple-sample runtime clock 与 `MonotonicDeadline`、可撤销的 Registry/Policy generation lease、`RuntimeCallFactory → CallContext`、operation/global/billable 原子预算、取消/关闭状态、session-bound one-shot `ConsentUseLease`，以及零 I/O 的两阶段 `AttemptGate`（`CredentialResolutionPermit → AttemptPermit`）；最终增量复核和离线故障/竞态矩阵未发现剩余 P0/P1。它们仍只是离线 authority/lease/permit 原语，尚未形成可发送的 Transport；
-- **M5/W09-B0 complete（当前工作区、仅合同冻结）**：已把后续实现拆为 CredentialHandle/resolver、可取消 DNS/全结果与 peer、exact TLS/HTTP/1.1、完整故障/清理矩阵四批，并冻结 handle proof、resolver post-read authority、pre-first-byte checkpoint、地址整组拒绝和 wire framing 硬门槛；尚未新增 CredentialHandle、读取任何 secret、解析 DNS、创建 socket 或发送 HTTP；
-- **尚不可用**：没有 `CredentialHandle`、真实 credential resolver、真实 Quartz/TCC 验收、真实 display/选区/截图 source、NSPanel 人机预览、HTTP/TLS/DNS/连接 peer、完整 I/O 终态清理或任何 live/eval/E2E 证据，因此当前仍没有可执行的解题用户路径；Registry 中的 `experimental` 只是 exact binding 状态，不代表应用链已可运行，更不能称为 `supported`；
-- legacy `Config`、parse/notify 与 `AnswerResult` 仍留在源码树中，但被 M0 产品入口隔离；旧布尔权限 helper 已永久 fail-closed，新 W06–W09-A 链尚未接入应用。当前离线链不读取 secret、不截图、不构造 SDK 或联网；DNS 全结果、连接 peer 与 rebinding 防护属于 W09-B。
+- **M5/W09-A complete（`main@8a50b7d`，已推送）**：已建立 triple-sample runtime clock 与 `MonotonicDeadline`、可撤销的 Registry/Policy generation lease、`RuntimeCallFactory → CallContext`、operation/global/billable 原子预算、取消/关闭状态、session-bound one-shot `ConsentUseLease`，以及零 I/O 的两阶段 `AttemptGate`（`CredentialResolutionPermit → AttemptPermit`）；最终增量复核和离线故障/竞态矩阵未发现剩余 P0/P1；
+- **M5/W09-B0 complete（`main@8a50b7d`，合同冻结已推送）**：已把后续实现拆为 CredentialHandle/resolver、可取消 DNS/全结果与 peer、exact TLS/HTTP/1.1、完整故障/清理矩阵四批，并冻结 handle proof、resolver post-read authority、pre-first-byte checkpoint、地址整组拒绝和 wire framing 硬门槛；
+- **M5/W09-B1 complete（本工作包）**：已新增 factory-only `CredentialHandle`、私有 mutable-secret ledger、built-in GLM exact frozen-binding resolver、caller handle proof、AttemptPermit v2 与 owner-only one-shot borrow。exact-one-read、post-read authority、Bearer 边界、handle 返回前预占、resolver/close/borrow 的单故障与 commit-then-raise、并发 owner/close/finish、source traceback 与零 I/O 均有回归；完整离线测试 401/401，独立终审未发现剩余 P0/P1；
+- **尚不可用**：没有 production credential source、真实 Quartz/TCC 验收、真实 display/选区/截图 source、NSPanel 人机预览、HTTP/TLS/DNS/连接 peer、完整 I/O 终态清理或任何 live/eval/E2E 证据，因此当前仍没有可执行的解题用户路径；Registry 中的 `experimental` 只是 exact binding 状态，不代表应用链已可运行，更不能称为 `supported`；
+- legacy `Config`、parse/notify 与 `AnswerResult` 仍留在源码树中，但被 M0 产品入口隔离；旧布尔权限 helper 已永久 fail-closed，新 W06–W09-B1 链尚未接入应用。当前默认离线链只使用 fake credential source，不截图、不构造 SDK 或联网；production credential source、DNS 全结果、连接 peer 与 rebinding 防护仍属于后续 W09-B。
 
 因此本文必须区分：
 
@@ -164,7 +165,7 @@ SolveRequest → PipelineExecutor
 8. direct pipeline 只能消费 active ValidatedCapture，形成唯一的 `StageInvocation`；Adapter 的纯本地 PayloadPreparer 依据 plan snapshot 生成待发送 payload 与摘要，不得读取密钥、联网或改变计划。
 9. EgressGate 复核选区、AuthorizationContext、plan snapshot、exact endpoint/data-kind，以及最终 payload 的 digest/字节数；当前 pass-through policy 还必须在预览前后用可信 Adapter 重建并逐字段、逐字节比对 `PreparedOutbound`，从而证明预览图片就是 body 内嵌的 canonical PNG。受控 PreviewController 明确批准后，Gate 才为该 network operation 产生限时、单次 `EgressApproval`；W08 只建立 UI boundary 合同，真实 NSPanel 人机证据属于 W12。Gate 失败、取消或 payload 不匹配时，密钥读取、DNS、socket 与 HTTP 调用次数都必须为零，并立即释放临时 artifact/payload。
 10. SendSessionFactory 必须先把 approval 的 consumed revision 不可逆提交到其账本，再签发只绑定同一 operation/endpoint/payload 的静态 `AuthorizedSendSession`。persistent grant 不消费；one-shot grant 则必须在同一 `Consent → Approval → Session` 锁序内联合登记 consumed grant revision、exact session 与 `ConsentUseLease`。任一 session 发布失败都必须移除 partial/full orphan；one-shot 联合提交失败还必须回滚 lease/grant，approval 始终保持 consumed，不能复用。SendSessionFactory 绝不解析 credential、构造 client 或执行 I/O。Phase 1 请求期间禁止远程 model discovery；未来若需要，必须作为独立预声明 operation，且结果不能修改当前 plan。
-11. session 成功后，AttemptGate 第一阶段在五账本 authority 链上签发 one-shot `CredentialResolutionPermit`；CredentialResolver 只能先领取该 permit，再从 permit 私下持有的 frozen PlannedExecution 唯一定位 exact credential binding，任何 backend read 之前和之后都重新验证完整 authority。成功只能返回 factory-issued、ledger-owned 的 one-shot `CredentialHandle`，并把 `handle_id + handle_digest` 绑定进 permit state 与后续 `AttemptPermit`；只回传公开可知的 binding digest 不构成解析证明。确认 exact handle 后，第二阶段才可原子扣减 operation/global/billable 预算并签发 `AttemptPermit`。W09-A 已实现零 I/O permit 原语；handle/resolver 属于 W09-B1，当前尚未实现。
+11. session 成功后，AttemptGate 第一阶段在五账本 authority 链上签发 one-shot `CredentialResolutionPermit`；CredentialResolver 只能先领取该 permit，再从 permit 私下持有的 frozen PlannedExecution 唯一定位 exact credential binding，任何 backend read 之前和之后都重新验证完整 authority。成功只能返回 factory-issued、ledger-owned 的 one-shot `CredentialHandle`，并把 `handle_id + handle_digest` 绑定进 permit state 与后续 `AttemptPermit`；只回传公开可知的 binding digest 不构成解析证明。第二阶段还必须由已收到 handle 的调用方把同一 primitive proof 交回 `reserve_attempt`，通过 Gate 前后两次 exact 比对后才可原子扣减 operation/global/billable 预算并签发 `AttemptPermit`，因此 Gate 内部确认先发生也不能在 `resolve()` 返回前被无 proof 预占。W09-A 的 permit 原语与 W09-B1 的 handle/resolver 已离线实现，production transport 仍未实现。
 12. W09-B 的 RemoteTransport 必须在真正 wire work 前再次领取并复核 `AttemptPermit`，再以 `send_once` 发送已经获批的 exact payload。Phase 1 direct plan 只允许请求内 inline bytes / raw base64 / Data URI 的单个 inference request，禁止预上传、file id、公共 URL、redirect、隐式 retry 与远程 repair。
 13. Adapter 优先使用 Provider/模型真实支持的结构化输出能力；无原生能力时才使用 prompt JSON。
 14. 所有响应必须经过本地 Schema 与语义校验。
@@ -704,7 +705,7 @@ AuthorizedSendSession
   session_terms_digest: Digest256
   session_digest: Digest256                # current lifecycle revision
 
-CallContext                                # W09-A working-tree authority; not session state
+CallContext                                # W09-A runtime authority; not session state
   runtime_deadline: MonotonicDeadline
   operation_budgets[]: AtomicBudget
   global_network_budget: AtomicBudget
@@ -718,13 +719,11 @@ CredentialResolutionPermit                # one-shot resolver pre-read authority
   registry_policy_lease_id / lease_digest
   authorized_at / authorized_monotonic_ns
 
-AttemptPermit                             # W09-A current one-shot pre-wire authority
+AttemptPermit                             # W09-A/B1 one-shot pre-wire authority
   credential_permit_id / session_id
   request_envelope_digest / credential_binding_digest
-  attempt_budget_reservation
-
-AttemptPermit W09-B1 target extension
   credential_handle_id / credential_handle_digest
+  attempt_budget_reservation
   # both fields enter the permit digest and exact-object ledger state
 ```
 
@@ -734,15 +733,15 @@ EgressPreview 与 EgressPreviewDecision 均只能由受控 factory 构造、不�
 
 EgressApproval 的有效期为确认时刻之后最多五分钟，并受 AuthorizationContext expiry 与 `authorized_at + plan.timeout_budget_ms` 的 wall-clock 上界共同收紧；确认发生在该上界或之后必须失败。这个 wall-clock 上界不能替代 W09 的唯一 monotonic deadline。W09-A 允许单 network-stage、单 operation、单 grant 的 one-shot ConsentGrant 进入预览和 approval，但 EgressGate 不消费 grant；多阶段或多 operation 的 one-shot 组合继续 fail-closed，直至 OCR route 对每阶段独立 lease/session 的语义另行实现和验证。
 
-SendSessionFactory 固定按 `ConsentLedger → EgressApprovalLedger → SendSessionLedger` 加锁：先重验 exact Consent/Authorization 与所有 envelope binding，再将 approval 的 consumed revision 不可逆写入其账本。persistent grant 随后登记静态 AuthorizedSendSession；one-shot grant 则在 Session 锁内以 purpose-specific 联合事务发布 provisional session、consumed grant revision 和 `ConsentUseLease`，成功前外部 snapshot 不能观察到孤儿 session。persistent 与 one-shot 的 session publish 在 partial/full 写入异常时都精确回滚 Session 对象、索引与 revision；one-shot 的 lease 构造或 Consent 索引失败还同步回滚 lease/grant，但 approval 始终保持 burned。factory 成功返回以前严禁 secret resolution、credential handle、client construction 或 I/O；factory 成功返回后也不自行解析 credential，解析职责只属于持有有效 `CredentialResolutionPermit` 的未来 CredentialResolver。session 刻意不包含 attempt counter、monotonic deadline、budget、cancellation、credential handle 或 HTTP state。Approval/Session ledger 的 `validate_active` 只证明各自账本的 lifecycle，不是完整发送授权。
+SendSessionFactory 固定按 `ConsentLedger → EgressApprovalLedger → SendSessionLedger` 加锁：先重验 exact Consent/Authorization 与所有 envelope binding，再将 approval 的 consumed revision 不可逆写入其账本。persistent grant 随后登记静态 AuthorizedSendSession；one-shot grant 则在 Session 锁内以 purpose-specific 联合事务发布 provisional session、consumed grant revision 和 `ConsentUseLease`，成功前外部 snapshot 不能观察到孤儿 session。persistent 与 one-shot 的 session publish 在 partial/full 写入异常时都精确回滚 Session 对象、索引与 revision；one-shot 的 lease 构造或 Consent 索引失败还同步回滚 lease/grant，但 approval 始终保持 burned。factory 成功返回以前严禁 secret resolution、credential handle、client construction 或 I/O；factory 成功返回后也不自行解析 credential，解析职责只属于持有有效 `CredentialResolutionPermit` 的 W09-B1 CredentialResolver。session 刻意不包含 attempt counter、monotonic deadline、budget、cancellation、credential handle 或 HTTP state。Approval/Session ledger 的 `validate_active` 只证明各自账本的 lifecycle，不是完整发送授权。
 
 W09-A 把每次 resolver pre-read、预算 reservation 与 transport pre-wire claim 都放回同一固定锁序：`ConsentLedger → EgressApprovalLedger → SendSessionLedger → RegistryPolicyAuthorityLedger → CallContextLedger`。Consent 阶段对 persistent grant 继续要求原 active revision；对 one-shot grant 则只允许 exact session 自动命中的当前 ConsentUseLease。`RuntimeCallFactory` 在 privacy authorization 后、PermissionGate/Capture 前建立唯一 CallContext；`AttemptGate` 第一阶段签发且一次性领取 `CredentialResolutionPermit`，resolver 确认 exact non-secret binding 后，第二阶段才原子消费 operation/global/billable budgets 并签发 `AttemptPermit`。这些对象不包含 secret、client、DNS 或 response，也不能自行联网。W09-B 的 transport 必须在 wire work 紧前再次领取 permit 并重验完整 authority；预算一旦预留不因失败或取消退还。
 
 W09-B Transport 只能在上述静态 session 成功返回且两阶段 permit 链通过后，向 envelope 的已批准 slot 注入由 exact binding 解析出的 Authorization/API-key secret；binding 为 `not_applicable` 时禁止注入任何认证 header/query。禁止添加其他数据承载 header/query，禁止修改 method、URL、非敏感 headers、content type 或 body。非秘密 header/query 的值只能来自冻结 Profile、transport policy 或协议固定元数据，不得依赖 StageInvocation、截图、OCR 文本、答案或 user hint。Host、Content-Length 等库派生 header 必须由已批准 URL/body 确定，并受版本化 transport policy 约束。Phase 1 的 canonical query 必须为空，任何用户内容都只能位于已批准 body；运行时 credential handle 与 session 中的 binding digest 必须匹配，否则零网络失败。
 
-`CredentialResolver.resolve()` 只接受 factory-only 的 exact `CredentialResolutionPermit`；禁止调用方另传 credential ref、binding、Provider、header 名或 secret。唯一顺序必须是：AttemptGate claim 与完整 authority recheck → 从 permit 冻结的 PlannedExecution 解析唯一 Registry metadata 并逐项核对 provider/profile/endpoint/network/TLS/injection slot/value scheme → exact locator backend read 一次 → post-read 完整 authority recheck → 原子发布/确认 handle。模块 import、对象构造、repr 与 metadata 必须零 secret read；禁止 alias、fallback、自动切换 Keychain/env、查询当前 Registry、远程鉴权或 model discovery。慢 backend read 期间发生 revoke/cancel/expiry 时，post-read recheck 必须拒绝、清理临时 secret 并终结 Gate activity，不能返回 handle。
+`CredentialResolver.resolve()` 只接受 factory-only 的 exact `CredentialResolutionPermit`；禁止调用方另传 credential ref、binding、Provider、header 名或 secret。唯一顺序必须是：AttemptGate claim 与完整 authority recheck → 从 permit 冻结的 PlannedExecution 解析唯一 Registry metadata 并逐项核对 provider/profile/endpoint/network/TLS/injection slot/value scheme → exact locator backend read 一次 → post-read 完整 authority recheck → 原子发布/确认 handle。Gate 确认 primitive proof 不是 caller publication；`reserve_attempt` 必须额外接收已经返回的 handle proof 并在锁内 exact 比对，handle 返回前的 permit holder 不能只凭 permit 消费预算。模块 import、对象构造、repr 与 metadata 必须零 secret read；禁止 alias、fallback、自动切换 Keychain/env、查询当前 Registry、远程鉴权或 model discovery。慢 backend read 期间发生 revoke/cancel/expiry 时，post-read recheck 必须拒绝、清理临时 secret 并终结 Gate activity，不能返回 handle。
 
-`CredentialHandle` 必须 runtime-final、factory-only、不可复制/序列化/pickle，公开证明只包含 handle、credential permit、context、session、operation、request envelope、binding、slot 与 scheme 的 ID/digest；secret 不进入 ID、digest、equality、hash、repr、safe metadata、异常或 fixture。secret 只由私有 ledger 以 mutable buffer 持有，Transport 通过 owner-only one-shot callback 在 exact AttemptPermit 上短暂借用；所有终态在 `finally` 中释放引用并 best-effort 清零。Python 环境源最初产生的 immutable string 或其他临时复制不能保证擦除，因此不得宣称 secure wipe。每次 retry 都必须重新 authorize/resolve，handle 不能跨 attempt/session/gate 重放。
+`CredentialHandle` 必须 runtime-final、factory-only、不可复制/序列化/pickle，公开证明只包含 handle、credential permit、context、session、operation、request envelope、binding、slot 与 scheme 的 ID/digest；secret 不进入 ID、digest、equality、hash、repr、safe metadata、异常或 fixture。secret 只由私有 ledger 以 mutable buffer 持有，Transport 通过 owner-only one-shot callback 在 exact AttemptPermit 上短暂借用；Gate 必须以 owner-specific borrow marker 阻止借用期间 attempt 终结，并确保失败的第二借用者不能释放第一借用者的 marker。所有终态在 `finally` 中先释放 view/引用并 best-effort 清零，再解除 marker。Python 环境源最初产生的 immutable string 或其他临时复制不能保证擦除，因此不得宣称 secure wipe。每次 retry 都必须重新 authorize/resolve，handle 不能跨 attempt/session/gate 重放。
 
 B1 读取后、handle 发布前必须把 GLM Bearer secret 编码为 1..4096 个 ASCII bytes，并 exact 匹配 RFC 6750 `b64token` 字符集：一个或多个 ASCII 字母/数字/`-._~+/`，随后可有 `=` padding；禁止 CR/LF/NUL、C0/C1、空白、非 ASCII、空值或超长值，也禁止 trim、normalize 或替换。任一值/locator/source 错误固定映射为无 cause/context 的 `ConfigError(stage="credential_resolver", retryable=False)`，同时清零临时 mutable buffer、终结 resolver-owned Gate activity，并保持 attempt budget、DNS、socket、HTTP 为零。
 
@@ -1347,9 +1346,9 @@ capabilities_ref = "zhipu/glm-4.6v-flash@verified-date"
 - `M7`：把 macOS 真实选区接入已经通过 M0–M6 的同一安全链，并保持 `experimental`；
 - 严格验证结果，禁止空 JSON 成功；GLM 不进入默认用户列表；当前 fail-open、默认全屏、任意 endpoint、raw fallback 与不受控重试均不属于兼容目标。
 
-**当前实现状态（2026-08-31 工作区）**：M0–M4 与 M5/W08 的离线合同已完成并进入远端 `main@8333adf`；M5 仍在进行，W09-A 已在工作区完成但尚未提交，W09-B0 合同已冻结，W09-B1–B4 及 M6–M9 尚未完成。W05、W06、W07、W08 的功能提交分别为 `65c867e`、`14a099a`、`1066a99`、`8333adf`。W05–W08 已提供 exact Registry/Plan/Consent/Capture/Adapter/Egress/static-session authority。W09-A 新增 runtime clock/monotonic deadline、Registry/Policy lease、在 privacy authorization 后且 PermissionGate/Capture 前创建的唯一 CallContext、operation/global/billable budget、cancel/close、session-bound one-shot ConsentUseLease，以及逐 resolver/attempt 复核五账本 authority 的两阶段 AttemptGate permit；其专项测试 69/69、完整离线测试 374/374、故障/竞态矩阵、93 文件 Python 3.10 grammar、compileall 与 diff check 均通过，最终增量复核未发现剩余 P0/P1。这些路径保持零 secret、零 client、零 DNS/socket/HTTP。W09-B0 已明确 handle proof、post-read/pre-wire authority、真正可取消 DNS、全结果/peer 与 exact wire/cleanup 硬门槛，但尚未提供任何 CredentialHandle、真实 credential resolver、精确 HTTP/1.1 `send_once`、TLS/hostname、完整 DNS 结果、连接 peer、rebinding、redirect 禁止与完整 I/O cleanup，因此 M5 不得升级为 complete。GLM 仍没有 VerificationRecord，只派生 `experimental`；应用仍被有意冻结，也没有真实 Quartz/TCC、topology/选区/截图、NSPanel、Provider API、live smoke 或真实 macOS E2E。Phase 1 query 固定为空；`QueryPolicyKind.EXACT` 仍未启用。production DNS resolver 的可取消、有界解析与 peer 校验是 W09-B 硬门槛，离线 authority 契约不证明传输或用户路径安全。
+**当前实现状态（2026-08-31）**：M0–M4、M5/W08、W09-A 与 W09-B0 已完成并进入远端 `main@8a50b7d`；M5 仍在进行，W09-B1 已在本工作包完成，W09-B2–B4 及 M6–M9 尚未完成。W09-B1 新增 factory-only CredentialHandle、私有 mutable-secret ledger、built-in GLM exact frozen-binding resolver、caller-supplied handle proof、AttemptPermit v2、owner-specific one-shot borrow marker与安全终态清理；W09 三模块 61/61、完整离线测试 401/401、关键六场景连续 20 轮、96 文件 Python 3.10 grammar、compileall、依赖方向与 diff check 均通过，独立终审未发现剩余 P0/P1。这些路径只使用 fake source，保持零真实环境凭据、零 client、零 DNS/socket/HTTP。production credential source、精确 HTTP/1.1 `send_once`、TLS/hostname、完整 DNS 结果、连接 peer、rebinding、redirect 禁止与全资源 I/O cleanup 仍不存在，因此 M5 不得升级为 complete。GLM 仍没有 VerificationRecord，只派生 `experimental`；应用仍被有意冻结，也没有真实 Quartz/TCC、topology/选区/截图、NSPanel、Provider API、live smoke 或真实 macOS E2E。Phase 1 query 固定为空；`QueryPolicyKind.EXACT` 仍未启用。production DNS resolver 的可取消、有界解析与 peer 校验是 W09-B 硬门槛，离线凭据合同不证明传输或用户路径安全。
 
-`M1–M4`、M5/W08、工作区 W09-A 与 W09-B0 合同冻结已经完成；下一步是 W09-B1 的 CredentialHandle/frozen-binding resolver，然后依次完成 B2 production resolver、B3 exact Transport 与 B4 完整矩阵，随后 W10 离线故障矩阵也必须通过。首次真实 API 只能发生在 M6/W11，且需要另行明确授权、只用固定非敏感合成图、只调用一次并关闭自动 retry；真实用户截图只能在该 smoke 完成后的 M7/W12 接入。详细工作包、依赖和当前状态以 Implementation Plan 为准；Plan 不得弱化本 Spec 的约束。
+`M1–M4`、M5/W08、W09-A、W09-B0 与 W09-B1 已经完成；下一步是 B2 production cancellable resolver、全结果地址策略与 peer binding，然后依次完成 B3 exact Transport 与 B4 完整矩阵，随后 W10 离线故障矩阵也必须通过。首次真实 API 只能发生在 M6/W11，且需要另行明确授权、只用固定非敏感合成图、只调用一次并关闭自动 retry；真实用户截图只能在该 smoke 完成后的 M7/W12 接入。详细工作包、依赖和当前状态以 Implementation Plan 为准；Plan 不得弱化本 Spec 的约束。
 
 **验收**：迁移后的纯逻辑测试通过；新增安全与契约测试；GLM 合成题图 live smoke 通过；真实用户远程截图路径只有在最小选区/预览/Egress 链完整且 M0–M6 全部通过时才可启用。所有 pre-gate 失败均为零 secret resolve、零 SDK 构造、零 DNS/socket/HTTP。
 
@@ -1438,13 +1437,13 @@ snapquiz/
 ├── transport/
 │   ├── contracts.py            # PreparedOutbound / exact envelope
 │   ├── session.py              # 当前：AuthorizedSendSession
-│   ├── credentials.py          # W09-B target：CredentialHandle / resolver
+│   ├── credentials.py          # W09-B1：CredentialHandle / frozen resolver
 │   └── http.py                 # W09-B target：exact HTTP/1.1 send_once / TLS / DNS / peer
 ├── runtime/
 │   ├── clock.py                # W09-A：trusted sample / monotonic deadline
 │   ├── authority.py            # W09-A：Registry/Policy revocable lease
 │   ├── context.py              # W09-A：CallContext / budgets / cancellation
-│   └── attempt.py              # W09-A：two-stage one-shot permits
+│   └── attempt.py              # W09-A/B1：two-stage permits / handle proof
 ├── present/
 ├── study/
 └── observability/

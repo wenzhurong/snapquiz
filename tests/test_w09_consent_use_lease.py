@@ -10,7 +10,7 @@ import time
 from threading import Barrier, Event, Lock, Thread
 import unittest
 from unittest.mock import patch
-from uuid import UUID
+from uuid import UUID, uuid5
 
 from snapquiz.domain.digest import digest256
 from snapquiz.domain.errors import EndpointPolicyError, TimeoutError as SnapTimeoutError
@@ -38,6 +38,8 @@ from tests.w09_helpers import make_w09_runtime
 
 SESSION_AT = NOW + timedelta(seconds=5)
 SECOND_DECISION_ID = UUID("50000000-0000-0000-0000-000000000002")
+_TEST_HANDLE_NAMESPACE = UUID("10515800-6bd7-5f3c-ae75-a295863909b1")
+_TEST_CLAIM_NAMESPACE = UUID("6a7ee735-79dd-5192-bfb5-ab7b4f4cf4b2")
 
 
 class _ForbiddenEnvironment:
@@ -128,13 +130,43 @@ def _authorize(runtime, gate):
 
 
 def _resolve(gate, credential):
+    claim_id = uuid5(_TEST_CLAIM_NAMESPACE, str(credential.permit_id))
     gate._claim_credential_resolution(
         credential,
+        claim_id=claim_id,
         _authority=_CREDENTIAL_RESOLVER_AUTHORITY,
     )
+    handle_id, handle_digest = _handle_proof(credential)
     gate._confirm_credential_resolution(
         credential,
+        claim_id=claim_id,
         resolved_binding_digest=credential.credential_binding_digest,
+        handle_id=handle_id,
+        handle_digest=handle_digest,
+        _authority=_CREDENTIAL_RESOLVER_AUTHORITY,
+    )
+
+
+def _handle_proof(credential):
+    handle_id = uuid5(_TEST_HANDLE_NAMESPACE, str(credential.permit_id))
+    handle_digest = digest256(
+        "TestCredentialHandle",
+        "snapquiz.test-credential-handle.v1",
+        {
+            "handle_id": handle_id,
+            "credential_permit_id": credential.permit_id,
+            "credential_permit_digest": credential.permit_digest,
+        },
+    )
+    return handle_id, handle_digest
+
+
+def _abandon_resolved(gate, credential):
+    handle_id, handle_digest = _handle_proof(credential)
+    return gate._abandon_resolved_credential_resolution(
+        credential,
+        handle_id=handle_id,
+        handle_digest=handle_digest,
         _authority=_CREDENTIAL_RESOLVER_AUTHORITY,
     )
 
@@ -142,7 +174,12 @@ def _resolve(gate, credential):
 def _finish_one_attempt(runtime, gate):
     credential = _authorize(runtime, gate)
     _resolve(gate, credential)
-    attempt = gate.reserve_attempt(credential_permit=credential)
+    handle_id, handle_digest = _handle_proof(credential)
+    attempt = gate.reserve_attempt(
+        credential_permit=credential,
+        credential_handle_id=handle_id,
+        credential_handle_digest=handle_digest,
+    )
     gate._claim_attempt(
         attempt,
         _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
@@ -625,9 +662,14 @@ class W09ConsentUseLeaseTest(unittest.TestCase):
         )
         credential = _authorize(runtime, gate)
         _resolve(gate, credential)
+        handle_id, handle_digest = _handle_proof(credential)
         with self.assertRaises(EndpointPolicyError):
-            gate.reserve_attempt(credential_permit=credential)
-        gate.abandon_credential_resolution(credential)
+            gate.reserve_attempt(
+                credential_permit=credential,
+                credential_handle_id=handle_id,
+                credential_handle_digest=handle_digest,
+            )
+        _abandon_resolved(gate, credential)
         self.assertEqual(runtime.consent_ledger.safe_metadata()["use_lease_count"], 1)
 
     def test_session_factory_and_lease_expiry_are_half_open(self):
@@ -692,6 +734,10 @@ class W09ConsentUseLeaseTest(unittest.TestCase):
         with self.assertRaises((EndpointPolicyError, SnapTimeoutError)):
             read_gate._claim_credential_resolution(
                 credential,
+                claim_id=uuid5(
+                    _TEST_CLAIM_NAMESPACE,
+                    str(credential.permit_id),
+                ),
                 _authority=_CREDENTIAL_RESOLVER_AUTHORITY,
             )
         self.assertEqual(
@@ -717,7 +763,12 @@ class W09ConsentUseLeaseTest(unittest.TestCase):
         wire_gate = AttemptGate()
         wire_credential = _authorize(before_wire, wire_gate)
         _resolve(wire_gate, wire_credential)
-        attempt = wire_gate.reserve_attempt(credential_permit=wire_credential)
+        handle_id, handle_digest = _handle_proof(wire_credential)
+        attempt = wire_gate.reserve_attempt(
+            credential_permit=wire_credential,
+            credential_handle_id=handle_id,
+            credential_handle_digest=handle_digest,
+        )
         before_wire.clock.advance(milliseconds=5_000)
         with self.assertRaises((EndpointPolicyError, SnapTimeoutError)):
             wire_gate._claim_attempt(
@@ -728,7 +779,10 @@ class W09ConsentUseLeaseTest(unittest.TestCase):
             before_wire.call_context.global_network_budget.snapshot().consumed,
             1,
         )
-        wire_gate.abandon_attempt(attempt)
+        wire_gate.abandon_attempt(
+            attempt,
+            _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+        )
 
     def test_wall_clock_rollback_before_lease_issue_is_rejected(self):
         runtime = _make_one_shot_session()
@@ -877,6 +931,10 @@ class W09ConsentUseLeaseTest(unittest.TestCase):
         with self.assertRaises(EndpointPolicyError):
             read_gate._claim_credential_resolution(
                 credential,
+                claim_id=uuid5(
+                    _TEST_CLAIM_NAMESPACE,
+                    str(credential.permit_id),
+                ),
                 _authority=_CREDENTIAL_RESOLVER_AUTHORITY,
             )
         self.assertEqual(
@@ -889,7 +947,12 @@ class W09ConsentUseLeaseTest(unittest.TestCase):
         wire_gate = AttemptGate()
         wire_credential = _authorize(before_wire, wire_gate)
         _resolve(wire_gate, wire_credential)
-        attempt = wire_gate.reserve_attempt(credential_permit=wire_credential)
+        handle_id, handle_digest = _handle_proof(wire_credential)
+        attempt = wire_gate.reserve_attempt(
+            credential_permit=wire_credential,
+            credential_handle_id=handle_id,
+            credential_handle_digest=handle_digest,
+        )
         before_wire.clock.advance(milliseconds=1_000)
         before_wire.consent_ledger.revoke(
             grant_id=before_wire.grant.grant_id,
@@ -904,7 +967,10 @@ class W09ConsentUseLeaseTest(unittest.TestCase):
             before_wire.call_context.global_network_budget.snapshot().consumed,
             1,
         )
-        wire_gate.abandon_attempt(attempt)
+        wire_gate.abandon_attempt(
+            attempt,
+            _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+        )
 
     def test_one_shot_full_authority_path_has_zero_external_side_effects(self):
         def forbidden(*args, **kwargs):

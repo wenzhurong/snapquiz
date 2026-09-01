@@ -67,7 +67,7 @@ from snapquiz.transport.session import (
 CREDENTIAL_RESOLUTION_PERMIT_SCHEMA_VERSION = (
     "snapquiz.credential-resolution-permit.v1"
 )
-ATTEMPT_PERMIT_SCHEMA_VERSION = "snapquiz.attempt-permit.v1"
+ATTEMPT_PERMIT_SCHEMA_VERSION = "snapquiz.attempt-permit.v2"
 
 _PERMIT_FACTORY_AUTHORITY = object()
 _PERMIT_RELEASE_AUTHORITY = object()
@@ -487,6 +487,8 @@ def _attempt_permit_payload(permit: "AttemptPermit") -> dict[str, object]:
         "credential_binding_digest": _binding_payload(
             permit.credential_binding_digest
         ),
+        "credential_handle_id": permit.credential_handle_id,
+        "credential_handle_digest": permit.credential_handle_digest,
         "reservation_id": permit.reservation_id,
         "reservation_digest": permit.reservation_digest,
         "operation_attempt": permit.operation_attempt,
@@ -506,6 +508,8 @@ def _attempt_permit_id_for(permit: "AttemptPermit") -> UUID:
                 ATTEMPT_PERMIT_SCHEMA_VERSION,
                 {
                     "credential_permit_id": permit.credential_permit_id,
+                    "credential_handle_id": permit.credential_handle_id,
+                    "credential_handle_digest": permit.credential_handle_digest,
                     "reservation_id": permit.reservation_id,
                     "reservation_digest": permit.reservation_digest,
                 },
@@ -529,6 +533,8 @@ class AttemptPermit:
         "operation_id",
         "request_envelope_digest",
         "credential_binding_digest",
+        "credential_handle_id",
+        "credential_handle_digest",
         "reservation_id",
         "reservation_digest",
         "operation_attempt",
@@ -549,14 +555,20 @@ class AttemptPermit:
         self,
         *,
         credential_permit: CredentialResolutionPermit,
+        credential_handle_id: UUID,
+        credential_handle_digest: Digest256,
         reservation: AttemptBudgetReservation,
         attempt_gate: "AttemptGate",
         _authority: object | None = None,
     ) -> None:
         if _authority is not _PERMIT_FACTORY_AUTHORITY:
             raise TypeError("attempt permits require AttemptGate")
+        require_uuid(credential_handle_id, "credential_handle_id")
+        require_digest(credential_handle_digest, "credential_handle_digest")
         identifier = {
             "credential_permit_id": credential_permit.permit_id,
+            "credential_handle_id": credential_handle_id,
+            "credential_handle_digest": credential_handle_digest,
             "reservation_id": reservation.reservation_id,
             "reservation_digest": reservation.reservation_digest,
         }
@@ -590,6 +602,8 @@ class AttemptPermit:
                 "credential_binding_digest",
                 credential_permit.credential_binding_digest,
             ),
+            ("credential_handle_id", credential_handle_id),
+            ("credential_handle_digest", credential_handle_digest),
             ("reservation_id", reservation.reservation_id),
             ("reservation_digest", reservation.reservation_digest),
             ("operation_attempt", reservation.operation_attempt),
@@ -647,6 +661,7 @@ class AttemptPermit:
             "context_id",
             "session_id",
             "operation_id",
+            "credential_handle_id",
             "reservation_id",
         ):
             require_uuid(getattr(self, name), name)
@@ -655,6 +670,7 @@ class AttemptPermit:
             "context_digest",
             "session_terms_digest",
             "request_envelope_digest",
+            "credential_handle_digest",
             "reservation_digest",
             "attempt_permit_digest",
             "_issued_digest",
@@ -759,6 +775,7 @@ class AttemptPermit:
             "attempt_permit_id": str(self.attempt_permit_id),
             "context_id": str(self.context_id),
             "session_id": str(self.session_id),
+            "credential_handle_id": str(self.credential_handle_id),
             "operation_attempt": self.operation_attempt,
             "global_attempt": self.global_attempt,
             "billable_attempt": self.billable_attempt,
@@ -766,20 +783,31 @@ class AttemptPermit:
 
 
 class _CredentialPermitState:
-    __slots__ = ("permit", "status", "resolved_binding")
+    __slots__ = (
+        "permit",
+        "status",
+        "resolved_binding",
+        "credential_handle_id",
+        "credential_handle_digest",
+        "resolver_claim_id",
+    )
 
     def __init__(self, permit: CredentialResolutionPermit) -> None:
         self.permit = permit
         self.status = "authorized"
         self.resolved_binding: Digest256 | ContractMarker | None = None
+        self.credential_handle_id: UUID | None = None
+        self.credential_handle_digest: Digest256 | None = None
+        self.resolver_claim_id: UUID | None = None
 
 
 class _AttemptPermitState:
-    __slots__ = ("permit", "status")
+    __slots__ = ("permit", "status", "credential_borrow_id")
 
     def __init__(self, permit: AttemptPermit) -> None:
         self.permit = permit
         self.status = "active"
+        self.credential_borrow_id: UUID | None = None
 
 
 def _validate_session_binding(
@@ -1121,26 +1149,53 @@ class AttemptGate:
         self,
         permit: CredentialResolutionPermit,
         *,
+        claim_id: UUID,
         resolved_binding_digest: Digest256 | ContractMarker,
+        handle_id: UUID,
+        handle_digest: Digest256,
         _authority: object | None = None,
     ) -> None:
-        """Trusted resolver callback; carries no credential bytes."""
+        """Revalidate after one backend read, then bind primitive handle proof."""
 
         if _authority is not _CREDENTIAL_RESOLVER_AUTHORITY:
             raise TypeError("credential confirmation requires trusted resolver")
-        _require_credential_binding(resolved_binding_digest)
-        mismatch = False
+        if type(claim_id) is not UUID:
+            raise _attempt_error("resolver claim owner 无效。")
+        binding_is_valid = True
+        try:
+            _require_credential_binding(resolved_binding_digest)
+        except (TypeError, ValueError, AttributeError):
+            binding_is_valid = False
+        proof_is_valid = type(handle_id) is UUID and type(handle_digest) is Digest256
         with self._lock:
             state = self._require_credential_state_locked(permit)
-            if state.status != "resolving":
+            if (
+                state.status != "resolving"
+                or state.resolver_claim_id != claim_id
+            ):
                 raise _attempt_error("凭据解析授权未被 resolver 独占。")
-            if resolved_binding_digest != permit.credential_binding_digest:
+            if (
+                not binding_is_valid
+                or not proof_is_valid
+                or resolved_binding_digest != permit.credential_binding_digest
+            ):
                 state.status = "failing"
-                mismatch = True
             else:
-                state.resolved_binding = resolved_binding_digest
-                state.status = "resolved"
-        if mismatch:
+                bindings = (
+                    permit._planned,
+                    permit._invocation,
+                    permit._prepared,
+                    permit._authorization,
+                    permit._consent_ledger,
+                    permit._session,
+                    permit._approval_ledger,
+                    permit._session_ledger,
+                    permit._authority_ledger,
+                    permit._context,
+                    permit._context_ledger,
+                )
+                state.status = "confirming"
+        if state.status == "failing":
             try:
                 self._finish_credential_activity(
                     permit,
@@ -1153,7 +1208,70 @@ class AttemptGate:
                     if current.status == "failing":
                         current.status = "resolving"
                 raise
-            raise _attempt_error("凭据解析结果与批准的 binding 不匹配。")
+            raise _attempt_error("凭据解析结果或句柄证明与批准内容不匹配。")
+
+        (
+            planned,
+            invocation,
+            prepared,
+            authorization,
+            consent_ledger,
+            session,
+            approval_ledger,
+            session_ledger,
+            authority_ledger,
+            context,
+            context_ledger,
+        ) = bindings
+
+        def confirm(
+            stage: ExecutionPlanStage,
+            operation: ExecutionPlanNetworkOperation,
+            sample: ClockSample,
+        ) -> None:
+            del stage, operation
+            if (
+                sample.wall_time < session.issued_at
+                or sample.wall_time >= session.valid_until
+            ):
+                raise _attempt_error("发送会话已经过期或尚未生效。")
+            with self._lock:
+                current = self._require_credential_state_locked(permit)
+                if (
+                    current.status != "confirming"
+                    or current.resolver_claim_id != claim_id
+                ):
+                    raise _attempt_error("凭据解析确认状态已经变化。")
+                current.resolved_binding = resolved_binding_digest
+                current.credential_handle_id = handle_id
+                current.credential_handle_digest = handle_digest
+                current.resolver_claim_id = None
+                current.status = "resolved"
+
+        try:
+            self._run_authority_path(
+                planned=planned,
+                invocation=invocation,
+                prepared=prepared,
+                authorization=authorization,
+                consent_ledger=consent_ledger,
+                session=session,
+                approval_ledger=approval_ledger,
+                session_ledger=session_ledger,
+                authority_ledger=authority_ledger,
+                context=context,
+                context_ledger=context_ledger,
+                final_action=confirm,
+            )
+        except BaseException:
+            with self._lock:
+                current = self._lookup_credential_state_locked(permit)
+                if (
+                    current.status == "confirming"
+                    and current.resolver_claim_id == claim_id
+                ):
+                    current.status = "resolving"
+            raise
 
     def _finish_credential_activity(
         self,
@@ -1194,15 +1312,25 @@ class AttemptGate:
         self,
         permit: CredentialResolutionPermit,
         *,
+        claim_id: UUID,
         _authority: object | None = None,
-    ) -> None:
+    ) -> bool:
         """Trusted resolver cleanup after an exclusive backend read fails."""
 
         if _authority is not _CREDENTIAL_RESOLVER_AUTHORITY:
             raise TypeError("credential failure requires trusted resolver")
+        if type(claim_id) is not UUID:
+            raise _attempt_error("resolver claim owner 无效。")
         with self._lock:
-            state = self._require_credential_state_locked(permit)
-            if state.status != "resolving":
+            state = self._lookup_credential_state_locked(permit)
+            if state.status in ("abandoned", "finished"):
+                return False
+            if self._active_by_session.get(permit.session_id) != permit.permit_id:
+                raise _attempt_error("凭据解析授权当前不可用。")
+            if (
+                state.status != "resolving"
+                or state.resolver_claim_id != claim_id
+            ):
                 raise _attempt_error("只能终止 resolver 已独占的凭据授权。")
             state.status = "failing"
         try:
@@ -1214,20 +1342,66 @@ class AttemptGate:
         except BaseException:
             with self._lock:
                 current = self._lookup_credential_state_locked(permit)
-                if current.status == "failing":
+                if (
+                    current.status == "failing"
+                    and current.resolver_claim_id == claim_id
+                ):
                     current.status = "resolving"
             raise
+        return True
+
+    def _credential_resolution_is_terminal(
+        self,
+        permit: CredentialResolutionPermit,
+        *,
+        _authority: object | None = None,
+    ) -> bool:
+        """Let the trusted resolver observe cleanup after commit-then-raise."""
+
+        if _authority is not _CREDENTIAL_RESOLVER_AUTHORITY:
+            raise TypeError("credential state observation requires trusted resolver")
+        with self._lock:
+            state = self._lookup_credential_state_locked(permit)
+            return state.status in ("abandoned", "finished")
+
+    def _credential_claim_is_owned(
+        self,
+        permit: CredentialResolutionPermit,
+        *,
+        claim_id: UUID,
+        _authority: object | None = None,
+    ) -> bool:
+        """Observe a caller-generated resolver owner after claim raises."""
+
+        if _authority is not _CREDENTIAL_RESOLVER_AUTHORITY:
+            raise TypeError("credential claim observation requires resolver")
+        if type(claim_id) is not UUID:
+            return False
+        with self._lock:
+            state = self._lookup_credential_state_locked(permit)
+            return (
+                state.resolver_claim_id == claim_id
+                and state.status in (
+                    "claiming",
+                    "resolving",
+                    "confirming",
+                    "failing",
+                )
+            )
 
     def _claim_credential_resolution(
         self,
         permit: CredentialResolutionPermit,
         *,
+        claim_id: UUID,
         _authority: object | None = None,
     ) -> CredentialResolutionPermit:
         """Atomically claim before any resolver backend may read a secret."""
 
         if _authority is not _CREDENTIAL_RESOLVER_AUTHORITY:
             raise TypeError("credential claim requires trusted resolver")
+        if type(claim_id) is not UUID:
+            raise _attempt_error("resolver claim owner 无效。")
         if type(permit) is not CredentialResolutionPermit:
             raise TypeError("permit must be CredentialResolutionPermit")
         if permit._attempt_gate is not self:
@@ -1236,6 +1410,8 @@ class AttemptGate:
             initial_state = self._require_credential_state_locked(permit)
             if initial_state.status != "authorized":
                 raise _attempt_error("凭据解析授权已被其他 resolver 领取。")
+            if initial_state.resolver_claim_id is not None:
+                raise _attempt_error("凭据解析授权已有 resolver owner。")
             bindings = (
                 permit._planned,
                 permit._invocation,
@@ -1249,6 +1425,7 @@ class AttemptGate:
                 permit._context,
                 permit._context_ledger,
             )
+            initial_state.resolver_claim_id = claim_id
             initial_state.status = "claiming"
         (
             planned,
@@ -1277,7 +1454,10 @@ class AttemptGate:
                 raise _attempt_error("发送会话已经过期或尚未生效。")
             with self._lock:
                 state = self._require_credential_state_locked(permit)
-                if state.status != "claiming":
+                if (
+                    state.status != "claiming"
+                    or state.resolver_claim_id != claim_id
+                ):
                     raise _attempt_error("凭据解析授权已被其他 resolver 领取。")
                 state.status = "resolving"
                 return permit
@@ -1300,30 +1480,72 @@ class AttemptGate:
         except BaseException:
             with self._lock:
                 current = self._lookup_credential_state_locked(permit)
-                if current.status == "claiming":
+                if (
+                    current.status == "claiming"
+                    and current.resolver_claim_id == claim_id
+                ):
                     current.status = "authorized"
+                    current.resolver_claim_id = None
             raise
 
     def abandon_credential_resolution(
         self,
         permit: CredentialResolutionPermit,
     ) -> bool:
-        """Invalidate an unused permit after resolver failure or cancellation."""
+        """Invalidate a permit before any resolver has read credential bytes."""
 
         with self._lock:
             state = self._lookup_credential_state_locked(permit)
             if state.status in ("abandoned", "finished"):
                 return False
-            if state.status not in ("authorized", "resolved"):
+            if state.status != "authorized":
                 raise _attempt_error(
-                    "resolver 已领取或 attempt 已预留的凭据授权不能公开废弃。"
+                    "resolver 已领取的凭据授权必须由 secret owner 终结。"
                 )
-            required_status = state.status
         self._finish_credential_activity(
             permit,
-            required_status=required_status,
+            required_status="authorized",
             terminal_status="abandoned",
         )
+        return True
+
+    def _abandon_resolved_credential_resolution(
+        self,
+        permit: CredentialResolutionPermit,
+        *,
+        handle_id: UUID,
+        handle_digest: Digest256,
+        _authority: object | None = None,
+    ) -> bool:
+        """Terminalize exact Gate proof before the owner zeroes its handle."""
+
+        if _authority is not _CREDENTIAL_RESOLVER_AUTHORITY:
+            raise TypeError("resolved cleanup requires trusted resolver")
+        if type(handle_id) is not UUID or type(handle_digest) is not Digest256:
+            raise _attempt_error("凭据句柄证明无效。")
+        with self._lock:
+            state = self._lookup_credential_state_locked(permit)
+            if state.status in ("abandoned", "finished"):
+                return False
+            if (
+                state.status != "resolved"
+                or state.credential_handle_id != handle_id
+                or state.credential_handle_digest != handle_digest
+            ):
+                raise _attempt_error("凭据句柄证明与 resolver 状态不匹配。")
+            state.status = "abandoning"
+        try:
+            self._finish_credential_activity(
+                permit,
+                required_status="abandoning",
+                terminal_status="abandoned",
+            )
+        except BaseException:
+            with self._lock:
+                current = self._lookup_credential_state_locked(permit)
+                if current.status == "abandoning":
+                    current.status = "resolved"
+            raise
         return True
 
     def _lookup_credential_state_locked(
@@ -1375,17 +1597,20 @@ class AttemptGate:
             raise _attempt_error("凭据解析授权的 active session 绑定已经变化。")
         permit_snapshot = self._snapshot_slots(permit)
         old_status = state.status
+        old_claim_id = state.resolver_claim_id
         try:
             permit._release_authority_refs(
                 _authority=_PERMIT_RELEASE_AUTHORITY,
             )
             state.status = terminal_status
+            state.resolver_claim_id = None
             if self._active_by_session.get(permit.session_id) != permit.permit_id:
                 raise _attempt_error("凭据解析授权的 active session 绑定已经变化。")
             del self._active_by_session[permit.session_id]
         except BaseException:
             self._restore_slots(permit, permit_snapshot)
             state.status = old_status
+            state.resolver_claim_id = old_claim_id
             self._active_by_session[permit.session_id] = active_id
             raise
 
@@ -1443,11 +1668,17 @@ class AttemptGate:
         self,
         *,
         credential_permit: CredentialResolutionPermit,
+        credential_handle_id: UUID,
+        credential_handle_digest: Digest256,
     ) -> AttemptPermit:
         if type(credential_permit) is not CredentialResolutionPermit:
             raise TypeError(
                 "credential_permit must be CredentialResolutionPermit"
             )
+        if type(credential_handle_id) is not UUID:
+            raise TypeError("credential_handle_id must be UUID")
+        if type(credential_handle_digest) is not Digest256:
+            raise TypeError("credential_handle_digest must be Digest256")
         if credential_permit._attempt_gate is not self:
             raise _attempt_error("凭据解析授权不属于当前 AttemptGate。")
         with self._lock:
@@ -1458,8 +1689,13 @@ class AttemptGate:
                 initial_state.status != "resolved"
                 or initial_state.resolved_binding
                 != credential_permit.credential_binding_digest
+                or initial_state.credential_handle_id != credential_handle_id
+                or initial_state.credential_handle_digest
+                != credential_handle_digest
             ):
-                raise _attempt_error("凭据尚未按批准 binding 解析。")
+                raise _attempt_error(
+                    "凭据尚未按批准 binding 和调用方句柄证明解析。"
+                )
             bindings = (
                 credential_permit._planned,
                 credential_permit._invocation,
@@ -1505,8 +1741,13 @@ class AttemptGate:
                     state.status != "resolved"
                     or state.resolved_binding
                     != credential_permit.credential_binding_digest
+                    or state.credential_handle_id != credential_handle_id
+                    or state.credential_handle_digest
+                    != credential_handle_digest
                 ):
-                    raise _attempt_error("凭据尚未按批准 binding 解析。")
+                    raise _attempt_error(
+                        "凭据尚未按批准 binding 和调用方句柄证明解析。"
+                    )
                 # Context lock is already held by _run_authority_path.  Marking
                 # this state before budget reservation makes abandon-vs-reserve
                 # linearizable without reversing the Context -> AttemptGate
@@ -1522,14 +1763,31 @@ class AttemptGate:
                         raise _attempt_error("凭据解析授权已经消费。")
                     permit = AttemptPermit(
                         credential_permit=credential_permit,
+                        credential_handle_id=current.credential_handle_id,
+                        credential_handle_digest=current.credential_handle_digest,
                         reservation=reservation,
                         attempt_gate=self,
                         _authority=_PERMIT_FACTORY_AUTHORITY,
                     )
+                    attempt_state = _AttemptPermitState(permit)
+                    try:
+                        self._attempt_permits[permit.attempt_permit_id] = (
+                            attempt_state
+                        )
+                    except BaseException:
+                        if (
+                            self._attempt_permits.get(permit.attempt_permit_id)
+                            is attempt_state
+                        ):
+                            del self._attempt_permits[permit.attempt_permit_id]
+                        permit._release_authority_refs(
+                            _authority=_PERMIT_RELEASE_AUTHORITY,
+                        )
+                        raise
+                    # Publishing the exact AttemptPermit state succeeds before
+                    # this final commit marker.  Any publication fault therefore
+                    # leaves the credential in reserving for the outer rollback.
                     current.status = "consumed"
-                    self._attempt_permits[permit.attempt_permit_id] = (
-                        _AttemptPermitState(permit)
-                    )
                     return permit
 
             try:
@@ -1591,6 +1849,29 @@ class AttemptGate:
             raise _attempt_error("attempt permit 不属于当前 AttemptGate。")
         return state
 
+    def _require_attempt_credential_proof_locked(
+        self,
+        permit: AttemptPermit,
+    ) -> CredentialResolutionPermit:
+        credential = permit._credential_permit
+        credential_state = self._credential_permits.get(
+            permit.credential_permit_id
+        )
+        if (
+            type(credential) is not CredentialResolutionPermit
+            or credential_state is None
+            or credential_state.permit is not credential
+            or credential_state.status != "consumed"
+            or credential_state.credential_handle_id
+            != permit.credential_handle_id
+            or credential_state.credential_handle_digest
+            != permit.credential_handle_digest
+            or self._active_by_session.get(permit.session_id)
+            != permit.credential_permit_id
+        ):
+            raise _attempt_error("attempt 的凭据句柄证明已经变化。")
+        return credential
+
     def _claim_attempt(
         self,
         permit: AttemptPermit,
@@ -1605,9 +1886,12 @@ class AttemptGate:
             raise TypeError("permit must be AttemptPermit")
         with self._lock:
             initial_state = self._lookup_attempt_state_locked(permit)
-            if initial_state.status != "active":
+            if (
+                initial_state.status != "active"
+                or initial_state.credential_borrow_id is not None
+            ):
                 raise _attempt_error("attempt permit 已被领取或终结。")
-            credential = permit._credential_permit
+            credential = self._require_attempt_credential_proof_locked(permit)
             bindings = (
                 credential._planned,
                 credential._invocation,
@@ -1649,8 +1933,12 @@ class AttemptGate:
                 raise _attempt_error("发送会话已经过期或尚未生效。")
             with self._lock:
                 state = self._lookup_attempt_state_locked(permit)
-                if state.status != "claiming":
+                if (
+                    state.status != "claiming"
+                    or state.credential_borrow_id is not None
+                ):
                     raise _attempt_error("attempt permit 已被领取或终结。")
+                self._require_attempt_credential_proof_locked(permit)
                 state.status = "sending"
                 return permit
 
@@ -1676,16 +1964,129 @@ class AttemptGate:
                     current.status = "active"
             raise
 
-    def abandon_attempt(self, permit: AttemptPermit) -> bool:
+    def _begin_credential_borrow(
+        self,
+        permit: AttemptPermit,
+        *,
+        borrow_id: UUID,
+        handle_id: UUID,
+        handle_digest: Digest256,
+        _authority: object | None = None,
+    ) -> None:
+        """Mark an in-flight attempt as borrowing its exact credential."""
+
+        if _authority is not _TRANSPORT_ATTEMPT_AUTHORITY:
+            raise TypeError("credential borrow requires trusted transport")
+        if type(borrow_id) is not UUID:
+            raise _attempt_error("凭据借用 owner 无效。")
+        if type(handle_id) is not UUID or type(handle_digest) is not Digest256:
+            raise _attempt_error("凭据句柄证明无效。")
+        with self._lock:
+            state = self._lookup_attempt_state_locked(permit)
+            if state.status != "sending":
+                raise _attempt_error("attempt 当前不能借用凭据。")
+            if state.credential_borrow_id is not None:
+                raise _attempt_error("attempt 已有凭据借用 owner。")
+            self._require_attempt_credential_proof_locked(permit)
+            if (
+                permit.credential_handle_id != handle_id
+                or permit.credential_handle_digest != handle_digest
+            ):
+                raise _attempt_error("attempt 的凭据句柄证明不匹配。")
+            state.credential_borrow_id = borrow_id
+
+    def _finish_credential_borrow(
+        self,
+        permit: AttemptPermit,
+        *,
+        borrow_id: UUID,
+        handle_id: UUID,
+        handle_digest: Digest256,
+        _authority: object | None = None,
+    ) -> None:
+        """Release the borrow marker only after the secret view is invalid."""
+
+        if _authority is not _TRANSPORT_ATTEMPT_AUTHORITY:
+            raise TypeError("credential borrow release requires trusted transport")
+        with self._lock:
+            state = self._lookup_attempt_state_locked(permit)
+            if (
+                state.status != "sending"
+                or state.credential_borrow_id != borrow_id
+                or permit.credential_handle_id != handle_id
+                or permit.credential_handle_digest != handle_digest
+            ):
+                raise _attempt_error("attempt 的凭据借用状态已经变化。")
+            self._require_attempt_credential_proof_locked(permit)
+            state.credential_borrow_id = None
+
+    def _credential_borrow_is_active(
+        self,
+        permit: AttemptPermit,
+        *,
+        borrow_id: UUID,
+        handle_id: UUID,
+        handle_digest: Digest256,
+        _authority: object | None = None,
+    ) -> bool:
+        """Observe a proof-exact marker after a transition raises."""
+
+        if _authority is not _TRANSPORT_ATTEMPT_AUTHORITY:
+            raise TypeError("credential borrow observation requires transport")
+        with self._lock:
+            state = self._lookup_attempt_state_locked(permit)
+            if (
+                permit.credential_handle_id != handle_id
+                or permit.credential_handle_digest != handle_digest
+            ):
+                raise _attempt_error("attempt 的凭据句柄证明不匹配。")
+            return (
+                state.status == "sending"
+                and state.credential_borrow_id == borrow_id
+            )
+
+    def _force_finish_credential_borrow(
+        self,
+        permit: AttemptPermit,
+        *,
+        borrow_id: UUID,
+        handle_id: UUID,
+        handle_digest: Digest256,
+        _authority: object | None = None,
+    ) -> None:
+        """Fault fallback after the view and ledger secret are already closed."""
+
+        if _authority is not _TRANSPORT_ATTEMPT_AUTHORITY:
+            raise TypeError("credential borrow recovery requires transport")
+        with self._lock:
+            state = self._lookup_attempt_state_locked(permit)
+            if (
+                state.status != "sending"
+                or state.credential_borrow_id != borrow_id
+                or permit.credential_handle_id != handle_id
+                or permit.credential_handle_digest != handle_digest
+            ):
+                raise _attempt_error("attempt 的凭据借用恢复状态不匹配。")
+            self._require_attempt_credential_proof_locked(permit)
+            state.credential_borrow_id = None
+
+    def abandon_attempt(
+        self,
+        permit: AttemptPermit,
+        *,
+        _authority: object | None = None,
+    ) -> bool:
         """Release an unclaimed attempt; budget remains consumed."""
 
+        if _authority is not _TRANSPORT_ATTEMPT_AUTHORITY:
+            raise TypeError("attempt abandonment requires trusted transport")
         if type(permit) is not AttemptPermit:
             raise TypeError("permit must be AttemptPermit")
         with self._lock:
             state = self._lookup_attempt_state_locked(permit)
             if state.status in ("abandoned", "finished"):
                 return False
-            if state.status != "active":
+            if state.status != "active" or state.credential_borrow_id is not None:
                 raise _attempt_error("已领取或正在终结的 attempt 不能废弃。")
             context_ledger = permit._context_ledger
             reservation = permit._reservation
@@ -1740,7 +2141,7 @@ class AttemptGate:
             state = self._lookup_attempt_state_locked(permit)
             if state.status in ("finished", "abandoned"):
                 return False
-            if state.status != "sending":
+            if state.status != "sending" or state.credential_borrow_id is not None:
                 raise _attempt_error("attempt permit 尚未由 transport 领取。")
             context_ledger = permit._context_ledger
             reservation = permit._reservation
