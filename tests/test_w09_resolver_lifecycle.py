@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import builtins
 import copy
+import gc
 import json
 import os
 import pickle
@@ -11,6 +12,7 @@ import subprocess
 import unittest
 from unittest.mock import patch
 from uuid import UUID
+import weakref
 
 from snapquiz.domain.digest import Digest256, digest256
 from snapquiz.domain.errors import ConfigError, EndpointPolicyError
@@ -27,6 +29,7 @@ from snapquiz.transport.resolver import (
     PreAttemptResolverGuard,
     ResolverHelperLauncher,
     ResolverResultReceipt,
+    _RESOLVER_LIFECYCLE_AUTHORITY,
     start_frame_digest,
 )
 
@@ -35,6 +38,7 @@ LIFECYCLE_ID = UUID("70000000-0000-0000-0000-000000000001")
 ATTEMPT_ID = UUID("70000000-0000-0000-0000-000000000002")
 CLAIM_ID = UUID("70000000-0000-0000-0000-000000000003")
 DNS_START_ID = UUID("70000000-0000-0000-0000-000000000004")
+READY_PUBLICATION_ID = UUID("70000000-0000-0000-0000-000000000005")
 ATTEMPT_DIGEST = Digest256("a" * 64)
 POLICY_DIGEST = Digest256("b" * 64)
 TARGET = "open.bigmodel.cn"
@@ -96,8 +100,9 @@ class _FakeSpawner:
         self.kernel = kernel
         self.requests = []
 
-    def spawn(self, request):
+    def spawn(self, request, *, publication):
         self.requests.append(request)
+        publication.publish(self.kernel)
         return self.kernel
 
 
@@ -109,6 +114,23 @@ def _launcher(chunks, *, faults=None, exit_status: object = 0):
         spawner,
         kernel,
     )
+
+
+def _reserve_lifecycle_capability(launcher):
+    reservation_owner = object()
+    with patch(
+        "snapquiz.transport.resolver.uuid4",
+        side_effect=[
+            READY_PUBLICATION_ID,
+            LIFECYCLE_ID,
+            CLAIM_ID,
+            DNS_START_ID,
+        ],
+    ):
+        return launcher._reserve_lifecycle_capability(
+            reservation_owner=reservation_owner,
+            _authority=_RESOLVER_LIFECYCLE_AUTHORITY,
+        )
 
 
 def _ready(
@@ -123,35 +145,61 @@ def _ready(
         faults=faults,
         exit_status=exit_status,
     )
-    guard = launcher.launch_ready(
-        lifecycle_id=LIFECYCLE_ID,
+    capability = _reserve_lifecycle_capability(launcher)
+    guard = launcher._launch_ready(
+        capability=capability,
         observer=observer,
+        _authority=_RESOLVER_LIFECYCLE_AUTHORITY,
     )
+    if not launcher._consume_ready_publication(
+        capability,
+        guard,
+        _authority=_RESOLVER_LIFECYCLE_AUTHORITY,
+    ):
+        raise AssertionError("READY publication was not consumed")
     return guard, spawner, kernel
 
 
 def _transfer(guard, *, observer=None):
-    return guard.transfer(
+    return guard._transfer(
         attempt_permit_id=ATTEMPT_ID,
         attempt_permit_digest=ATTEMPT_DIGEST,
-        transport_claim_id=CLAIM_ID,
         observer=observer,
+        _authority=_RESOLVER_LIFECYCLE_AUTHORITY,
     )
 
 
 def _start(guard, *, observer=None):
-    guard.start(
+    guard._start(
         hostname=TARGET,
         port=443,
         network_policy_ref="snapquiz.internet-public-address-policy.v1",
         network_policy_digest=POLICY_DIGEST,
-        dns_start_id=DNS_START_ID,
         observer=observer,
+        _authority=_RESOLVER_LIFECYCLE_AUTHORITY,
+    )
+
+
+def _read_result_receipt(guard, *, observer=None):
+    return guard._read_result_receipt(
+        observer=observer,
+        _authority=_RESOLVER_LIFECYCLE_AUTHORITY,
     )
 
 
 def _cleanup_counts(kernel: _FakeKernel) -> tuple[int, int, int]:
     return (
+        kernel.events.count("terminate"),
+        kernel.events.count("reap"),
+        kernel.events.count("close_pipes"),
+    )
+
+
+def _external_counts(spawner: _FakeSpawner, kernel: _FakeKernel):
+    return (
+        len(spawner.requests),
+        kernel.events.count("read"),
+        len(kernel.writes),
         kernel.events.count("terminate"),
         kernel.events.count("reap"),
         kernel.events.count("close_pipes"),
@@ -173,7 +221,7 @@ class W09ResolverLifecycleTest(unittest.TestCase):
         self.assertEqual(attempt.safe_metadata()["state"], "transferred")
         _start(attempt)
         self.assertEqual(attempt.safe_metadata()["state"], "started")
-        receipt = attempt.read_result_receipt()
+        receipt = _read_result_receipt(attempt)
         self.assertIs(type(receipt), ResolverResultReceipt)
         self.assertEqual(receipt.lifecycle_id, LIFECYCLE_ID)
         self.assertEqual(receipt.attempt_permit_id, ATTEMPT_ID)
@@ -250,12 +298,138 @@ class W09ResolverLifecycleTest(unittest.TestCase):
         self.assertNotIn(SECRET.encode("ascii"), kernel.writes[0])
         attempt.cleanup()
 
+    def test_spawn_publish_then_raise_cleans_anchored_kernel_and_registries(self):
+        launcher, spawner, kernel = _launcher([READY_FRAME])
+        capability = _reserve_lifecycle_capability(launcher)
+
+        def publish_then_raise(request, *, publication):
+            spawner.requests.append(request)
+            publication.publish(kernel)
+            raise RuntimeError("synthetic spawn post-publication")
+
+        with patch.object(spawner, "spawn", side_effect=publish_then_raise):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "spawn post-publication",
+            ):
+                launcher._launch_ready(
+                    capability=capability,
+                    _authority=_RESOLVER_LIFECYCLE_AUTHORITY,
+                )
+
+        self.assertEqual(len(spawner.requests), 1)
+        self.assertEqual(kernel.events.count("read"), 0)
+        self.assertEqual(_cleanup_counts(kernel), (1, 1, 1))
+        self.assertEqual(launcher._ready_publications, {})
+        self.assertEqual(launcher._lifecycle_recovery, {})
+
+    def test_spawn_return_without_publication_is_anchored_then_cleaned(self):
+        launcher, spawner, kernel = _launcher([READY_FRAME])
+        capability = _reserve_lifecycle_capability(launcher)
+
+        def return_without_publication(request, *, publication):
+            del publication
+            spawner.requests.append(request)
+            return kernel
+
+        with patch.object(
+            spawner,
+            "spawn",
+            side_effect=return_without_publication,
+        ):
+            with self.assertRaisesRegex(
+                EndpointPolicyError,
+                "kernel 未在 spawn 返回前发布",
+            ):
+                launcher._launch_ready(
+                    capability=capability,
+                    _authority=_RESOLVER_LIFECYCLE_AUTHORITY,
+                )
+
+        self.assertEqual(len(spawner.requests), 1)
+        self.assertEqual(kernel.events.count("read"), 0)
+        self.assertEqual(kernel.writes, [])
+        self.assertEqual(_cleanup_counts(kernel), (1, 1, 1))
+        self.assertEqual(launcher._ready_publications, {})
+        self.assertEqual(launcher._lifecycle_recovery, {})
+
+    def test_kernel_attach_normal_noop_is_reanchored_then_rejected(self):
+        launcher, spawner, kernel = _launcher([READY_FRAME])
+        capability = _reserve_lifecycle_capability(launcher)
+
+        with patch.object(
+            resolver_module._ResolverLifecycleLedger,
+            "attach_kernel",
+            return_value=None,
+        ):
+            with self.assertRaisesRegex(
+                EndpointPolicyError,
+                "kernel publication 未提交",
+            ):
+                launcher._launch_ready(
+                    capability=capability,
+                    _authority=_RESOLVER_LIFECYCLE_AUTHORITY,
+                )
+
+        self.assertEqual(len(spawner.requests), 1)
+        self.assertEqual(kernel.events.count("read"), 0)
+        self.assertEqual(kernel.writes, [])
+        self.assertEqual(_cleanup_counts(kernel), (1, 1, 1))
+        self.assertEqual(launcher._ready_publications, {})
+        self.assertEqual(launcher._lifecycle_recovery, {})
+
+    def test_ready_ledger_normal_noop_is_rejected_before_publication(self):
+        launcher, spawner, kernel = _launcher([READY_FRAME])
+        capability = _reserve_lifecycle_capability(launcher)
+
+        with patch.object(
+            resolver_module._ResolverLifecycleLedger,
+            "mark_ready",
+            return_value=None,
+        ):
+            with self.assertRaisesRegex(
+                EndpointPolicyError,
+                "READY ledger proof 未提交",
+            ):
+                launcher._launch_ready(
+                    capability=capability,
+                    _authority=_RESOLVER_LIFECYCLE_AUTHORITY,
+                )
+
+        self.assertEqual(len(spawner.requests), 1)
+        self.assertEqual(kernel.events.count("read"), 1)
+        self.assertEqual(kernel.writes, [])
+        self.assertEqual(_cleanup_counts(kernel), (1, 1, 1))
+        self.assertEqual(launcher._ready_publications, {})
+        self.assertEqual(launcher._lifecycle_recovery, {})
+
+    def test_live_lifecycle_recovery_anchor_cannot_be_released_early(self):
+        pre, _, kernel = _ready()
+        launcher = pre._capability._launcher
+        publication_id = pre._capability.publication_id
+
+        with self.assertRaisesRegex(
+            EndpointPolicyError,
+            "只能在 terminal 后释放",
+        ):
+            launcher._release_lifecycle_recovery(
+                publication_id,
+                pre._ledger,
+            )
+
+        self.assertIn(publication_id, launcher._lifecycle_recovery)
+        self.assertEqual(_cleanup_counts(kernel), (0, 0, 0))
+        self.assertTrue(pre.cleanup())
+        self.assertEqual(_cleanup_counts(kernel), (1, 1, 1))
+        self.assertEqual(launcher._lifecycle_recovery, {})
+
     def test_guards_are_factory_only(self):
         with self.assertRaisesRegex(TypeError, "require launcher"):
             PreAttemptResolverGuard(
                 lifecycle_id=LIFECYCLE_ID,
                 spawn_request_digest=ATTEMPT_DIGEST,
                 ledger=object(),
+                capability=object(),
             )
         with self.assertRaisesRegex(TypeError, "require ownership transfer"):
             AttemptTerminalGuard(
@@ -266,7 +440,105 @@ class W09ResolverLifecycleTest(unittest.TestCase):
                 terminal_guard_id=DNS_START_ID,
                 terminal_guard_digest=POLICY_DIGEST,
                 ledger=object(),
+                capability=object(),
             )
+
+    def test_public_lifecycle_bypasses_are_absent_and_have_zero_side_effects(self):
+        launcher, spawner, kernel = _launcher([READY_FRAME, RESULT + b"\n"])
+        before = _external_counts(spawner, kernel)
+
+        with self.assertRaises(AttributeError):
+            launcher.launch_ready(lifecycle_id=LIFECYCLE_ID)  # type: ignore[attr-defined]
+        self.assertEqual(_external_counts(spawner, kernel), before)
+
+        capability = _reserve_lifecycle_capability(launcher)
+        pre = launcher._launch_ready(
+            capability=capability,
+            _authority=_RESOLVER_LIFECYCLE_AUTHORITY,
+        )
+        self.assertTrue(
+            launcher._consume_ready_publication(
+                capability,
+                pre,
+                _authority=_RESOLVER_LIFECYCLE_AUTHORITY,
+            )
+        )
+        before = _external_counts(spawner, kernel)
+        with self.assertRaises(AttributeError):
+            pre.transfer(  # type: ignore[attr-defined]
+                attempt_permit_id=ATTEMPT_ID,
+                attempt_permit_digest=ATTEMPT_DIGEST,
+            )
+        self.assertEqual(_external_counts(spawner, kernel), before)
+
+        attempt = _transfer(pre)
+        before = _external_counts(spawner, kernel)
+        with self.assertRaises(AttributeError):
+            attempt.start(  # type: ignore[attr-defined]
+                hostname=TARGET,
+                port=443,
+                network_policy_ref="snapquiz.internet-public-address-policy.v1",
+                network_policy_digest=POLICY_DIGEST,
+            )
+        with self.assertRaises(AttributeError):
+            attempt.read_result_receipt()  # type: ignore[attr-defined]
+        self.assertEqual(_external_counts(spawner, kernel), before)
+        self.assertTrue(attempt.cleanup())
+
+    def test_private_lifecycle_entries_require_authority_before_external_io(self):
+        launcher, spawner, kernel = _launcher([READY_FRAME, RESULT + b"\n"])
+        before = _external_counts(spawner, kernel)
+        with self.assertRaisesRegex(TypeError, "requires coordinator"):
+            launcher._reserve_lifecycle_capability(
+                reservation_owner=object(),
+            )
+        self.assertEqual(_external_counts(spawner, kernel), before)
+
+        capability = _reserve_lifecycle_capability(launcher)
+        before = _external_counts(spawner, kernel)
+        with self.assertRaisesRegex(TypeError, "requires coordinator"):
+            launcher._launch_ready(capability=capability)
+        self.assertEqual(_external_counts(spawner, kernel), before)
+
+        pre = launcher._launch_ready(
+            capability=capability,
+            _authority=_RESOLVER_LIFECYCLE_AUTHORITY,
+        )
+        self.assertTrue(
+            launcher._consume_ready_publication(
+                capability,
+                pre,
+                _authority=_RESOLVER_LIFECYCLE_AUTHORITY,
+            )
+        )
+        before = _external_counts(spawner, kernel)
+        with self.assertRaisesRegex(TypeError, "requires coordinator"):
+            pre._transfer(
+                attempt_permit_id=ATTEMPT_ID,
+                attempt_permit_digest=ATTEMPT_DIGEST,
+            )
+        self.assertEqual(_external_counts(spawner, kernel), before)
+
+        attempt = _transfer(pre)
+        before = _external_counts(spawner, kernel)
+        with self.assertRaisesRegex(TypeError, "requires coordinator"):
+            attempt._start(
+                hostname=TARGET,
+                port=443,
+                network_policy_ref="snapquiz.internet-public-address-policy.v1",
+                network_policy_digest=POLICY_DIGEST,
+            )
+        self.assertEqual(_external_counts(spawner, kernel), before)
+
+        _start(attempt)
+        before = _external_counts(spawner, kernel)
+        with self.assertRaisesRegex(TypeError, "requires coordinator"):
+            attempt._read_result_receipt()
+        self.assertEqual(_external_counts(spawner, kernel), before)
+        receipt = _read_result_receipt(attempt)
+        self.assertEqual(receipt.lifecycle_id, LIFECYCLE_ID)
+        self.assertEqual(receipt.transport_claim_id, CLAIM_ID)
+        self.assertEqual(receipt.dns_start_id, DNS_START_ID)
 
     def test_exact_owner_identity_rejects_forged_guard(self):
         pre, _, kernel = _ready()
@@ -307,8 +579,12 @@ class W09ResolverLifecycleTest(unittest.TestCase):
         for name, chunks in cases:
             with self.subTest(name=name):
                 launcher, _, kernel = _launcher(chunks)
+                capability = _reserve_lifecycle_capability(launcher)
                 with self.assertRaises(EndpointPolicyError):
-                    launcher.launch_ready(lifecycle_id=LIFECYCLE_ID)
+                    launcher._launch_ready(
+                        capability=capability,
+                        _authority=_RESOLVER_LIFECYCLE_AUTHORITY,
+                    )
                 self.assertEqual(_cleanup_counts(kernel), (1, 1, 1))
                 self.assertEqual(kernel.writes, [])
 
@@ -323,10 +599,10 @@ class W09ResolverLifecycleTest(unittest.TestCase):
     def test_pre_transfer_validation_fault_cleans_pre_owner(self):
         pre, _, kernel = _ready()
         with self.assertRaises(ValueError):
-            pre.transfer(
+            pre._transfer(
                 attempt_permit_id="not-a-uuid",  # type: ignore[arg-type]
                 attempt_permit_digest=ATTEMPT_DIGEST,
-                transport_claim_id=CLAIM_ID,
+                _authority=_RESOLVER_LIFECYCLE_AUTHORITY,
             )
         self.assertEqual(_cleanup_counts(kernel), (1, 1, 1))
         self.assertEqual(pre.safe_metadata()["state"], "terminal")
@@ -379,7 +655,7 @@ class W09ResolverLifecycleTest(unittest.TestCase):
                 attempt = _transfer(pre)
                 _start(attempt)
                 with self.assertRaises(EndpointPolicyError):
-                    attempt.read_result_receipt()
+                    _read_result_receipt(attempt)
                 self.assertEqual(_cleanup_counts(kernel), (1, 1, 1))
 
     def test_result_second_frame_in_next_chunk_fails_closed(self):
@@ -394,7 +670,7 @@ class W09ResolverLifecycleTest(unittest.TestCase):
         _start(attempt)
 
         with self.assertRaises(EndpointPolicyError):
-            attempt.read_result_receipt()
+            _read_result_receipt(attempt)
 
         self.assertIsNone(attempt._ledger._issued_receipt)
         self.assertEqual(kernel.read_limits[-1], 1)
@@ -409,7 +685,7 @@ class W09ResolverLifecycleTest(unittest.TestCase):
         _start(attempt)
 
         with self.assertRaises(EndpointPolicyError):
-            attempt.read_result_receipt()
+            _read_result_receipt(attempt)
 
         self.assertIsNone(attempt._ledger._issued_receipt)
         self.assertEqual(_cleanup_counts(kernel), (1, 1, 1))
@@ -441,7 +717,7 @@ class W09ResolverLifecycleTest(unittest.TestCase):
                     side_effect=invalid_eof_read,
                 ):
                     with self.assertRaises(EndpointPolicyError):
-                        attempt.read_result_receipt()
+                        _read_result_receipt(attempt)
 
                 self.assertEqual(eof_calls, 1)
                 self.assertIsNone(attempt._ledger._issued_receipt)
@@ -464,7 +740,7 @@ class W09ResolverLifecycleTest(unittest.TestCase):
 
         with patch.object(kernel, "read_stdout", side_effect=fail_eof_read):
             with self.assertRaisesRegex(KeyboardInterrupt, "raw EOF"):
-                attempt.read_result_receipt()
+                _read_result_receipt(attempt)
 
         self.assertEqual(eof_calls, 1)
         self.assertIsNone(attempt._ledger._issued_receipt)
@@ -490,7 +766,7 @@ class W09ResolverLifecycleTest(unittest.TestCase):
                 _start(attempt)
 
                 with self.assertRaises(EndpointPolicyError):
-                    attempt.read_result_receipt()
+                    _read_result_receipt(attempt)
 
                 self.assertIsNone(attempt._ledger._issued_receipt)
                 self.assertEqual(kernel.events.count("reap"), 1)
@@ -519,7 +795,7 @@ class W09ResolverLifecycleTest(unittest.TestCase):
                 _start(attempt)
 
                 with self.assertRaises(type(error)):
-                    attempt.read_result_receipt()
+                    _read_result_receipt(attempt)
 
                 self.assertIsNone(attempt._ledger._issued_receipt)
                 self.assertEqual(kernel.events.count("reap"), 1)
@@ -553,7 +829,7 @@ class W09ResolverLifecycleTest(unittest.TestCase):
                     new=commit_then_raise,
                 ):
                     with self.assertRaisesRegex(RuntimeError, "postcommit"):
-                        attempt.read_result_receipt()
+                        _read_result_receipt(attempt)
 
                 self.assertIsNone(attempt._ledger._issued_receipt)
                 self.assertEqual(_cleanup_counts(kernel), (0, 1, 1))
@@ -565,7 +841,7 @@ class W09ResolverLifecycleTest(unittest.TestCase):
         attempt = _transfer(pre)
         _start(attempt)
 
-        receipt = attempt.read_result_receipt()
+        receipt = _read_result_receipt(attempt)
 
         self.assertEqual(receipt.raw_transcript_byte_size, 16 * 1024)
         self.assertEqual(MAX_RESULT_FRAME_BYTES, MAX_RESULT_TRANSCRIPT_BYTES + 1)
@@ -577,7 +853,7 @@ class W09ResolverLifecycleTest(unittest.TestCase):
         pre, _, kernel = _ready([READY_FRAME, RESULT + b"\n"])
         attempt = _transfer(pre)
         _start(attempt)
-        receipt = attempt.read_result_receipt()
+        receipt = _read_result_receipt(attempt)
         altered = b'{"altered":true}'
         altered_digest = resolver_module.result_transcript_digest(altered)
         object.__setattr__(receipt, "_raw_transcript", altered)
@@ -612,7 +888,9 @@ class W09ResolverLifecycleTest(unittest.TestCase):
             raise RuntimeError("result observer fault")
 
         with self.assertRaisesRegex(RuntimeError, "result observer fault"):
-            returned.append(attempt.read_result_receipt(observer=fail_after_commit))
+            returned.append(
+                _read_result_receipt(attempt, observer=fail_after_commit)
+            )
 
         self.assertEqual(returned, [])
         self.assertEqual(attempt.safe_metadata()["state"], "terminal")
@@ -659,6 +937,172 @@ class W09ResolverLifecycleTest(unittest.TestCase):
         with self.assertRaises(EndpointPolicyError):
             pre.cleanup()
 
+    def test_cleanup_postcommit_fault_retains_recovery_anchor_without_retry(self):
+        launcher, spawner, kernel = _launcher([READY_FRAME])
+        capability = _reserve_lifecycle_capability(launcher)
+        launch_owner = object()
+        pre = launcher._launch_ready(
+            capability=capability,
+            launch_owner=launch_owner,
+            _authority=_RESOLVER_LIFECYCLE_AUTHORITY,
+        )
+        self.assertTrue(
+            launcher._consume_ready_publication(
+                capability,
+                pre,
+                _authority=_RESOLVER_LIFECYCLE_AUTHORITY,
+            )
+        )
+        ledger = pre._ledger
+        ledger_type = type(ledger)
+        original_commit = ledger_type.commit_cleanup_action
+        committed_actions = []
+
+        def commit_then_raise(instance, owner, action_name, result=None):
+            original_commit(instance, owner, action_name, result)
+            committed_actions.append(action_name)
+            if action_name == "terminate":
+                raise RuntimeError("synthetic cleanup action postcommit")
+
+        with patch.object(
+            ledger_type,
+            "commit_cleanup_action",
+            new=commit_then_raise,
+        ):
+            with self.assertRaises(EndpointPolicyError):
+                pre.cleanup()
+
+        self.assertEqual(
+            committed_actions,
+            ["terminate", "reap", "close_pipes"],
+        )
+        self.assertEqual(pre.safe_metadata()["state"], "cleanup_failed")
+        self.assertEqual(_cleanup_counts(kernel), (1, 1, 1))
+        self.assertTrue(ledger._terminated)
+        self.assertEqual(launcher._ready_publications, {})
+        self.assertIn(capability.publication_id, launcher._lifecycle_recovery)
+        recovery = launcher._lifecycle_recovery[capability.publication_id]
+        self.assertIs(recovery.ledger, ledger)
+        self.assertIs(recovery.ledger._kernel, kernel)
+
+        kernel_reference = weakref.ref(kernel)
+        spawner.kernel = None
+        del recovery, ledger, pre, kernel
+        gc.collect()
+        retained_kernel = kernel_reference()
+        self.assertIsNotNone(retained_kernel)
+        recovery = launcher._lifecycle_recovery[capability.publication_id]
+        self.assertIs(recovery.ledger._kernel, retained_kernel)
+
+        counts = _cleanup_counts(retained_kernel)
+        self.assertFalse(
+            launcher._recover_ready_publication_for_cleanup(
+                capability,
+                launch_owner=launch_owner,
+                _authority=_RESOLVER_LIFECYCLE_AUTHORITY,
+            )
+        )
+        self.assertEqual(_cleanup_counts(retained_kernel), counts)
+        self.assertEqual(
+            recovery.ledger.safe_metadata()["state"],
+            "cleanup_failed",
+        )
+        self.assertIn(capability.publication_id, launcher._lifecycle_recovery)
+
+    def test_finish_cleanup_normal_noop_is_retried_without_external_actions(self):
+        launcher, _, kernel = _launcher([READY_FRAME])
+        capability = _reserve_lifecycle_capability(launcher)
+        launch_owner = object()
+        pre = launcher._launch_ready(
+            capability=capability,
+            launch_owner=launch_owner,
+            _authority=_RESOLVER_LIFECYCLE_AUTHORITY,
+        )
+        self.assertTrue(
+            launcher._consume_ready_publication(
+                capability,
+                pre,
+                _authority=_RESOLVER_LIFECYCLE_AUTHORITY,
+            )
+        )
+        ledger = pre._ledger
+
+        with patch.object(
+            type(ledger),
+            "finish_cleanup",
+            return_value=None,
+        ):
+            with self.assertRaisesRegex(
+                EndpointPolicyError,
+                "cleanup 失败",
+            ):
+                pre.cleanup()
+
+        self.assertEqual(ledger.safe_metadata()["state"], "cleaning")
+        self.assertEqual(_cleanup_counts(kernel), (1, 1, 1))
+        self.assertIn(capability.publication_id, launcher._lifecycle_recovery)
+        cleanup_counts = _cleanup_counts(kernel)
+
+        self.assertTrue(
+            launcher._recover_ready_publication_for_cleanup(
+                capability,
+                launch_owner=launch_owner,
+                _authority=_RESOLVER_LIFECYCLE_AUTHORITY,
+            )
+        )
+        self.assertTrue(ledger.is_terminal())
+        self.assertEqual(_cleanup_counts(kernel), cleanup_counts)
+        self.assertEqual(launcher._ready_publications, {})
+        self.assertEqual(launcher._lifecycle_recovery, {})
+
+    def test_terminal_callback_precommit_fault_is_recovered_without_retry(self):
+        launcher, _, kernel = _launcher([READY_FRAME])
+        capability = _reserve_lifecycle_capability(launcher)
+        launch_owner = object()
+        pre = launcher._launch_ready(
+            capability=capability,
+            launch_owner=launch_owner,
+            _authority=_RESOLVER_LIFECYCLE_AUTHORITY,
+        )
+        ledger = pre._ledger
+        original_release = ResolverHelperLauncher._release_lifecycle_recovery
+        release_calls = []
+
+        def fail_first_release(instance, publication_id, selected_ledger):
+            release_calls.append((instance, publication_id, selected_ledger))
+            if len(release_calls) == 1:
+                raise RuntimeError("synthetic terminal callback precommit")
+            return original_release(instance, publication_id, selected_ledger)
+
+        with patch.object(
+            ResolverHelperLauncher,
+            "_release_lifecycle_recovery",
+            new=fail_first_release,
+        ):
+            self.assertTrue(pre.cleanup())
+
+        self.assertEqual(len(release_calls), 1)
+        self.assertIs(release_calls[0][0], launcher)
+        self.assertEqual(release_calls[0][1], capability.publication_id)
+        self.assertIs(release_calls[0][2], ledger)
+        self.assertTrue(ledger.is_terminal())
+        self.assertEqual(pre.safe_metadata()["state"], "terminal")
+        self.assertEqual(_cleanup_counts(kernel), (1, 1, 1))
+        self.assertIn(capability.publication_id, launcher._lifecycle_recovery)
+        self.assertIn(capability.publication_id, launcher._ready_publications)
+
+        cleanup_counts = _cleanup_counts(kernel)
+        self.assertTrue(
+            launcher._recover_ready_publication_for_cleanup(
+                capability,
+                launch_owner=launch_owner,
+                _authority=_RESOLVER_LIFECYCLE_AUTHORITY,
+            )
+        )
+        self.assertEqual(launcher._lifecycle_recovery, {})
+        self.assertEqual(launcher._ready_publications, {})
+        self.assertEqual(_cleanup_counts(kernel), cleanup_counts)
+
     def test_import_and_construction_have_zero_external_io(self):
         def forbidden(*args, **kwargs):
             del args, kwargs
@@ -693,6 +1137,7 @@ class W09ResolverLifecycleTest(unittest.TestCase):
 
     def test_production_launcher_fails_closed_without_process_api(self):
         launcher = ResolverHelperLauncher.production(executable=EXECUTABLE)
+        capability = _reserve_lifecycle_capability(launcher)
 
         def forbidden(*args, **kwargs):
             del args, kwargs
@@ -704,7 +1149,10 @@ class W09ResolverLifecycleTest(unittest.TestCase):
             patch.object(subprocess, "Popen", forbidden),
         ):
             with self.assertRaises(ConfigError):
-                launcher.launch_ready(lifecycle_id=LIFECYCLE_ID)
+                launcher._launch_ready(
+                    capability=capability,
+                    _authority=_RESOLVER_LIFECYCLE_AUTHORITY,
+                )
 
 
 if __name__ == "__main__":

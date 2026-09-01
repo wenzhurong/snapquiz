@@ -3,11 +3,11 @@
 This module deliberately contains no process implementation.  A helper can
 only be reached through injected ``HelperSpawner``/``HelperKernel`` objects;
 that injection point is a trusted test seam, not a production authorization
-boundary.  The offline coordinator proves the matching AttemptGate claim and
-DNS-start commit before calling ``transfer``/``start``; factory capability
-sealing remains pending.  The production placeholder fails closed until an
-independently executable, ``posix_spawn`` based adapter is implemented and
-validated.
+boundary.  The offline coordinator holds a launcher-issued lifecycle
+capability and proves the matching AttemptGate claim and DNS-start commit
+before invoking the private lifecycle transitions.  The production placeholder
+fails closed until an independently executable, ``posix_spawn`` based adapter
+is implemented and validated.
 Importing and constructing the contracts performs no process, DNS, file,
 environment, or socket I/O.
 """
@@ -17,7 +17,7 @@ import hashlib
 import re
 from threading import RLock
 from typing import Callable, NamedTuple, Protocol
-from uuid import UUID, uuid5
+from uuid import UUID, uuid4, uuid5
 
 from snapquiz.domain._validation import (
     require_digest,
@@ -35,6 +35,9 @@ RESOLVER_HELPER_PROTOCOL_VERSION = "snapquiz.resolver-helper.v2"
 RESOLVER_HELPER_START_SCHEMA_VERSION = "snapquiz.resolver-start.v2"
 RESOLVER_TERMINAL_GUARD_SCHEMA_VERSION = "snapquiz.resolver-terminal-guard.v1"
 RESOLVER_RESULT_RECEIPT_SCHEMA_VERSION = "snapquiz.resolver-result-receipt.v2"
+RESOLVER_LIFECYCLE_CAPABILITY_SCHEMA_VERSION = (
+    "snapquiz.resolver-lifecycle-capability.v1"
+)
 READY_FRAME = b"SNAPQUIZ-RESOLVER/2 READY\n"
 MAX_READY_FRAME_BYTES = 64
 MAX_START_FRAME_BYTES = 4_096
@@ -48,6 +51,8 @@ _PRE_GUARD_FACTORY_AUTHORITY = object()
 _ATTEMPT_GUARD_FACTORY_AUTHORITY = object()
 _RESULT_RECEIPT_FACTORY_AUTHORITY = object()
 _READY_PUBLICATION_TICKET_AUTHORITY = object()
+_RESOLVER_LIFECYCLE_AUTHORITY = object()
+_KERNEL_PUBLICATION_AUTHORITY = object()
 _TERMINAL_GUARD_UUID_NAMESPACE = UUID(
     "4c82487b-3247-52f0-9fb9-7696da7f7471"
 )
@@ -116,10 +121,15 @@ class HelperKernel(Protocol):
 
 
 class HelperSpawner(Protocol):
-    """Injectable process boundary used only by ``launch_ready``."""
+    """Injectable process boundary used only by the private READY transition."""
 
-    def spawn(self, request: "ResolverHelperSpawnRequest") -> HelperKernel:
-        """Create one helper without receiving target or credential data."""
+    def spawn(
+        self,
+        request: "ResolverHelperSpawnRequest",
+        *,
+        publication: "_KernelPublication",
+    ) -> HelperKernel:
+        """Create and publish one helper before returning from the spawn call."""
 
 
 class _ResultReceiptIssuanceSnapshot(NamedTuple):
@@ -174,6 +184,127 @@ class _CleanupPlan(NamedTuple):
     reap: bool
     close_pipes: bool
     inherited_failure: bool
+
+
+class _LifecycleCapabilitySnapshot(NamedTuple):
+    """Ledger-owned copy of one launcher-issued lifecycle capability."""
+
+    publication_id: UUID
+    lifecycle_id: UUID
+    transport_claim_id: UUID
+    dns_start_id: UUID
+    spawn_request_digest: Digest256
+    capability_digest: Digest256
+    launcher: object
+    reservation_owner: object
+
+
+class _TerminalGuardSnapshot(NamedTuple):
+    """Ledger-owned copy of one READY-to-attempt ownership transfer."""
+
+    attempt_permit_id: UUID
+    attempt_permit_digest: Digest256
+    transport_claim_id: UUID
+    terminal_guard_id: UUID
+    terminal_guard_digest: Digest256
+
+
+class _SpawnRequestSnapshot(NamedTuple):
+    """Launcher-owned immutable view of its exact spawn configuration."""
+
+    request: object
+    spawner: object
+    canonical_metadata: bytes
+    request_digest: Digest256
+
+
+def _lifecycle_capability_digest(
+    *,
+    publication_id: UUID,
+    lifecycle_id: UUID,
+    transport_claim_id: UUID,
+    dns_start_id: UUID,
+    spawn_request_digest: Digest256,
+) -> Digest256:
+    """Bind every generated role ID to the exact helper spawn contract."""
+
+    return digest256(
+        "ResolverLifecycleCapability",
+        RESOLVER_LIFECYCLE_CAPABILITY_SCHEMA_VERSION,
+        {
+            "publication_id": require_uuid(publication_id, "publication_id"),
+            "lifecycle_id": require_uuid(lifecycle_id, "lifecycle_id"),
+            "transport_claim_id": require_uuid(
+                transport_claim_id,
+                "transport_claim_id",
+            ),
+            "dns_start_id": require_uuid(dns_start_id, "dns_start_id"),
+            "spawn_request_digest": require_digest(
+                spawn_request_digest,
+                "spawn_request_digest",
+            ),
+        },
+    )
+
+
+def _validated_lifecycle_capability_snapshot(
+    capability: object,
+    *,
+    launcher: object | None = None,
+) -> _LifecycleCapabilitySnapshot:
+    """Validate one exact immutable capability and return an independent copy."""
+
+    if type(capability) is not _ReadyPublicationTicket:
+        raise _lifecycle_error("resolver lifecycle capability 类型无效。")
+    bound_launcher = capability._launcher
+    reservation_owner = capability._reservation_owner
+    if bound_launcher is None or reservation_owner is None:
+        raise _lifecycle_error("resolver lifecycle capability owner 无效。")
+    if launcher is not None and bound_launcher is not launcher:
+        raise _lifecycle_error("resolver lifecycle capability launcher 无效。")
+    publication_id = require_uuid(capability.publication_id, "publication_id")
+    lifecycle_id = require_uuid(capability.lifecycle_id, "lifecycle_id")
+    transport_claim_id = require_uuid(
+        capability.transport_claim_id,
+        "transport_claim_id",
+    )
+    dns_start_id = require_uuid(capability.dns_start_id, "dns_start_id")
+    if len(
+        {
+            publication_id,
+            lifecycle_id,
+            transport_claim_id,
+            dns_start_id,
+        }
+    ) != 4:
+        raise _lifecycle_error("resolver lifecycle capability role id 冲突。")
+    spawn_request_digest = require_digest(
+        capability.spawn_request_digest,
+        "spawn_request_digest",
+    )
+    capability_digest = require_digest(
+        capability.capability_digest,
+        "capability_digest",
+    )
+    expected_digest = _lifecycle_capability_digest(
+        publication_id=publication_id,
+        lifecycle_id=lifecycle_id,
+        transport_claim_id=transport_claim_id,
+        dns_start_id=dns_start_id,
+        spawn_request_digest=spawn_request_digest,
+    )
+    if capability_digest != expected_digest:
+        raise _lifecycle_error("resolver lifecycle capability digest 无效。")
+    return _LifecycleCapabilitySnapshot(
+        publication_id=publication_id,
+        lifecycle_id=lifecycle_id,
+        transport_claim_id=transport_claim_id,
+        dns_start_id=dns_start_id,
+        spawn_request_digest=spawn_request_digest,
+        capability_digest=capability_digest,
+        launcher=bound_launcher,
+        reservation_owner=reservation_owner,
+    )
 
 
 def _lifecycle_error(message: str) -> EndpointPolicyError:
@@ -322,15 +453,56 @@ class ResolverHelperSpawnRequest:
         )
 
 
+def _capture_spawn_request_snapshot(
+    request: object,
+    spawner: object,
+) -> _SpawnRequestSnapshot:
+    """Validate and freeze the exact request bytes and spawner identity."""
+
+    if type(request) is not ResolverHelperSpawnRequest:
+        raise _lifecycle_error("resolver helper spawn request 类型无效。")
+    if spawner is None or not callable(getattr(spawner, "spawn", None)):
+        raise _lifecycle_error("resolver helper spawner 无效。")
+    try:
+        metadata = request.safe_metadata()
+        canonical_metadata = canonical_json_bytes(metadata)
+        request_digest = digest256(
+            "ResolverHelperSpawnRequest",
+            RESOLVER_HELPER_PROTOCOL_VERSION,
+            metadata,
+        )
+        current_digest = require_digest(
+            request.request_digest,
+            "request_digest",
+        )
+    except (AttributeError, TypeError, ValueError):
+        raise _lifecycle_error("resolver helper spawn request proof 无效。") from None
+    if request_digest != current_digest:
+        raise _lifecycle_error("resolver helper spawn request 已变化。")
+    return _SpawnRequestSnapshot(
+        request=request,
+        spawner=spawner,
+        canonical_metadata=canonical_metadata,
+        request_digest=request_digest,
+    )
+
+
 @runtime_final
 class FailClosedProductionHelperSpawner:
     """Production placeholder: deliberately performs no process operation."""
 
     __slots__ = ()
 
-    def spawn(self, request: ResolverHelperSpawnRequest) -> HelperKernel:
+    def spawn(
+        self,
+        request: ResolverHelperSpawnRequest,
+        *,
+        publication: "_KernelPublication",
+    ) -> HelperKernel:
         if type(request) is not ResolverHelperSpawnRequest:
             raise TypeError("request must be ResolverHelperSpawnRequest")
+        if type(publication) is not _KernelPublication:
+            raise TypeError("publication must be _KernelPublication")
         raise _production_unavailable() from None
 
 
@@ -339,6 +511,9 @@ class _ResolverLifecycleLedger:
 
     __slots__ = (
         "lifecycle_id",
+        "_capability",
+        "_capability_snapshot",
+        "_terminal_guard_snapshot",
         "_lock",
         "_pre_owner",
         "_owner",
@@ -359,10 +534,22 @@ class _ResolverLifecycleLedger:
         "_issued_receipt",
         "_issued_receipt_snapshot",
         "_issued_resolution_snapshot",
+        "_on_terminal",
     )
 
-    def __init__(self, lifecycle_id: UUID) -> None:
-        self.lifecycle_id = require_uuid(lifecycle_id, "lifecycle_id")
+    def __init__(
+        self,
+        capability: object,
+        *,
+        on_terminal: Callable[["_ResolverLifecycleLedger"], None] | None = None,
+    ) -> None:
+        snapshot = _validated_lifecycle_capability_snapshot(capability)
+        if on_terminal is not None and not callable(on_terminal):
+            raise TypeError("on_terminal must be callable")
+        self.lifecycle_id = snapshot.lifecycle_id
+        self._capability = capability
+        self._capability_snapshot = snapshot
+        self._terminal_guard_snapshot: _TerminalGuardSnapshot | None = None
         self._lock = RLock()
         self._pre_owner: object | None = None
         self._owner: object | None = None
@@ -383,10 +570,35 @@ class _ResolverLifecycleLedger:
         self._issued_receipt: ResolverResultReceipt | None = None
         self._issued_receipt_snapshot: _ResultReceiptIssuanceSnapshot | None = None
         self._issued_resolution_snapshot: _ResolutionPublicationSnapshot | None = None
+        self._on_terminal = on_terminal
+
+    def require_exact_capability(
+        self,
+        owner: object,
+        capability: object,
+    ) -> _LifecycleCapabilitySnapshot:
+        """Reject aliases or mutated capability objects before state changes."""
+
+        with self._lock:
+            if (
+                capability is not self._capability
+                or getattr(owner, "_capability", None) is not capability
+            ):
+                raise _lifecycle_error("resolver lifecycle capability owner 无效。")
+            snapshot = _validated_lifecycle_capability_snapshot(capability)
+            if snapshot != self._capability_snapshot:
+                raise _lifecycle_error("resolver lifecycle capability 已变化。")
+            return snapshot
 
     def bind_pre_owner(self, owner: object) -> None:
         with self._lock:
-            if self._owner is not None or self._state != "created":
+            if (
+                self._owner is not None
+                or self._state != "created"
+                or getattr(owner, "_capability", None) is not self._capability
+                or _validated_lifecycle_capability_snapshot(self._capability)
+                != self._capability_snapshot
+            ):
                 raise _lifecycle_error("resolver helper owner 已绑定。")
             self._pre_owner = owner
             self._owner = owner
@@ -398,27 +610,136 @@ class _ResolverLifecycleLedger:
             self._kernel = kernel
             self._state = "spawned"
 
+    def is_exact_kernel_attached(
+        self,
+        owner: object,
+        kernel: HelperKernel,
+    ) -> bool:
+        """Observe the exact pre-return kernel anchor."""
+
+        with self._lock:
+            return (
+                self._owner is owner
+                and self._pre_owner is owner
+                and self._kernel is kernel
+                and self._state == "spawned"
+            )
+
+    def recover_kernel_publication_for_cleanup(
+        self,
+        owner: object,
+        kernel: HelperKernel,
+    ) -> bool:
+        """Anchor a normal-return no-op publication for cleanup only."""
+
+        with self._lock:
+            if (
+                self._owner is not owner
+                or self._pre_owner is not owner
+                or self._state != "created"
+                or self._kernel is not None
+            ):
+                return self._kernel is kernel and self._state == "spawned"
+            self._kernel = kernel
+            self._state = "spawned"
+            return True
+
     def mark_ready(self, owner: object) -> None:
         self._cas(owner, expected="spawned", replacement=owner, target="ready")
 
-    def transfer(self, owner: object, replacement: object) -> None:
-        self._cas(
-            owner,
-            expected="ready",
-            replacement=replacement,
-            target="transferred",
-        )
+    def require_exact_ready_guard(
+        self,
+        owner: object,
+        capability: object,
+    ) -> _LifecycleCapabilitySnapshot:
+        """Return the snapshot only after READY is durably ledger-owned."""
 
-    def recover_transferred_guard(
+        with self._lock:
+            snapshot = self.require_exact_capability(owner, capability)
+            if (
+                type(owner) is not PreAttemptResolverGuard
+                or getattr(owner, "_ledger", None) is not self
+                or self._owner is not owner
+                or self._pre_owner is not owner
+                or self._state != "ready"
+                or self._kernel is None
+                or owner.lifecycle_id != snapshot.lifecycle_id
+                or owner.spawn_request_digest != snapshot.spawn_request_digest
+            ):
+                raise _lifecycle_error("resolver READY ledger proof 未提交。")
+            return snapshot
+
+    def transfer(self, owner: object, replacement: object) -> None:
+        with self._lock:
+            capability_snapshot = _validated_lifecycle_capability_snapshot(
+                self._capability
+            )
+            if (
+                getattr(owner, "_capability", None) is not self._capability
+                or type(replacement) is not AttemptTerminalGuard
+                or getattr(replacement, "_capability", None)
+                is not self._capability
+                or replacement._ledger is not self
+                or capability_snapshot != self._capability_snapshot
+                or replacement.lifecycle_id != capability_snapshot.lifecycle_id
+                or replacement.transport_claim_id
+                != capability_snapshot.transport_claim_id
+                or self._owner is not owner
+                or self._state != "ready"
+                or self._terminal_guard_snapshot is not None
+            ):
+                raise _lifecycle_error("resolver helper owner 或状态已经变化。")
+            expected_guard_id = uuid5(
+                _TERMINAL_GUARD_UUID_NAMESPACE,
+                str(
+                    digest256(
+                        "ResolverTerminalGuardIdentifier",
+                        RESOLVER_TERMINAL_GUARD_SCHEMA_VERSION,
+                        {
+                            "lifecycle_id": capability_snapshot.lifecycle_id,
+                            "attempt_permit_id": replacement.attempt_permit_id,
+                            "attempt_permit_digest": (
+                                replacement.attempt_permit_digest
+                            ),
+                            "transport_claim_id": (
+                                capability_snapshot.transport_claim_id
+                            ),
+                        },
+                    )
+                ),
+            )
+            expected_guard_digest = _terminal_guard_digest(
+                lifecycle_id=capability_snapshot.lifecycle_id,
+                attempt_permit_id=replacement.attempt_permit_id,
+                attempt_permit_digest=replacement.attempt_permit_digest,
+                transport_claim_id=capability_snapshot.transport_claim_id,
+                terminal_guard_id=expected_guard_id,
+            )
+            if (
+                replacement.terminal_guard_id != expected_guard_id
+                or replacement.terminal_guard_digest != expected_guard_digest
+            ):
+                raise _lifecycle_error("resolver terminal guard proof 无效。")
+            self._terminal_guard_snapshot = _TerminalGuardSnapshot(
+                attempt_permit_id=replacement.attempt_permit_id,
+                attempt_permit_digest=replacement.attempt_permit_digest,
+                transport_claim_id=capability_snapshot.transport_claim_id,
+                terminal_guard_id=expected_guard_id,
+                terminal_guard_digest=expected_guard_digest,
+            )
+            self._owner = replacement
+            self._state = "transferred"
+
+    def recover_transferred_guard_for_cleanup(
         self,
         pre_owner: object,
         *,
         attempt_permit_id: UUID,
         attempt_permit_digest: Digest256,
-        transport_claim_id: UUID,
-    ) -> "AttemptTerminalGuard | None":
-        """Recover the exact post-transfer owner without reviving cleanup."""
+    ) -> bool:
+        """Clean the ledger-owned post-transfer owner without returning it."""
 
+        transport_claim_id = self._capability_snapshot.transport_claim_id
         expected_guard_id = uuid5(
             _TERMINAL_GUARD_UUID_NAMESPACE,
             str(
@@ -443,21 +764,60 @@ class _ResolverLifecycleLedger:
         )
         with self._lock:
             guard = self._owner
+            expected_snapshot = _TerminalGuardSnapshot(
+                attempt_permit_id=attempt_permit_id,
+                attempt_permit_digest=attempt_permit_digest,
+                transport_claim_id=transport_claim_id,
+                terminal_guard_id=expected_guard_id,
+                terminal_guard_digest=expected_guard_digest,
+            )
             if (
                 self._pre_owner is not pre_owner
                 or self._state != "transferred"
                 or self._cleanup_claimed
                 or type(guard) is not AttemptTerminalGuard
-                or guard._ledger is not self
-                or guard.lifecycle_id != self.lifecycle_id
-                or guard.attempt_permit_id != attempt_permit_id
-                or guard.attempt_permit_digest != attempt_permit_digest
-                or guard.transport_claim_id != transport_claim_id
-                or guard.terminal_guard_id != expected_guard_id
-                or guard.terminal_guard_digest != expected_guard_digest
+                or self._terminal_guard_snapshot != expected_snapshot
             ):
-                return None
-            return guard
+                return self._state == "terminal"
+        _cleanup_guard(
+            guard,
+            self,
+            observer=None,
+            suppress_errors=True,
+        )
+        return self.is_terminal()
+
+    def require_exact_terminal_guard(
+        self,
+        owner: object,
+        capability: object,
+    ) -> tuple[_LifecycleCapabilitySnapshot, _TerminalGuardSnapshot]:
+        """Return only ledger snapshots after exact terminal-owner validation."""
+
+        with self._lock:
+            capability_snapshot = _validated_lifecycle_capability_snapshot(
+                capability
+            )
+            guard_snapshot = self._terminal_guard_snapshot
+            if (
+                capability is not self._capability
+                or capability_snapshot != self._capability_snapshot
+                or self._owner is not owner
+                or type(owner) is not AttemptTerminalGuard
+                or getattr(owner, "_ledger", None) is not self
+                or getattr(owner, "_capability", None) is not self._capability
+                or guard_snapshot is None
+                or owner.lifecycle_id != capability_snapshot.lifecycle_id
+                or owner.attempt_permit_id != guard_snapshot.attempt_permit_id
+                or owner.attempt_permit_digest
+                != guard_snapshot.attempt_permit_digest
+                or owner.transport_claim_id != guard_snapshot.transport_claim_id
+                or owner.terminal_guard_id != guard_snapshot.terminal_guard_id
+                or owner.terminal_guard_digest
+                != guard_snapshot.terminal_guard_digest
+            ):
+                raise _lifecycle_error("resolver terminal guard proof 已变化。")
+            return capability_snapshot, guard_snapshot
 
     def commit_start(
         self,
@@ -471,8 +831,17 @@ class _ResolverLifecycleLedger:
             exact_start_frame_digest,
             "exact_start_frame_digest",
         )
+        self.require_exact_terminal_guard(owner, self._capability)
         with self._lock:
-            if self._owner is not owner or self._state != "transferred":
+            if (
+                self._owner is not owner
+                or self._state != "transferred"
+                or getattr(owner, "_capability", None)
+                is not self._capability
+                or _validated_lifecycle_capability_snapshot(self._capability)
+                != self._capability_snapshot
+                or checked_start_id != self._capability_snapshot.dns_start_id
+            ):
                 raise _lifecycle_error("resolver helper owner 或状态已经变化。")
             if self._dns_start_id is not None or self._start_frame_digest is not None:
                 raise _lifecycle_error("resolver helper START proof 已存在。")
@@ -489,6 +858,7 @@ class _ResolverLifecycleLedger:
         )
 
     def commit_result_read(self, owner: object) -> None:
+        self.require_exact_terminal_guard(owner, self._capability)
         self._cas(
             owner,
             expected="started",
@@ -626,15 +996,28 @@ class _ResolverLifecycleLedger:
     ) -> None:
         snapshot = _capture_result_receipt_snapshot(receipt)
         with self._lock:
+            guard_snapshot = self._terminal_guard_snapshot
             if (
                 self._owner is not owner
                 or self._state != "result_resources_closed"
                 or type(owner) is not AttemptTerminalGuard
+                or guard_snapshot is None
                 or type(receipt) is not ResolverResultReceipt
                 or receipt._ledger is not self
                 or receipt._issuer is not owner
                 or self._issued_receipt is not None
                 or self._issued_receipt_snapshot is not None
+                or snapshot.lifecycle_id != self._capability_snapshot.lifecycle_id
+                or snapshot.attempt_permit_id
+                != guard_snapshot.attempt_permit_id
+                or snapshot.attempt_permit_digest
+                != guard_snapshot.attempt_permit_digest
+                or snapshot.transport_claim_id
+                != guard_snapshot.transport_claim_id
+                or snapshot.terminal_guard_id
+                != guard_snapshot.terminal_guard_id
+                or snapshot.terminal_guard_digest
+                != guard_snapshot.terminal_guard_digest
                 or self._dns_start_id != receipt.dns_start_id
                 or self._start_frame_digest != receipt.start_frame_digest
                 or receipt.stdout_eof is not self._stdout_eof
@@ -848,6 +1231,7 @@ class _ResolverLifecycleLedger:
             raise ValueError("unknown resolver helper cleanup action")
 
     def finish_cleanup(self, owner: object) -> None:
+        callback: Callable[["_ResolverLifecycleLedger"], None] | None
         with self._lock:
             if self._owner is not owner or self._state != "cleaning":
                 raise _lifecycle_error("resolver helper cleanup 状态已经变化。")
@@ -859,6 +1243,13 @@ class _ResolverLifecycleLedger:
             self._pre_owner = None
             self._owner = None
             self._state = "terminal"
+            callback = self._on_terminal
+        if callback is not None:
+            try:
+                callback(self)
+            except BaseException:
+                # Terminal resource proof is stronger than registry bookkeeping.
+                pass
 
     def mark_cleanup_failed(self, owner: object) -> None:
         """Retain the kernel and owner when resource release is unproven."""
@@ -867,6 +1258,54 @@ class _ResolverLifecycleLedger:
             if self._owner is not owner or self._state != "cleaning":
                 raise _lifecycle_error("resolver helper cleanup 状态已经变化。")
             self._state = "cleanup_failed"
+
+    def cleanup_is_ready_to_finish(self, owner: object) -> bool:
+        """Observe bookkeeping-only cleanup remaining after all resources."""
+
+        with self._lock:
+            return (
+                self._owner is owner
+                and self._state == "cleaning"
+                and self._cleanup_claimed
+                and (
+                    self._kernel is None
+                    or (self._child_reaped and self._helper_pipes_closed)
+                )
+            )
+
+    def retry_finish_cleanup(self, owner: object) -> bool:
+        """Retry only terminal bookkeeping; never repeat external actions."""
+
+        if self.is_terminal():
+            return True
+        if not self.cleanup_is_ready_to_finish(owner):
+            return False
+        try:
+            self.finish_cleanup(owner)
+        except BaseException:
+            return False
+        return self.is_terminal()
+
+    def is_terminal(self) -> bool:
+        with self._lock:
+            return self._state == "terminal"
+
+    def recover_current_owner_for_cleanup(self) -> bool:
+        """Clean the ledger-held owner without exposing a live capability."""
+
+        with self._lock:
+            if self._state == "terminal":
+                return True
+            owner = self._owner
+            if owner is None:
+                return False
+        _cleanup_guard(
+            owner,
+            self,
+            observer=None,
+            suppress_errors=True,
+        )
+        return self.is_terminal()
 
     def kernel_for(self, owner: object, *, states: tuple[str, ...]) -> HelperKernel:
         with self._lock:
@@ -905,6 +1344,105 @@ class _ResolverLifecycleLedger:
             }
 
 
+@runtime_final
+class _KernelPublication:
+    """Single-use sink that anchors a created helper before spawn returns."""
+
+    __slots__ = ("_ledger", "_owner", "_lock", "_kernel")
+
+    def __init__(
+        self,
+        *,
+        ledger: _ResolverLifecycleLedger,
+        owner: object,
+        _authority: object | None = None,
+    ) -> None:
+        if _authority is not _KERNEL_PUBLICATION_AUTHORITY:
+            raise TypeError("kernel publication requires launcher")
+        if type(ledger) is not _ResolverLifecycleLedger:
+            raise TypeError("ledger must be _ResolverLifecycleLedger")
+        object.__setattr__(self, "_ledger", ledger)
+        object.__setattr__(self, "_owner", owner)
+        object.__setattr__(self, "_lock", RLock())
+        object.__setattr__(self, "_kernel", None)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        del name, value
+        raise AttributeError("_KernelPublication is immutable")
+
+    def publish(self, kernel: HelperKernel) -> None:
+        """Attach the exact live helper before control can leave ``spawn``."""
+
+        if kernel is None or any(
+            not callable(getattr(kernel, method_name, None))
+            for method_name in (
+                "read_stdout",
+                "write_stdin",
+                "terminate",
+                "reap",
+                "close_pipes",
+            )
+        ):
+            raise _lifecycle_error("resolver helper kernel 合同无效。")
+        with self._lock:
+            if self._kernel is not None:
+                raise _lifecycle_error("resolver helper kernel 已发布。")
+            self._ledger.attach_kernel(self._owner, kernel)
+            if not self._ledger.is_exact_kernel_attached(
+                self._owner,
+                kernel,
+            ):
+                self._ledger.recover_kernel_publication_for_cleanup(
+                    self._owner,
+                    kernel,
+                )
+                raise _lifecycle_error(
+                    "resolver helper kernel publication 未提交。"
+                )
+            object.__setattr__(self, "_kernel", kernel)
+
+    def confirm_returned(self, kernel: HelperKernel) -> None:
+        """Require spawn to return the exact already-published kernel."""
+
+        with self._lock:
+            if self._kernel is None:
+                # A contract-violating spawner may create and return the real
+                # helper without first using the sink.  Adopt that exact
+                # normal-return value for cleanup only, then still reject the
+                # launch so READY/secret/START can never continue.
+                if kernel is None or any(
+                    not callable(getattr(kernel, method_name, None))
+                    for method_name in (
+                        "read_stdout",
+                        "write_stdin",
+                        "terminate",
+                        "reap",
+                        "close_pipes",
+                    )
+                ):
+                    raise _lifecycle_error(
+                        "resolver helper kernel publication 无效。"
+                    )
+                self._ledger.attach_kernel(self._owner, kernel)
+                if not self._ledger.is_exact_kernel_attached(
+                    self._owner,
+                    kernel,
+                ):
+                    self._ledger.recover_kernel_publication_for_cleanup(
+                        self._owner,
+                        kernel,
+                    )
+                    raise _lifecycle_error(
+                        "resolver helper kernel publication 未提交。"
+                    )
+                object.__setattr__(self, "_kernel", kernel)
+                raise _lifecycle_error(
+                    "resolver helper kernel 未在 spawn 返回前发布。"
+                )
+            if self._kernel is not kernel:
+                raise _lifecycle_error("resolver helper kernel publication 无效。")
+
+
 def _cleanup_guard(
     guard: object,
     ledger: _ResolverLifecycleLedger,
@@ -919,7 +1457,9 @@ def _cleanup_guard(
             return False
         raise
     if not plan.claimed:
-        return False
+        if ledger.is_terminal():
+            return False
+        return ledger.retry_finish_cleanup(guard)
 
     observer_error: BaseException | None = None
     try:
@@ -952,11 +1492,16 @@ def _cleanup_guard(
         try:
             ledger.finish_cleanup(guard)
         except BaseException:
+            pass
+        if not ledger.is_terminal():
+            ledger.retry_finish_cleanup(guard)
+        if not ledger.is_terminal():
             cleanup_failed = True
-            try:
-                ledger.mark_cleanup_failed(guard)
-            except BaseException:
-                pass
+            if not ledger.cleanup_is_ready_to_finish(guard):
+                try:
+                    ledger.mark_cleanup_failed(guard)
+                except BaseException:
+                    pass
 
     if observer_error is not None and not suppress_errors:
         raise observer_error
@@ -966,7 +1511,7 @@ def _cleanup_guard(
         error.__context__ = None
         error.__suppress_context__ = True
         raise error from None
-    return True
+    return ledger.is_terminal()
 
 
 def _terminal_guard_digest(
@@ -1187,6 +1732,10 @@ class ResolverResultReceipt:
             raise TypeError("issuer must be AttemptTerminalGuard")
         if type(ledger) is not _ResolverLifecycleLedger or issuer._ledger is not ledger:
             raise TypeError("receipt ledger must be the issuer ledger")
+        capability_snapshot, guard_snapshot = ledger.require_exact_terminal_guard(
+            issuer,
+            issuer._capability,
+        )
         checked_transcript = raw_transcript
         if (
             type(checked_transcript) is not bytes
@@ -1209,12 +1758,12 @@ class ResolverResultReceipt:
         if checked_exit_status != 0:
             raise _lifecycle_error("RESULT child exit status 无效。")
         values = (
-            ("lifecycle_id", issuer.lifecycle_id),
-            ("attempt_permit_id", issuer.attempt_permit_id),
-            ("attempt_permit_digest", issuer.attempt_permit_digest),
-            ("transport_claim_id", issuer.transport_claim_id),
-            ("terminal_guard_id", issuer.terminal_guard_id),
-            ("terminal_guard_digest", issuer.terminal_guard_digest),
+            ("lifecycle_id", capability_snapshot.lifecycle_id),
+            ("attempt_permit_id", guard_snapshot.attempt_permit_id),
+            ("attempt_permit_digest", guard_snapshot.attempt_permit_digest),
+            ("transport_claim_id", guard_snapshot.transport_claim_id),
+            ("terminal_guard_id", guard_snapshot.terminal_guard_id),
+            ("terminal_guard_digest", guard_snapshot.terminal_guard_digest),
             ("dns_start_id", require_uuid(dns_start_id, "dns_start_id")),
             (
                 "start_frame_digest",
@@ -1420,7 +1969,12 @@ class ResolverResultReceipt:
 class PreAttemptResolverGuard:
     """Factory-only owner from process creation through verified READY."""
 
-    __slots__ = ("lifecycle_id", "spawn_request_digest", "_ledger")
+    __slots__ = (
+        "lifecycle_id",
+        "spawn_request_digest",
+        "_ledger",
+        "_capability",
+    )
 
     def __init__(
         self,
@@ -1428,15 +1982,27 @@ class PreAttemptResolverGuard:
         lifecycle_id: UUID,
         spawn_request_digest: Digest256,
         ledger: _ResolverLifecycleLedger,
+        capability: object,
         _authority: object | None = None,
     ) -> None:
         if _authority is not _PRE_GUARD_FACTORY_AUTHORITY:
             raise TypeError("pre-attempt resolver guards require launcher")
+        if type(ledger) is not _ResolverLifecycleLedger:
+            raise TypeError("ledger must be _ResolverLifecycleLedger")
+        snapshot = _validated_lifecycle_capability_snapshot(capability)
+        if (
+            ledger._capability is not capability
+            or snapshot != ledger._capability_snapshot
+            or lifecycle_id != snapshot.lifecycle_id
+            or spawn_request_digest != snapshot.spawn_request_digest
+        ):
+            raise _lifecycle_error("resolver lifecycle capability binding 无效。")
         self.lifecycle_id = require_uuid(lifecycle_id, "lifecycle_id")
         self.spawn_request_digest = require_digest(
             spawn_request_digest, "spawn_request_digest"
         )
         self._ledger = ledger
+        self._capability = capability
 
     def __setattr__(self, name: str, value: object) -> None:
         if hasattr(self, name):
@@ -1453,26 +2019,28 @@ class PreAttemptResolverGuard:
     def safe_metadata(self) -> dict[str, object]:
         return self._ledger.safe_metadata()
 
-    def transfer(
+    def _transfer(
         self,
         *,
         attempt_permit_id: UUID,
         attempt_permit_digest: Digest256,
-        transport_claim_id: UUID,
         observer: LifecycleObserver | None = None,
+        _authority: object | None = None,
     ) -> "AttemptTerminalGuard":
-        """Record proof values after a trusted coordinator proves ``io_claimed``.
+        """Transfer READY ownership after the coordinator proves ``io_claimed``."""
 
-        This ledger validates identity and one-shot ownership only.  It cannot
-        itself consult AttemptGate; direct callers therefore do not gain DNS
-        authority merely by supplying UUID/digest-shaped values.
-        """
+        if _authority is not _RESOLVER_LIFECYCLE_AUTHORITY:
+            raise TypeError("resolver ownership transfer requires coordinator")
+        capability = self._ledger.require_exact_capability(
+            self,
+            self._capability,
+        )
+        transport_claim_id = capability.transport_claim_id
 
         replacement: AttemptTerminalGuard | None = None
         try:
             require_uuid(attempt_permit_id, "attempt_permit_id")
             require_digest(attempt_permit_digest, "attempt_permit_digest")
-            require_uuid(transport_claim_id, "transport_claim_id")
             guard_id = uuid5(
                 _TERMINAL_GUARD_UUID_NAMESPACE,
                 str(
@@ -1503,6 +2071,7 @@ class PreAttemptResolverGuard:
                 terminal_guard_id=guard_id,
                 terminal_guard_digest=guard_digest,
                 ledger=self._ledger,
+                capability=self._capability,
                 _authority=_ATTEMPT_GUARD_FACTORY_AUTHORITY,
             )
             self._ledger.transfer(self, replacement)
@@ -1524,29 +2093,26 @@ class PreAttemptResolverGuard:
             raise
         return replacement
 
-    def _recover_transferred_guard(
+    def _recover_transferred_guard_for_cleanup(
         self,
         *,
         attempt_permit_id: UUID,
         attempt_permit_digest: Digest256,
-        transport_claim_id: UUID,
         _authority: object | None = None,
-    ) -> "AttemptTerminalGuard | None":
-        """Recover one exact owner lost after ``transfer`` returned."""
+    ) -> bool:
+        """Clean one lost post-transfer owner without returning capability."""
 
-        if _authority is not _TRANSPORT_ATTEMPT_AUTHORITY:
-            raise TypeError("resolver publication recovery requires transport")
+        if _authority is not _RESOLVER_LIFECYCLE_AUTHORITY:
+            raise TypeError("resolver publication recovery requires coordinator")
         if (
             type(attempt_permit_id) is not UUID
             or type(attempt_permit_digest) is not Digest256
-            or type(transport_claim_id) is not UUID
         ):
-            return None
-        return self._ledger.recover_transferred_guard(
+            return False
+        return self._ledger.recover_transferred_guard_for_cleanup(
             self,
             attempt_permit_id=attempt_permit_id,
             attempt_permit_digest=attempt_permit_digest,
-            transport_claim_id=transport_claim_id,
         )
 
     def cleanup(self, *, observer: LifecycleObserver | None = None) -> bool:
@@ -1570,6 +2136,7 @@ class AttemptTerminalGuard:
         "terminal_guard_id",
         "terminal_guard_digest",
         "_ledger",
+        "_capability",
     )
 
     def __init__(
@@ -1582,10 +2149,21 @@ class AttemptTerminalGuard:
         terminal_guard_id: UUID,
         terminal_guard_digest: Digest256,
         ledger: _ResolverLifecycleLedger,
+        capability: object,
         _authority: object | None = None,
     ) -> None:
         if _authority is not _ATTEMPT_GUARD_FACTORY_AUTHORITY:
             raise TypeError("attempt terminal guards require ownership transfer")
+        if type(ledger) is not _ResolverLifecycleLedger:
+            raise TypeError("ledger must be _ResolverLifecycleLedger")
+        snapshot = _validated_lifecycle_capability_snapshot(capability)
+        if (
+            ledger._capability is not capability
+            or snapshot != ledger._capability_snapshot
+            or lifecycle_id != snapshot.lifecycle_id
+            or transport_claim_id != snapshot.transport_claim_id
+        ):
+            raise _lifecycle_error("resolver terminal capability binding 无效。")
         values = (
             ("lifecycle_id", require_uuid(lifecycle_id, "lifecycle_id")),
             (
@@ -1609,6 +2187,7 @@ class AttemptTerminalGuard:
                 require_digest(terminal_guard_digest, "terminal_guard_digest"),
             ),
             ("_ledger", ledger),
+            ("_capability", capability),
         )
         for name, value in values:
             object.__setattr__(self, name, value)
@@ -1640,22 +2219,40 @@ class AttemptTerminalGuard:
         )
         return metadata
 
-    def start(
+    def _proof_snapshot(
+        self,
+        *,
+        _authority: object | None = None,
+    ) -> _TerminalGuardSnapshot:
+        """Return the ledger-owned proof only to the trusted coordinator."""
+
+        if _authority is not _RESOLVER_LIFECYCLE_AUTHORITY:
+            raise TypeError("resolver terminal proof requires coordinator")
+        _, guard_snapshot = self._ledger.require_exact_terminal_guard(
+            self,
+            self._capability,
+        )
+        return guard_snapshot
+
+    def _start(
         self,
         *,
         hostname: str,
         port: int,
         network_policy_ref: str,
         network_policy_digest: Digest256,
-        dns_start_id: UUID,
         observer: LifecycleObserver | None = None,
+        _authority: object | None = None,
     ) -> None:
-        """Write the sole START after the coordinator commits DNS authority.
+        """Write the sole START after the coordinator commits DNS authority."""
 
-        The guard enforces one-shot lifecycle ownership, but the trusted
-        coordinator remains responsible for calling AttemptGate's exact
-        ``_commit_dns_start`` first and for checking commit-then-raise state.
-        """
+        if _authority is not _RESOLVER_LIFECYCLE_AUTHORITY:
+            raise TypeError("resolver START requires coordinator")
+        capability, guard_snapshot = self._ledger.require_exact_terminal_guard(
+            self,
+            self._capability,
+        )
+        dns_start_id = capability.dns_start_id
 
         try:
             frame = encode_start_frame(
@@ -1663,11 +2260,11 @@ class AttemptTerminalGuard:
                 port=port,
                 network_policy_ref=network_policy_ref,
                 network_policy_digest=network_policy_digest,
-                attempt_permit_id=self.attempt_permit_id,
-                attempt_permit_digest=self.attempt_permit_digest,
-                transport_claim_id=self.transport_claim_id,
-                terminal_guard_id=self.terminal_guard_id,
-                terminal_guard_digest=self.terminal_guard_digest,
+                attempt_permit_id=guard_snapshot.attempt_permit_id,
+                attempt_permit_digest=guard_snapshot.attempt_permit_digest,
+                transport_claim_id=guard_snapshot.transport_claim_id,
+                terminal_guard_id=guard_snapshot.terminal_guard_id,
+                terminal_guard_digest=guard_snapshot.terminal_guard_digest,
                 dns_start_id=dns_start_id,
             )
             exact_start_digest = start_frame_digest(frame)
@@ -1689,12 +2286,17 @@ class AttemptTerminalGuard:
             )
             raise
 
-    def read_result_receipt(
+    def _read_result_receipt(
         self,
         *,
         observer: LifecycleObserver | None = None,
+        _authority: object | None = None,
     ) -> ResolverResultReceipt:
         """Attest one RESULT, EOF, exit-zero, reap, and closed pipes."""
+
+        if _authority is not _RESOLVER_LIFECYCLE_AUTHORITY:
+            raise TypeError("resolver RESULT read requires coordinator")
+        self._ledger.require_exact_terminal_guard(self, self._capability)
 
         try:
             self._ledger.commit_result_read(self)
@@ -1769,12 +2371,15 @@ class AttemptTerminalGuard:
 
 @runtime_final
 class _ReadyPublicationTicket:
-    """Launcher-issued identity for one caller-generated publication ID."""
+    """Launcher-issued identity for one complete resolver lifecycle."""
 
     __slots__ = (
         "publication_id",
         "lifecycle_id",
+        "transport_claim_id",
+        "dns_start_id",
         "spawn_request_digest",
+        "capability_digest",
         "_launcher",
         "_reservation_owner",
     )
@@ -1784,7 +2389,10 @@ class _ReadyPublicationTicket:
         *,
         publication_id: UUID,
         lifecycle_id: UUID,
+        transport_claim_id: UUID,
+        dns_start_id: UUID,
         spawn_request_digest: Digest256,
+        capability_digest: Digest256,
         launcher: object,
         reservation_owner: object,
         _authority: object | None = None,
@@ -1805,11 +2413,27 @@ class _ReadyPublicationTicket:
         )
         object.__setattr__(
             self,
+            "transport_claim_id",
+            require_uuid(transport_claim_id, "transport_claim_id"),
+        )
+        object.__setattr__(
+            self,
+            "dns_start_id",
+            require_uuid(dns_start_id, "dns_start_id"),
+        )
+        object.__setattr__(
+            self,
             "spawn_request_digest",
             require_digest(spawn_request_digest, "spawn_request_digest"),
         )
+        object.__setattr__(
+            self,
+            "capability_digest",
+            require_digest(capability_digest, "capability_digest"),
+        )
         object.__setattr__(self, "_launcher", launcher)
         object.__setattr__(self, "_reservation_owner", reservation_owner)
+        _validated_lifecycle_capability_snapshot(self, launcher=launcher)
 
     def __setattr__(self, name: str, value: object) -> None:
         del name, value
@@ -1817,36 +2441,61 @@ class _ReadyPublicationTicket:
 
 
 class _ReadyPublicationState:
-    __slots__ = ("ticket", "guard", "status")
+    __slots__ = (
+        "ticket",
+        "capability_snapshot",
+        "guard",
+        "ledger",
+        "launch_owner",
+        "status",
+    )
 
     def __init__(self, ticket: _ReadyPublicationTicket) -> None:
         self.ticket = ticket
+        self.capability_snapshot = _validated_lifecycle_capability_snapshot(
+            ticket
+        )
         self.guard: PreAttemptResolverGuard | None = None
+        self.ledger: _ResolverLifecycleLedger | None = None
+        self.launch_owner: object | None = None
         self.status = "reserved"
+
+
+class _LifecycleRecoveryState(NamedTuple):
+    """Strong recovery anchor retained until ledger terminal proof."""
+
+    ticket: _ReadyPublicationTicket
+    capability_snapshot: _LifecycleCapabilitySnapshot
+    launch_owner: object
+    ledger: _ResolverLifecycleLedger
 
 
 @runtime_final
 class ResolverHelperLauncher:
-    """Construct-only configuration plus one explicit spawn/READY method."""
+    """Construct-only configuration plus one capability-gated READY path."""
 
     __slots__ = (
         "_spawner",
+        "_spawner_snapshot",
         "_request",
+        "_request_snapshot",
         "_publication_lock",
         "_ready_publications",
+        "_lifecycle_recovery",
     )
 
     def __init__(self, spawner: HelperSpawner, *, executable: str) -> None:
         if spawner is None or not callable(getattr(spawner, "spawn", None)):
             raise TypeError("spawner must implement HelperSpawner")
+        request = ResolverHelperSpawnRequest(executable=executable)
+        snapshot = _capture_spawn_request_snapshot(request, spawner)
         object.__setattr__(self, "_spawner", spawner)
-        object.__setattr__(
-            self,
-            "_request",
-            ResolverHelperSpawnRequest(executable=executable),
-        )
+        object.__setattr__(self, "_spawner_snapshot", spawner)
+        object.__setattr__(self, "_request", request)
+        object.__setattr__(self, "_request_snapshot", snapshot)
         object.__setattr__(self, "_publication_lock", RLock())
         object.__setattr__(self, "_ready_publications", {})
+        object.__setattr__(self, "_lifecycle_recovery", {})
 
     def __setattr__(self, name: str, value: object) -> None:
         del name, value
@@ -1861,113 +2510,329 @@ class ResolverHelperLauncher:
     def safe_metadata(self) -> dict[str, object]:
         return self._request.safe_metadata()
 
-    def _reserve_ready_publication(
+    def _validated_spawn_configuration(self) -> _SpawnRequestSnapshot:
+        """Reject current launcher aliases that differ from construction."""
+
+        expected = self._request_snapshot
+        current = _capture_spawn_request_snapshot(
+            self._request,
+            self._spawner,
+        )
+        if (
+            type(expected) is not _SpawnRequestSnapshot
+            or self._spawner_snapshot is not expected.spawner
+            or current.request is not expected.request
+            or current.spawner is not expected.spawner
+            or current.canonical_metadata != expected.canonical_metadata
+            or current.request_digest != expected.request_digest
+        ):
+            raise _lifecycle_error("resolver helper spawn configuration 已变化。")
+        return expected
+
+    def _reserve_lifecycle_capability(
         self,
         *,
-        publication_id: UUID,
-        lifecycle_id: UUID,
         reservation_owner: object,
         _authority: object | None = None,
     ) -> _ReadyPublicationTicket:
-        """Atomically reserve an exact ticket before any helper can spawn."""
+        """Generate and reserve every role ID before any helper can spawn."""
 
-        if _authority is not _TRANSPORT_ATTEMPT_AUTHORITY:
-            raise TypeError("READY publication reservation requires transport")
-        checked_publication_id = require_uuid(
-            publication_id,
-            "publication_id",
-        )
-        checked_lifecycle_id = require_uuid(lifecycle_id, "lifecycle_id")
+        if _authority is not _RESOLVER_LIFECYCLE_AUTHORITY:
+            raise TypeError("resolver capability reservation requires coordinator")
         if reservation_owner is None:
             raise TypeError("reservation_owner must be an identity object")
+        spawn_snapshot = self._validated_spawn_configuration()
+        publication_id = require_uuid(uuid4(), "publication_id")
+        lifecycle_id = require_uuid(uuid4(), "lifecycle_id")
+        transport_claim_id = require_uuid(uuid4(), "transport_claim_id")
+        dns_start_id = require_uuid(uuid4(), "dns_start_id")
+        if len(
+            {
+                publication_id,
+                lifecycle_id,
+                transport_claim_id,
+                dns_start_id,
+            }
+        ) != 4:
+            raise _lifecycle_error("resolver lifecycle capability role id 冲突。")
+        capability_digest = _lifecycle_capability_digest(
+            publication_id=publication_id,
+            lifecycle_id=lifecycle_id,
+            transport_claim_id=transport_claim_id,
+            dns_start_id=dns_start_id,
+            spawn_request_digest=spawn_snapshot.request_digest,
+        )
         ticket = _ReadyPublicationTicket(
-            publication_id=checked_publication_id,
-            lifecycle_id=checked_lifecycle_id,
-            spawn_request_digest=self._request.request_digest,
+            publication_id=publication_id,
+            lifecycle_id=lifecycle_id,
+            transport_claim_id=transport_claim_id,
+            dns_start_id=dns_start_id,
+            spawn_request_digest=spawn_snapshot.request_digest,
+            capability_digest=capability_digest,
             launcher=self,
             reservation_owner=reservation_owner,
             _authority=_READY_PUBLICATION_TICKET_AUTHORITY,
         )
         state = _ReadyPublicationState(ticket)
         with self._publication_lock:
-            if checked_publication_id in self._ready_publications:
+            if publication_id in self._ready_publications:
                 raise _lifecycle_error("resolver READY publication id 已使用。")
-            self._ready_publications[checked_publication_id] = state
+            self._ready_publications[publication_id] = state
         return ticket
 
-    def _recover_ready_reservation(
+    def _recover_lifecycle_reservation(
         self,
         *,
-        publication_id: UUID,
-        lifecycle_id: UUID,
         reservation_owner: object,
         _authority: object | None = None,
     ) -> bool:
         """Remove only this caller-owned reservation after a lost return."""
 
-        if _authority is not _TRANSPORT_ATTEMPT_AUTHORITY:
-            raise TypeError("READY reservation recovery requires transport")
-        if (
-            type(publication_id) is not UUID
-            or type(lifecycle_id) is not UUID
-            or reservation_owner is None
-        ):
+        if _authority is not _RESOLVER_LIFECYCLE_AUTHORITY:
+            raise TypeError("resolver capability recovery requires coordinator")
+        if reservation_owner is None:
             return False
         with self._publication_lock:
-            state = self._ready_publications.get(publication_id)
-            ticket = None if state is None else state.ticket
+            matches = [
+                (publication_id, state)
+                for publication_id, state in self._ready_publications.items()
+                if type(state.ticket) is _ReadyPublicationTicket
+                and state.capability_snapshot.launcher is self
+                and state.capability_snapshot.reservation_owner
+                is reservation_owner
+            ]
+            if len(matches) != 1:
+                return False
+            publication_id, state = matches[0]
             if (
-                state is None
-                or type(ticket) is not _ReadyPublicationTicket
-                or ticket._launcher is not self
-                or ticket._reservation_owner is not reservation_owner
-                or ticket.lifecycle_id != lifecycle_id
-                or ticket.spawn_request_digest != self._request.request_digest
-                or state.status != "reserved"
+                state.status != "reserved"
                 or state.guard is not None
+                or state.launch_owner is not None
             ):
                 return False
+            state.status = "consumed"
             del self._ready_publications[publication_id]
             return True
 
-    def _cancel_ready_reservation(
+    def _reserved_lifecycle_snapshot_for_owner(
         self,
         ticket: _ReadyPublicationTicket,
+        *,
+        reservation_owner: object,
+        _authority: object | None = None,
+    ) -> _LifecycleCapabilitySnapshot:
+        """Attest one normal-return ticket against its reserving owner."""
+
+        if _authority is not _RESOLVER_LIFECYCLE_AUTHORITY:
+            raise TypeError("resolver reservation attestation requires coordinator")
+        if reservation_owner is None:
+            raise TypeError("reservation_owner must be an identity object")
+        snapshot = _validated_lifecycle_capability_snapshot(
+            ticket,
+            launcher=self,
+        )
+        with self._publication_lock:
+            state = self._ready_publications.get(snapshot.publication_id)
+            if (
+                state is None
+                or state.ticket is not ticket
+                or state.capability_snapshot != snapshot
+                or state.capability_snapshot.reservation_owner
+                is not reservation_owner
+                or state.status != "reserved"
+                or state.guard is not None
+                or state.ledger is not None
+                or state.launch_owner is not None
+            ):
+                raise _lifecycle_error(
+                    "resolver lifecycle reservation owner 不匹配。"
+                )
+            return state.capability_snapshot
+
+    def _claim_ready_launch(
+        self,
+        ticket: _ReadyPublicationTicket,
+        *,
+        launch_owner: object,
+        _authority: object | None = None,
+    ) -> _LifecycleCapabilitySnapshot:
+        """Atomically claim the only spawn allowed by one capability."""
+
+        if _authority is not _RESOLVER_LIFECYCLE_AUTHORITY:
+            raise TypeError("resolver launch claim requires coordinator")
+        if launch_owner is None:
+            raise TypeError("launch_owner must be an identity object")
+        snapshot = _validated_lifecycle_capability_snapshot(
+            ticket,
+            launcher=self,
+        )
+        spawn_snapshot = self._validated_spawn_configuration()
+        if snapshot.spawn_request_digest != spawn_snapshot.request_digest:
+            raise _lifecycle_error("resolver lifecycle capability request 无效。")
+        with self._publication_lock:
+            state = self._ready_publications.get(snapshot.publication_id)
+            if (
+                state is None
+                or state.ticket is not ticket
+                or state.capability_snapshot != snapshot
+                or state.status != "reserved"
+                or state.guard is not None
+                or state.launch_owner is not None
+            ):
+                raise _lifecycle_error("resolver lifecycle capability 不可启动。")
+            state.launch_owner = launch_owner
+            state.status = "launching"
+        return snapshot
+
+    def _cancel_ready_launch(
+        self,
+        ticket: _ReadyPublicationTicket,
+        *,
+        launch_owner: object,
     ) -> None:
-        """Drop only this still-reserved ticket after an internal failure."""
+        """Consume only this exact in-progress launch after internal failure."""
 
         with self._publication_lock:
-            state = self._ready_publications.get(ticket.publication_id)
-            if (
-                state is not None
-                and state.ticket is ticket
-                and state.status == "reserved"
-                and state.guard is None
+            for publication_id, state in tuple(
+                self._ready_publications.items()
             ):
-                del self._ready_publications[ticket.publication_id]
+                if (
+                    state.ticket is ticket
+                    and state.status == "launching"
+                    and state.guard is None
+                    and state.launch_owner is launch_owner
+                ):
+                    state.launch_owner = None
+                    state.status = "consumed"
+                    del self._ready_publications[publication_id]
+                    return
+
+    def _register_lifecycle_recovery(
+        self,
+        ticket: _ReadyPublicationTicket,
+        ledger: _ResolverLifecycleLedger,
+        *,
+        launch_owner: object,
+    ) -> None:
+        """Anchor the ledger before the first operation that may create a child."""
+
+        snapshot = _validated_lifecycle_capability_snapshot(
+            ticket,
+            launcher=self,
+        )
+        with self._publication_lock:
+            state = self._ready_publications.get(snapshot.publication_id)
+            if (
+                state is None
+                or state.ticket is not ticket
+                or state.capability_snapshot != snapshot
+                or state.status != "launching"
+                or state.launch_owner is not launch_owner
+                or state.guard is not None
+                or state.ledger is not None
+                or snapshot.publication_id in self._lifecycle_recovery
+            ):
+                raise _lifecycle_error("resolver lifecycle recovery anchor 无效。")
+            state.ledger = ledger
+            self._lifecycle_recovery[snapshot.publication_id] = (
+                _LifecycleRecoveryState(
+                    ticket=ticket,
+                    capability_snapshot=snapshot,
+                    launch_owner=launch_owner,
+                    ledger=ledger,
+                )
+            )
+
+    def _release_lifecycle_recovery(
+        self,
+        publication_id: UUID,
+        ledger: _ResolverLifecycleLedger,
+    ) -> None:
+        """Forget an anchor only after its ledger proves terminal cleanup."""
+
+        if (
+            type(publication_id) is not UUID
+            or type(ledger) is not _ResolverLifecycleLedger
+            or not ledger.is_terminal()
+        ):
+            raise _lifecycle_error(
+                "resolver lifecycle recovery 只能在 terminal 后释放。"
+            )
+        with self._publication_lock:
+            recovery = self._lifecycle_recovery.get(publication_id)
+            if recovery is not None and recovery.ledger is ledger:
+                del self._lifecycle_recovery[publication_id]
+            state = self._ready_publications.get(publication_id)
+            if state is not None and state.ledger is ledger:
+                state.guard = None
+                state.ledger = None
+                state.launch_owner = None
+                state.status = "consumed"
+                del self._ready_publications[publication_id]
+
+    def _recover_ready_launch_claim(
+        self,
+        ticket: _ReadyPublicationTicket,
+        *,
+        launch_owner: object,
+    ) -> bool:
+        """Best-effort exact-owner fallback if launch cancellation faults."""
+
+        with self._publication_lock:
+            for publication_id, state in tuple(
+                self._ready_publications.items()
+            ):
+                if (
+                    state.ticket is ticket
+                    and state.capability_snapshot.launcher is self
+                    and state.status == "launching"
+                    and state.guard is None
+                    and state.launch_owner is launch_owner
+                ):
+                    state.launch_owner = None
+                    state.status = "consumed"
+                    del self._ready_publications[publication_id]
+                    return True
+        return False
 
     def _publish_ready_guard(
         self,
         ticket: _ReadyPublicationTicket,
         guard: PreAttemptResolverGuard,
+        *,
+        launch_owner: object,
+        _authority: object | None = None,
     ) -> None:
         """Publish the exact READY owner as the final pre-return action."""
 
+        if _authority is not _RESOLVER_LIFECYCLE_AUTHORITY:
+            raise TypeError("resolver READY publication requires coordinator")
+        snapshot = _validated_lifecycle_capability_snapshot(
+            ticket,
+            launcher=self,
+        )
+        spawn_snapshot = self._validated_spawn_configuration()
         if (
-            type(ticket) is not _ReadyPublicationTicket
-            or ticket._launcher is not self
+            snapshot.spawn_request_digest != spawn_snapshot.request_digest
             or type(guard) is not PreAttemptResolverGuard
-            or guard.lifecycle_id != ticket.lifecycle_id
-            or guard.spawn_request_digest != ticket.spawn_request_digest
+            or guard._capability is not ticket
+            or guard._ledger._capability is not ticket
+            or guard._ledger._capability_snapshot != snapshot
+            or guard.lifecycle_id != snapshot.lifecycle_id
+            or guard.spawn_request_digest != snapshot.spawn_request_digest
         ):
             raise _lifecycle_error("resolver READY publication proof 无效。")
+        guard._ledger.require_exact_ready_guard(guard, ticket)
         with self._publication_lock:
-            state = self._ready_publications.get(ticket.publication_id)
+            state = self._ready_publications.get(snapshot.publication_id)
             if (
                 state is None
                 or state.ticket is not ticket
-                or state.status != "reserved"
+                or state.capability_snapshot != snapshot
+                or state.status != "launching"
                 or state.guard is not None
+                or state.ledger is not guard._ledger
+                or state.launch_owner is not launch_owner
             ):
                 raise _lifecycle_error("resolver READY publication reservation 已变化。")
             state.guard = guard
@@ -1982,107 +2847,172 @@ class ResolverHelperLauncher:
     ) -> bool:
         """Consume only the normally assigned exact guard identity."""
 
-        if _authority is not _TRANSPORT_ATTEMPT_AUTHORITY:
-            raise TypeError("READY publication consumption requires transport")
+        if _authority is not _RESOLVER_LIFECYCLE_AUTHORITY:
+            raise TypeError("READY publication consumption requires coordinator")
         if (
             type(ticket) is not _ReadyPublicationTicket
             or ticket._launcher is not self
             or type(guard) is not PreAttemptResolverGuard
+            or guard._capability is not ticket
         ):
             return False
+        try:
+            snapshot = _validated_lifecycle_capability_snapshot(
+                ticket,
+                launcher=self,
+            )
+        except (TypeError, ValueError, EndpointPolicyError):
+            return False
         with self._publication_lock:
-            state = self._ready_publications.get(ticket.publication_id)
+            state = self._ready_publications.get(snapshot.publication_id)
             if (
                 state is None
                 or state.ticket is not ticket
+                or state.capability_snapshot != snapshot
                 or state.status != "published"
                 or state.guard is not guard
+                or state.launch_owner is None
             ):
                 return False
             state.guard = None
+            state.launch_owner = None
             state.status = "consumed"
-            del self._ready_publications[ticket.publication_id]
+            del self._ready_publications[snapshot.publication_id]
             return True
 
-    def _recover_ready_publication(
+    def _recover_ready_publication_for_cleanup(
         self,
         ticket: _ReadyPublicationTicket,
         *,
+        launch_owner: object,
         _authority: object | None = None,
-    ) -> PreAttemptResolverGuard | None:
-        """Consume a reserved/published ticket after an outer exception."""
+    ) -> bool:
+        """Clean an exact launch owner in-place without returning capability."""
 
-        if _authority is not _TRANSPORT_ATTEMPT_AUTHORITY:
-            raise TypeError("READY publication recovery requires transport")
+        if _authority is not _RESOLVER_LIFECYCLE_AUTHORITY:
+            raise TypeError("READY publication recovery requires coordinator")
+        if type(ticket) is not _ReadyPublicationTicket or launch_owner is None:
+            return False
+        with self._publication_lock:
+            matches = [
+                recovery
+                for recovery in self._lifecycle_recovery.values()
+                if recovery.ticket is ticket
+                and recovery.capability_snapshot.launcher is self
+                and recovery.launch_owner is launch_owner
+            ]
+            if len(matches) != 1:
+                return False
+            recovery = matches[0]
+            publication_id = recovery.capability_snapshot.publication_id
+            ledger = recovery.ledger
+        ledger.recover_current_owner_for_cleanup()
+        if not ledger.is_terminal():
+            return False
+        # ``finish_cleanup`` deliberately treats terminal resource proof as
+        # stronger than bookkeeping callback success.  Retry that idempotent
+        # bookkeeping here so a callback fault cannot retain the strong
+        # lifecycle recovery anchor forever.
+        self._release_lifecycle_recovery(publication_id, ledger)
+        with self._publication_lock:
+            recovery_is_gone = publication_id not in self._lifecycle_recovery
+            ready_state = self._ready_publications.get(publication_id)
+            ready_state_is_gone = (
+                ready_state is None or ready_state.ledger is not ledger
+            )
+        return recovery_is_gone and ready_state_is_gone
+
+    def _accepted_ready_guard_ledger(
+        self,
+        ticket: _ReadyPublicationTicket,
+        guard: PreAttemptResolverGuard,
+        *,
+        launch_owner: object,
+        _authority: object | None = None,
+    ) -> _ResolverLifecycleLedger:
+        """Attest consumed READY ownership without returning a new guard."""
+
+        if _authority is not _RESOLVER_LIFECYCLE_AUTHORITY:
+            raise TypeError("READY guard attestation requires coordinator")
         if (
             type(ticket) is not _ReadyPublicationTicket
-            or ticket._launcher is not self
+            or type(guard) is not PreAttemptResolverGuard
+            or launch_owner is None
         ):
-            return None
+            raise _lifecycle_error("resolver READY guard 类型无效。")
+        snapshot = _validated_lifecycle_capability_snapshot(
+            ticket,
+            launcher=self,
+        )
         with self._publication_lock:
-            state = self._ready_publications.get(ticket.publication_id)
-            if state is None or state.ticket is not ticket:
-                return None
-            if state.status == "reserved" and state.guard is None:
-                state.status = "consumed"
-                del self._ready_publications[ticket.publication_id]
-                return None
-            guard = state.guard
+            recovery = self._lifecycle_recovery.get(snapshot.publication_id)
             if (
-                state.status != "published"
-                or type(guard) is not PreAttemptResolverGuard
-                or guard.lifecycle_id != ticket.lifecycle_id
-                or guard.spawn_request_digest != ticket.spawn_request_digest
+                snapshot.publication_id in self._ready_publications
+                or recovery is None
+                or recovery.ticket is not ticket
+                or recovery.capability_snapshot != snapshot
+                or recovery.launch_owner is not launch_owner
             ):
-                return None
-            state.guard = None
-            state.status = "consumed"
-            del self._ready_publications[ticket.publication_id]
-            return guard
+                raise _lifecycle_error(
+                    "resolver READY publication 未提交消费。"
+                )
+            ledger = recovery.ledger
+        ledger.require_exact_ready_guard(guard, ticket)
+        return ledger
 
-    def launch_ready(
+    def _launch_ready(
         self,
         *,
-        lifecycle_id: UUID,
+        capability: _ReadyPublicationTicket,
+        launch_owner: object | None = None,
         observer: LifecycleObserver | None = None,
-        publication_ticket: _ReadyPublicationTicket | None = None,
+        _authority: object | None = None,
     ) -> PreAttemptResolverGuard:
         """Spawn with fixed metadata, then accept only the fixed READY frame."""
 
-        checked_lifecycle_id = require_uuid(lifecycle_id, "lifecycle_id")
-        if publication_ticket is not None:
-            if (
-                type(publication_ticket) is not _ReadyPublicationTicket
-                or publication_ticket._launcher is not self
-                or publication_ticket.lifecycle_id != checked_lifecycle_id
-                or publication_ticket.spawn_request_digest
-                != self._request.request_digest
-            ):
-                raise _lifecycle_error("resolver READY publication ticket 无效。")
-            with self._publication_lock:
-                publication_state = self._ready_publications.get(
-                    publication_ticket.publication_id
-                )
-                if (
-                    publication_state is None
-                    or publication_state.ticket is not publication_ticket
-                    or publication_state.status != "reserved"
-                    or publication_state.guard is not None
-                ):
-                    raise _lifecycle_error(
-                        "resolver READY publication reservation 不可用。"
-                    )
-        ledger = _ResolverLifecycleLedger(lifecycle_id)
-        guard = PreAttemptResolverGuard(
-            lifecycle_id=lifecycle_id,
-            spawn_request_digest=self._request.request_digest,
-            ledger=ledger,
-            _authority=_PRE_GUARD_FACTORY_AUTHORITY,
-        )
-        ledger.bind_pre_owner(guard)
+        if _authority is not _RESOLVER_LIFECYCLE_AUTHORITY:
+            raise TypeError("resolver launch requires coordinator")
+        if launch_owner is None:
+            launch_owner = object()
+        guard: PreAttemptResolverGuard | None = None
         try:
-            kernel = self._spawner.spawn(self._request)
-            ledger.attach_kernel(guard, kernel)
+            snapshot = self._claim_ready_launch(
+                capability,
+                launch_owner=launch_owner,
+                _authority=_RESOLVER_LIFECYCLE_AUTHORITY,
+            )
+            publication_id = snapshot.publication_id
+            ledger = _ResolverLifecycleLedger(
+                capability,
+                on_terminal=lambda selected: self._release_lifecycle_recovery(
+                    publication_id,
+                    selected,
+                ),
+            )
+            guard = PreAttemptResolverGuard(
+                lifecycle_id=snapshot.lifecycle_id,
+                spawn_request_digest=snapshot.spawn_request_digest,
+                ledger=ledger,
+                capability=capability,
+                _authority=_PRE_GUARD_FACTORY_AUTHORITY,
+            )
+            ledger.bind_pre_owner(guard)
+            self._register_lifecycle_recovery(
+                capability,
+                ledger,
+                launch_owner=launch_owner,
+            )
+            spawn_snapshot = self._validated_spawn_configuration()
+            publication = _KernelPublication(
+                ledger=ledger,
+                owner=guard,
+                _authority=_KERNEL_PUBLICATION_AUTHORITY,
+            )
+            kernel = spawn_snapshot.spawner.spawn(
+                spawn_snapshot.request,
+                publication=publication,
+            )
+            publication.confirm_returned(kernel)
             frame = _read_bounded_frame(
                 kernel,
                 maximum=MAX_READY_FRAME_BYTES,
@@ -2092,18 +3022,34 @@ class ResolverHelperLauncher:
                 raise _lifecycle_error("resolver helper READY frame 无效。")
             ledger.mark_ready(guard)
             _notify(observer, "ready_committed", guard.safe_metadata())
-            if publication_ticket is not None:
-                self._publish_ready_guard(publication_ticket, guard)
+            self._publish_ready_guard(
+                capability,
+                guard,
+                launch_owner=launch_owner,
+                _authority=_RESOLVER_LIFECYCLE_AUTHORITY,
+            )
             return guard
         except BaseException:
-            if publication_ticket is not None:
-                self._cancel_ready_reservation(publication_ticket)
-            _cleanup_guard(
-                guard,
-                ledger,
-                observer=None,
-                suppress_errors=True,
-            )
+            try:
+                self._cancel_ready_launch(
+                    capability,
+                    launch_owner=launch_owner,
+                )
+            except BaseException:
+                try:
+                    self._recover_ready_launch_claim(
+                        capability,
+                        launch_owner=launch_owner,
+                    )
+                except BaseException:
+                    pass
+            if guard is not None:
+                _cleanup_guard(
+                    guard,
+                    guard._ledger,
+                    observer=None,
+                    suppress_errors=True,
+                )
             raise
 
 

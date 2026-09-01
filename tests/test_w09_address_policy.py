@@ -52,6 +52,7 @@ import snapquiz.transport.resolver as resolver_module
 
 SESSION_ISSUED_AT = NOW + timedelta(seconds=5)
 EXECUTABLE = "/opt/snapquiz/libexec/resolver-helper"
+PUBLICATION_ID = UUID("72000000-0000-0000-0000-000000000006")
 LIFECYCLE_ID = UUID("72000000-0000-0000-0000-000000000001")
 ATTEMPT_ID = UUID("72000000-0000-0000-0000-000000000002")
 CLAIM_ID = UUID("72000000-0000-0000-0000-000000000003")
@@ -258,25 +259,48 @@ class _Spawner:
     def __init__(self, kernel: _Kernel) -> None:
         self.kernel = kernel
 
-    def spawn(self, request):
+    def spawn(self, request, *, publication):
         del request
+        publication.publish(self.kernel)
         return self.kernel
 
 
 def _issue(*records, overrides=None, read_result: bool = True):
     runtime, gate, attempt, claim_id = _make_attempt()
+    start_id = uuid5(LIFECYCLE_ID, str(attempt.attempt_permit_id))
     kernel = _Kernel(tuple(records), overrides)
     launcher = ResolverHelperLauncher(_Spawner(kernel), executable=EXECUTABLE)
-    pre = launcher.launch_ready(lifecycle_id=LIFECYCLE_ID)
+    reservation_owner = object()
+    with patch.object(
+        resolver_module,
+        "uuid4",
+        side_effect=(PUBLICATION_ID, LIFECYCLE_ID, claim_id, start_id),
+    ) as generate_role_id:
+        capability = launcher._reserve_lifecycle_capability(
+            reservation_owner=reservation_owner,
+            _authority=resolver_module._RESOLVER_LIFECYCLE_AUTHORITY,
+        )
+    if generate_role_id.call_count != 4:
+        raise AssertionError("resolver capability did not reserve four role ids")
+    pre = launcher._launch_ready(
+        capability=capability,
+        _authority=resolver_module._RESOLVER_LIFECYCLE_AUTHORITY,
+    )
+    if not launcher._consume_ready_publication(
+        capability,
+        pre,
+        _authority=resolver_module._RESOLVER_LIFECYCLE_AUTHORITY,
+    ):
+        raise AssertionError("resolver READY publication was not consumed")
     gate._claim_attempt(
         attempt,
         claim_id=claim_id,
         _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
     )
-    guard = pre.transfer(
+    guard = pre._transfer(
         attempt_permit_id=attempt.attempt_permit_id,
         attempt_permit_digest=attempt.attempt_permit_digest,
-        transport_claim_id=claim_id,
+        _authority=resolver_module._RESOLVER_LIFECYCLE_AUTHORITY,
     )
     gate._bind_terminal_guard(
         attempt,
@@ -285,7 +309,6 @@ def _issue(*records, overrides=None, read_result: bool = True):
         guard_digest=guard.terminal_guard_digest,
         _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
     )
-    start_id = uuid5(LIFECYCLE_ID, str(attempt.attempt_permit_id))
     gate._commit_dns_start(
         attempt,
         claim_id=claim_id,
@@ -294,14 +317,20 @@ def _issue(*records, overrides=None, read_result: bool = True):
         start_id=start_id,
         _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
     )
-    guard.start(
+    guard._start(
         hostname="open.bigmodel.cn",
         port=443,
         network_policy_ref=INTERNET_PUBLIC_ADDRESS_POLICY_REF,
         network_policy_digest=INTERNET_PUBLIC_ADDRESS_POLICY_DIGEST,
-        dns_start_id=start_id,
+        _authority=resolver_module._RESOLVER_LIFECYCLE_AUTHORITY,
     )
-    receipt = guard.read_result_receipt() if read_result else None
+    receipt = (
+        guard._read_result_receipt(
+            _authority=resolver_module._RESOLVER_LIFECYCLE_AUTHORITY,
+        )
+        if read_result
+        else None
+    )
     return runtime, gate, attempt, claim_id, guard, receipt, kernel
 
 
@@ -535,7 +564,10 @@ class W09ResolutionPublicationTest(unittest.TestCase):
 
         try:
             with self.assertRaisesRegex(RuntimeError, "after RESULT"):
-                guard.read_result_receipt(observer=fail_after_issue)
+                guard._read_result_receipt(
+                    observer=fail_after_issue,
+                    _authority=resolver_module._RESOLVER_LIFECYCLE_AUTHORITY,
+                )
             terminal_receipt = guard._ledger._issued_receipt
             self.assertIs(type(terminal_receipt), ResolverResultReceipt)
             self.assertEqual(guard.safe_metadata()["state"], "terminal")

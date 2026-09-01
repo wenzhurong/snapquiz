@@ -785,6 +785,11 @@ class AttemptPermit:
 class _CredentialPermitState:
     __slots__ = (
         "permit",
+        "permit_id",
+        "session_id",
+        "credential_binding_digest",
+        "context",
+        "context_ledger",
         "status",
         "resolved_binding",
         "credential_handle_id",
@@ -795,6 +800,11 @@ class _CredentialPermitState:
 
     def __init__(self, permit: CredentialResolutionPermit) -> None:
         self.permit = permit
+        self.permit_id = permit.permit_id
+        self.session_id = permit.session_id
+        self.credential_binding_digest = permit.credential_binding_digest
+        self.context = permit._context
+        self.context_ledger = permit._context_ledger
         self.status = "authorized"
         self.resolved_binding: Digest256 | ContractMarker | None = None
         self.credential_handle_id: UUID | None = None
@@ -802,10 +812,30 @@ class _CredentialPermitState:
         self.resolved_publication_id: UUID | None = None
         self.resolver_claim_id: UUID | None = None
 
+    def recovery_refs(self) -> tuple[object, object]:
+        return self.context, self.context_ledger
+
+    def restore_recovery_refs(self, refs: tuple[object, object]) -> None:
+        self.context, self.context_ledger = refs
+
+    def clear_recovery_refs(self) -> None:
+        self.context = None
+        self.context_ledger = None
+
 
 class _AttemptPermitState:
     __slots__ = (
         "permit",
+        "attempt_permit_id",
+        "attempt_permit_digest",
+        "credential_permit",
+        "credential_permit_id",
+        "credential_handle_id",
+        "credential_handle_digest",
+        "session_id",
+        "context",
+        "context_ledger",
+        "reservation",
         "status",
         "transport_claim_id",
         "terminal_guard_id",
@@ -816,12 +846,49 @@ class _AttemptPermitState:
 
     def __init__(self, permit: AttemptPermit) -> None:
         self.permit = permit
+        self.attempt_permit_id = permit.attempt_permit_id
+        self.attempt_permit_digest = permit.attempt_permit_digest
+        self.credential_permit = permit._credential_permit
+        self.credential_permit_id = permit.credential_permit_id
+        self.credential_handle_id = permit.credential_handle_id
+        self.credential_handle_digest = permit.credential_handle_digest
+        self.session_id = permit.session_id
+        self.context = permit._credential_permit._context
+        self.context_ledger = permit._context_ledger
+        self.reservation = permit._reservation
         self.status = "active"
         self.transport_claim_id: UUID | None = None
         self.terminal_guard_id: UUID | None = None
         self.terminal_guard_digest: Digest256 | None = None
         self.dns_start_id: UUID | None = None
         self.credential_borrow_id: UUID | None = None
+
+    def clear_recovery_refs(self) -> None:
+        """Drop strong recovery anchors after irreversible terminal commit."""
+
+        self.credential_permit = None
+        self.context = None
+        self.context_ledger = None
+        self.reservation = None
+
+    def recovery_refs(self) -> tuple[object, object, object, object]:
+        return (
+            self.credential_permit,
+            self.context,
+            self.context_ledger,
+            self.reservation,
+        )
+
+    def restore_recovery_refs(
+        self,
+        refs: tuple[object, object, object, object],
+    ) -> None:
+        (
+            self.credential_permit,
+            self.context,
+            self.context_ledger,
+            self.reservation,
+        ) = refs
 
 
 def _validate_session_binding(
@@ -1189,6 +1256,7 @@ class AttemptGate:
             and type(handle_id) is UUID
             and type(handle_digest) is Digest256
         )
+        preconfirm_snapshot: tuple[object, object, object, object] | None = None
         with self._lock:
             state = self._require_credential_state_locked(permit)
             if (
@@ -1215,6 +1283,12 @@ class AttemptGate:
                     permit._authority_ledger,
                     permit._context,
                     permit._context_ledger,
+                )
+                preconfirm_snapshot = (
+                    state.resolved_binding,
+                    state.credential_handle_id,
+                    state.credential_handle_digest,
+                    state.resolved_publication_id,
                 )
                 state.status = "confirming"
         if state.status == "failing":
@@ -1286,6 +1360,41 @@ class AttemptGate:
                 context_ledger=context_ledger,
                 final_action=confirm,
             )
+            with self._lock:
+                current = self._require_credential_state_locked(permit)
+                committed = (
+                    current is state
+                    and current.status == "resolved"
+                    and current.resolver_claim_id is None
+                    and current.resolved_binding
+                    == resolved_binding_digest
+                    and current.credential_handle_id == handle_id
+                    and current.credential_handle_digest == handle_digest
+                    and current.resolved_publication_id
+                    == effective_publication_id
+                    and self._active_by_session.get(current.session_id)
+                    == current.permit_id
+                )
+                if not committed:
+                    if (
+                        current is state
+                        and preconfirm_snapshot is not None
+                        and current.status in ("confirming", "resolved")
+                        and current.resolver_claim_id in (claim_id, None)
+                        and self._active_by_session.get(current.session_id)
+                        == current.permit_id
+                    ):
+                        (
+                            current.resolved_binding,
+                            current.credential_handle_id,
+                            current.credential_handle_digest,
+                            current.resolved_publication_id,
+                        ) = preconfirm_snapshot
+                        current.resolver_claim_id = claim_id
+                        current.status = "resolving"
+                    raise _attempt_error(
+                        "credential confirmation transaction 未提交。"
+                    )
         except BaseException:
             with self._lock:
                 current = self._lookup_credential_state_locked(permit)
@@ -1330,6 +1439,17 @@ class AttemptGate:
             action=terminal,
             _authority=_ATTEMPT_BUDGET_AUTHORITY,
         )
+        with self._lock:
+            if (
+                self._credential_permits.get(state.permit_id) is not state
+                or state.status != terminal_status
+                or state.resolver_claim_id is not None
+                or state.resolved_publication_id is not None
+                or state.session_id in self._active_by_session
+            ):
+                raise _attempt_error(
+                    "凭据解析终态 transaction 未提交。"
+                )
 
     def _fail_credential_resolution(
         self,
@@ -1386,6 +1506,36 @@ class AttemptGate:
         with self._lock:
             state = self._lookup_credential_state_locked(permit)
             return state.status in ("abandoned", "finished")
+
+    def _credential_resolution_is_terminal_for_cleanup(
+        self,
+        permit: CredentialResolutionPermit,
+        *,
+        _authority: object | None = None,
+    ) -> bool:
+        """Observe terminal state without trusting released permit slots."""
+
+        if _authority is not _CREDENTIAL_RESOLVER_AUTHORITY:
+            raise TypeError("credential cleanup observation requires resolver")
+        if type(permit) is not CredentialResolutionPermit:
+            return False
+        with self._lock:
+            matches = [
+                state
+                for key, state in self._credential_permits.items()
+                if state.permit is permit and state.permit_id == key
+            ]
+            if len(matches) != 1:
+                return False
+            state = matches[0]
+            return (
+                state.status in ("abandoned", "finished")
+                and state.resolver_claim_id is None
+                and state.resolved_publication_id is None
+                and state.context is None
+                and state.context_ledger is None
+                and state.session_id not in self._active_by_session
+            )
 
     def _credential_claim_is_owned(
         self,
@@ -1531,7 +1681,7 @@ class AttemptGate:
                 return permit
 
         try:
-            return self._run_authority_path(
+            self._run_authority_path(
                 planned=planned,
                 invocation=invocation,
                 prepared=prepared,
@@ -1545,16 +1695,30 @@ class AttemptGate:
                 context_ledger=context_ledger,
                 final_action=claim,
             )
+            with self._lock:
+                current = self._require_credential_state_locked(permit)
+                if (
+                    current is not initial_state
+                    or current.status != "resolving"
+                    or current.resolver_claim_id != claim_id
+                    or self._active_by_session.get(current.session_id)
+                    != current.permit_id
+                ):
+                    raise _attempt_error(
+                        "credential claim transaction 未提交。"
+                    )
         except BaseException:
             with self._lock:
-                current = self._lookup_credential_state_locked(permit)
                 if (
-                    current.status == "claiming"
-                    and current.resolver_claim_id == claim_id
+                    self._credential_permits.get(initial_state.permit_id)
+                    is initial_state
+                    and initial_state.status == "claiming"
+                    and initial_state.resolver_claim_id == claim_id
                 ):
-                    current.status = "authorized"
-                    current.resolver_claim_id = None
+                    initial_state.status = "authorized"
+                    initial_state.resolver_claim_id = None
             raise
+        return permit
 
     def abandon_credential_resolution(
         self,
@@ -1651,6 +1815,38 @@ class AttemptGate:
         for name, original in snapshot.items():
             object.__setattr__(value, name, original)
 
+    @staticmethod
+    def _credential_permit_refs_are_released(
+        permit: CredentialResolutionPermit,
+    ) -> bool:
+        return permit._released is True and all(
+            getattr(permit, name) is None
+            for name in (
+                "_planned",
+                "_invocation",
+                "_prepared",
+                "_authorization",
+                "_consent_ledger",
+                "_session",
+                "_approval_ledger",
+                "_session_ledger",
+                "_authority_ledger",
+                "_context",
+                "_context_ledger",
+            )
+        )
+
+    @staticmethod
+    def _attempt_permit_refs_are_released(permit: AttemptPermit) -> bool:
+        return permit._released is True and all(
+            getattr(permit, name) is None
+            for name in (
+                "_credential_permit",
+                "_reservation",
+                "_context_ledger",
+            )
+        )
+
     def _commit_credential_terminal_locked(
         self,
         *,
@@ -1667,23 +1863,292 @@ class AttemptGate:
         old_status = state.status
         old_claim_id = state.resolver_claim_id
         old_publication_id = state.resolved_publication_id
+        old_recovery_refs = state.recovery_refs()
         try:
             permit._release_authority_refs(
                 _authority=_PERMIT_RELEASE_AUTHORITY,
             )
+            if not self._credential_permit_refs_are_released(permit):
+                raise _attempt_error(
+                    "credential permit authority refs 未释放。"
+                )
             state.status = terminal_status
             state.resolver_claim_id = None
             state.resolved_publication_id = None
             if self._active_by_session.get(permit.session_id) != permit.permit_id:
                 raise _attempt_error("凭据解析授权的 active session 绑定已经变化。")
             del self._active_by_session[permit.session_id]
+            state.clear_recovery_refs()
+            if state.recovery_refs() != (None, None):
+                raise _attempt_error(
+                    "credential recovery refs 未释放。"
+                )
         except BaseException:
             self._restore_slots(permit, permit_snapshot)
             state.status = old_status
             state.resolver_claim_id = old_claim_id
             state.resolved_publication_id = old_publication_id
+            state.restore_recovery_refs(old_recovery_refs)
             self._active_by_session[permit.session_id] = active_id
             raise
+
+    def _commit_recovered_credential_terminal_locked(
+        self,
+        *,
+        permit: CredentialResolutionPermit,
+        state: _CredentialPermitState,
+    ) -> None:
+        """Terminalize a resolved credential from independent Gate snapshots."""
+
+        active_id = self._active_by_session.get(state.session_id)
+        if (
+            state.permit is not permit
+            or self._credential_permits.get(state.permit_id) is not state
+            or active_id != state.permit_id
+        ):
+            raise _attempt_error("credential cleanup recovery owner 已变化。")
+        permit_snapshot = self._snapshot_slots(permit)
+        old_status = state.status
+        old_claim_id = state.resolver_claim_id
+        old_publication_id = state.resolved_publication_id
+        old_recovery_refs = state.recovery_refs()
+        try:
+            permit._release_authority_refs(
+                _authority=_PERMIT_RELEASE_AUTHORITY,
+            )
+            if not self._credential_permit_refs_are_released(permit):
+                raise _attempt_error(
+                    "credential permit authority refs 未释放。"
+                )
+            state.status = "abandoned"
+            state.resolver_claim_id = None
+            state.resolved_publication_id = None
+            if self._active_by_session.get(state.session_id) != state.permit_id:
+                raise _attempt_error("credential cleanup recovery session 已变化。")
+            del self._active_by_session[state.session_id]
+            state.clear_recovery_refs()
+            if state.recovery_refs() != (None, None):
+                raise _attempt_error(
+                    "credential recovery refs 未释放。"
+                )
+        except BaseException:
+            self._restore_slots(permit, permit_snapshot)
+            state.status = old_status
+            state.resolver_claim_id = old_claim_id
+            state.resolved_publication_id = old_publication_id
+            state.restore_recovery_refs(old_recovery_refs)
+            self._active_by_session[state.session_id] = active_id
+            raise
+
+    def _recover_resolved_credential_for_cleanup(
+        self,
+        permit: CredentialResolutionPermit,
+        *,
+        publication_id: UUID,
+        handle_id: UUID,
+        handle_digest: Digest256,
+        _authority: object | None = None,
+    ) -> bool:
+        """Recovery entry point for one exact resolved credential."""
+
+        if _authority is not _CREDENTIAL_RESOLVER_AUTHORITY:
+            raise TypeError("credential cleanup recovery requires resolver")
+        return self._recover_resolved_credential_state_for_cleanup(
+            permit,
+            publication_id=publication_id,
+            handle_id=handle_id,
+            handle_digest=handle_digest,
+            _authority=_CREDENTIAL_RESOLVER_AUTHORITY,
+        )
+
+    def _recover_resolved_credential_state_for_cleanup(
+        self,
+        permit: CredentialResolutionPermit,
+        *,
+        publication_id: UUID,
+        handle_id: UUID,
+        handle_digest: Digest256,
+        _authority: object | None = None,
+    ) -> bool:
+        """Independent ledger path for retrying resolved cleanup."""
+
+        if _authority is not _CREDENTIAL_RESOLVER_AUTHORITY:
+            raise TypeError("credential cleanup recovery requires resolver")
+        if (
+            type(permit) is not CredentialResolutionPermit
+            or type(publication_id) is not UUID
+            or type(handle_id) is not UUID
+            or type(handle_digest) is not Digest256
+        ):
+            return False
+        with self._lock:
+            matches = [
+                state
+                for key, state in self._credential_permits.items()
+                if state.permit is permit
+                and state.permit_id == key
+            ]
+            if len(matches) != 1:
+                return False
+            state = matches[0]
+            if state.status in ("abandoned", "finished"):
+                return True
+            if (
+                state.status != "resolved"
+                or state.resolver_claim_id is not None
+                or state.credential_handle_id != handle_id
+                or state.credential_handle_digest != handle_digest
+                or state.resolved_publication_id != publication_id
+                or self._active_by_session.get(state.session_id)
+                != state.permit_id
+                or state.context is None
+                or state.context_ledger is None
+            ):
+                return False
+            state.status = "abandoning"
+
+        def terminal() -> None:
+            with self._lock:
+                if (
+                    self._credential_permits.get(state.permit_id) is not state
+                    or state.status != "abandoning"
+                    or state.credential_handle_id != handle_id
+                    or state.credential_handle_digest != handle_digest
+                    or state.resolved_publication_id != publication_id
+                ):
+                    raise _attempt_error(
+                        "credential cleanup recovery 状态已经变化。"
+                    )
+                self._commit_recovered_credential_terminal_locked(
+                    permit=permit,
+                    state=state,
+                )
+
+        try:
+            state.context_ledger._finish_gate_activity(
+                context=state.context,
+                attempt_gate=self,
+                activity_id=state.permit_id,
+                action=terminal,
+                _authority=_ATTEMPT_BUDGET_AUTHORITY,
+            )
+        except BaseException:
+            with self._lock:
+                if state.status == "abandoning":
+                    state.status = "resolved"
+        else:
+            with self._lock:
+                if state.status == "abandoning":
+                    state.status = "resolved"
+        with self._lock:
+            return (
+                state.status in ("abandoned", "finished")
+                and state.resolver_claim_id is None
+                and state.resolved_publication_id is None
+                and state.session_id not in self._active_by_session
+            )
+
+    def _recover_claimed_credential_for_cleanup(
+        self,
+        permit: CredentialResolutionPermit,
+        *,
+        claim_id: UUID,
+        _authority: object | None = None,
+    ) -> bool:
+        """Recovery entry point for one exact resolver-owned claim."""
+
+        if _authority is not _CREDENTIAL_RESOLVER_AUTHORITY:
+            raise TypeError("credential cleanup recovery requires resolver")
+        return self._recover_claimed_credential_state_for_cleanup(
+            permit,
+            claim_id=claim_id,
+            _authority=_CREDENTIAL_RESOLVER_AUTHORITY,
+        )
+
+    def _recover_claimed_credential_state_for_cleanup(
+        self,
+        permit: CredentialResolutionPermit,
+        *,
+        claim_id: UUID,
+        _authority: object | None = None,
+    ) -> bool:
+        """Independent ledger path for retrying claimed cleanup."""
+
+        if _authority is not _CREDENTIAL_RESOLVER_AUTHORITY:
+            raise TypeError("credential cleanup recovery requires resolver")
+        if (
+            type(permit) is not CredentialResolutionPermit
+            or type(claim_id) is not UUID
+        ):
+            return False
+        with self._lock:
+            matches = [
+                state
+                for key, state in self._credential_permits.items()
+                if state.permit is permit
+                and state.permit_id == key
+            ]
+            if len(matches) != 1:
+                return False
+            state = matches[0]
+            if state.status in ("abandoned", "finished"):
+                return True
+            if (
+                state.status not in ("claiming", "resolving", "confirming")
+                or state.resolver_claim_id != claim_id
+                or self._active_by_session.get(state.session_id)
+                != state.permit_id
+                or state.context is None
+                or state.context_ledger is None
+            ):
+                return False
+            previous_status = state.status
+            state.status = "failing"
+
+        def terminal() -> None:
+            with self._lock:
+                if (
+                    self._credential_permits.get(state.permit_id) is not state
+                    or state.status != "failing"
+                    or state.resolver_claim_id != claim_id
+                ):
+                    raise _attempt_error(
+                        "credential claim cleanup recovery 状态已经变化。"
+                    )
+                self._commit_recovered_credential_terminal_locked(
+                    permit=permit,
+                    state=state,
+                )
+
+        try:
+            state.context_ledger._finish_gate_activity(
+                context=state.context,
+                attempt_gate=self,
+                activity_id=state.permit_id,
+                action=terminal,
+                _authority=_ATTEMPT_BUDGET_AUTHORITY,
+            )
+        except BaseException:
+            with self._lock:
+                if (
+                    state.status == "failing"
+                    and state.resolver_claim_id == claim_id
+                ):
+                    state.status = previous_status
+        else:
+            with self._lock:
+                if (
+                    state.status == "failing"
+                    and state.resolver_claim_id == claim_id
+                ):
+                    state.status = previous_status
+        with self._lock:
+            return (
+                state.status in ("abandoned", "finished")
+                and state.resolver_claim_id is None
+                and state.resolved_publication_id is None
+                and state.session_id not in self._active_by_session
+            )
 
     def _commit_attempt_terminal_locked(
         self,
@@ -1711,6 +2176,8 @@ class AttemptGate:
         old_credential_publication_id = (
             credential_state.resolved_publication_id
         )
+        old_recovery_refs = state.recovery_refs()
+        old_credential_recovery_refs = credential_state.recovery_refs()
         try:
             credential._release_authority_refs(
                 _authority=_PERMIT_RELEASE_AUTHORITY,
@@ -1718,6 +2185,12 @@ class AttemptGate:
             permit._release_authority_refs(
                 _authority=_PERMIT_RELEASE_AUTHORITY,
             )
+            if not self._credential_permit_refs_are_released(credential):
+                raise _attempt_error(
+                    "credential permit authority refs 未释放。"
+                )
+            if not self._attempt_permit_refs_are_released(permit):
+                raise _attempt_error("attempt permit authority refs 未释放。")
             state.status = terminal_status
             state.transport_claim_id = None
             state.terminal_guard_id = None
@@ -1732,6 +2205,14 @@ class AttemptGate:
             ):
                 raise _attempt_error("attempt 的 active session 绑定已经变化。")
             del self._active_by_session[permit.session_id]
+            state.clear_recovery_refs()
+            credential_state.clear_recovery_refs()
+            if state.recovery_refs() != (None, None, None, None):
+                raise _attempt_error("attempt recovery refs 未释放。")
+            if credential_state.recovery_refs() != (None, None):
+                raise _attempt_error(
+                    "credential recovery refs 未释放。"
+                )
         except BaseException:
             self._restore_slots(credential, credential_snapshot)
             self._restore_slots(permit, permit_snapshot)
@@ -1744,6 +2225,10 @@ class AttemptGate:
             credential_state.status = old_credential_status
             credential_state.resolved_publication_id = (
                 old_credential_publication_id
+            )
+            state.restore_recovery_refs(old_recovery_refs)
+            credential_state.restore_recovery_refs(
+                old_credential_recovery_refs
             )
             self._active_by_session[permit.session_id] = active_id
             raise
@@ -1884,7 +2369,7 @@ class AttemptGate:
                     return permit
 
             try:
-                return context_ledger._reserve_attempt_budgets(
+                candidate = context_ledger._reserve_attempt_budgets(
                     context=context,
                     session_id=credential_permit.session_id,
                     session_valid_until=session.valid_until,
@@ -1897,16 +2382,45 @@ class AttemptGate:
                     action=build,
                     _authority=_ATTEMPT_BUDGET_AUTHORITY,
                 )
-            except BaseException:
                 with self._lock:
-                    current = self._lookup_credential_state_locked(
+                    current = self._require_credential_state_locked(
                         credential_permit
                     )
-                    if current.status == "reserving":
-                        current.status = "resolved"
+                    attempt_state = (
+                        self._attempt_permits.get(
+                            candidate.attempt_permit_id
+                        )
+                        if type(candidate) is AttemptPermit
+                        else None
+                    )
+                    if (
+                        current is not initial_state
+                        or current.status != "consumed"
+                        or attempt_state is None
+                        or attempt_state.permit is not candidate
+                        or attempt_state.status != "active"
+                        or attempt_state.credential_permit
+                        is not credential_permit
+                        or attempt_state.credential_handle_id
+                        != credential_handle_id
+                        or attempt_state.credential_handle_digest
+                        != credential_handle_digest
+                    ):
+                        raise _attempt_error(
+                            "attempt reservation transaction 未提交。"
+                        )
+                return candidate
+            except BaseException:
+                with self._lock:
+                    if (
+                        self._credential_permits.get(initial_state.permit_id)
+                        is initial_state
+                        and initial_state.status == "reserving"
+                    ):
+                        initial_state.status = "resolved"
                 raise
 
-        return self._run_authority_path(
+        candidate = self._run_authority_path(
             planned=planned,
             invocation=invocation,
             prepared=prepared,
@@ -1920,87 +2434,468 @@ class AttemptGate:
             context_ledger=context_ledger,
             final_action=reserve,
         )
+        with self._lock:
+            published = (
+                self._attempt_permits.get(candidate.attempt_permit_id)
+                if type(candidate) is AttemptPermit
+                else None
+            )
+            if (
+                published is None
+                or published.permit is not candidate
+                or published.status != "active"
+                or published.credential_permit is not credential_permit
+                or published.credential_handle_id != credential_handle_id
+                or published.credential_handle_digest != credential_handle_digest
+            ):
+                raise _attempt_error(
+                    "attempt reservation publication 未提交。"
+                )
+        return candidate
 
-    def _recover_published_attempt(
+    def _find_published_attempt_for_cleanup_locked(
+        self,
+        *,
+        credential_permit: CredentialResolutionPermit,
+        credential_handle_id: UUID,
+        credential_handle_digest: Digest256,
+    ) -> tuple[
+        AttemptPermit,
+        _AttemptPermitState,
+        _CredentialPermitState,
+    ] | None:
+        """Find one exact active/unclaimed attempt while ``_lock`` is held."""
+
+        credential_matches = [
+            state
+            for key, state in self._credential_permits.items()
+            if state.permit is credential_permit
+            and state.permit_id == key
+        ]
+        if len(credential_matches) != 1:
+            return None
+        credential_state = credential_matches[0]
+        if (
+            credential_state.status != "consumed"
+            or credential_state.credential_handle_id != credential_handle_id
+            or credential_state.credential_handle_digest
+            != credential_handle_digest
+            or self._active_by_session.get(credential_state.session_id)
+            != credential_state.permit_id
+        ):
+            return None
+
+        matches: list[
+            tuple[AttemptPermit, _AttemptPermitState, _CredentialPermitState]
+        ] = []
+        for candidate_state in self._attempt_permits.values():
+            candidate = candidate_state.permit
+            if (
+                candidate_state.status != "active"
+                or candidate_state.transport_claim_id is not None
+                or candidate_state.terminal_guard_id is not None
+                or candidate_state.terminal_guard_digest is not None
+                or candidate_state.dns_start_id is not None
+                or candidate_state.credential_borrow_id is not None
+                or type(candidate) is not AttemptPermit
+                or candidate_state.credential_permit is not credential_permit
+                or candidate_state.credential_permit_id
+                != credential_state.permit_id
+                or candidate_state.credential_handle_id != credential_handle_id
+                or candidate_state.credential_handle_digest
+                != credential_handle_digest
+            ):
+                continue
+            matches.append((candidate, candidate_state, credential_state))
+            if len(matches) > 1:
+                return None
+        return matches[0] if len(matches) == 1 else None
+
+    def _commit_recovered_attempt_terminal_locked(
+        self,
+        *,
+        permit: AttemptPermit,
+        state: _AttemptPermitState,
+        credential_state: _CredentialPermitState,
+        terminal_status: str,
+    ) -> None:
+        """Terminalize from ledger snapshots, never returned permit fields."""
+
+        credential = state.credential_permit
+        active_id = self._active_by_session.get(state.session_id)
+        if (
+            type(credential) is not CredentialResolutionPermit
+            or credential_state.permit is not credential
+            or self._attempt_permits.get(state.attempt_permit_id) is not state
+            or state.permit is not permit
+            or active_id != state.credential_permit_id
+        ):
+            raise _attempt_error("attempt cleanup recovery owner 已变化。")
+        credential_snapshot = self._snapshot_slots(credential)
+        permit_snapshot = self._snapshot_slots(permit)
+        old_attempt_status = state.status
+        old_transport_claim_id = state.transport_claim_id
+        old_terminal_guard_id = state.terminal_guard_id
+        old_terminal_guard_digest = state.terminal_guard_digest
+        old_dns_start_id = state.dns_start_id
+        old_credential_borrow_id = state.credential_borrow_id
+        old_credential_status = credential_state.status
+        old_publication_id = credential_state.resolved_publication_id
+        old_recovery_refs = state.recovery_refs()
+        old_credential_recovery_refs = credential_state.recovery_refs()
+        try:
+            credential._release_authority_refs(
+                _authority=_PERMIT_RELEASE_AUTHORITY,
+            )
+            permit._release_authority_refs(
+                _authority=_PERMIT_RELEASE_AUTHORITY,
+            )
+            if not self._credential_permit_refs_are_released(credential):
+                raise _attempt_error(
+                    "credential permit authority refs 未释放。"
+                )
+            if not self._attempt_permit_refs_are_released(permit):
+                raise _attempt_error("attempt permit authority refs 未释放。")
+            state.status = terminal_status
+            state.transport_claim_id = None
+            state.terminal_guard_id = None
+            state.terminal_guard_digest = None
+            state.dns_start_id = None
+            state.credential_borrow_id = None
+            credential_state.status = "finished"
+            credential_state.resolved_publication_id = None
+            if (
+                self._active_by_session.get(state.session_id)
+                != state.credential_permit_id
+            ):
+                raise _attempt_error("attempt cleanup recovery session 已变化。")
+            del self._active_by_session[state.session_id]
+            state.clear_recovery_refs()
+            credential_state.clear_recovery_refs()
+            if state.recovery_refs() != (None, None, None, None):
+                raise _attempt_error("attempt recovery refs 未释放。")
+            if credential_state.recovery_refs() != (None, None):
+                raise _attempt_error(
+                    "credential recovery refs 未释放。"
+                )
+        except BaseException:
+            self._restore_slots(credential, credential_snapshot)
+            self._restore_slots(permit, permit_snapshot)
+            state.status = old_attempt_status
+            state.transport_claim_id = old_transport_claim_id
+            state.terminal_guard_id = old_terminal_guard_id
+            state.terminal_guard_digest = old_terminal_guard_digest
+            state.dns_start_id = old_dns_start_id
+            state.credential_borrow_id = old_credential_borrow_id
+            credential_state.status = old_credential_status
+            credential_state.resolved_publication_id = old_publication_id
+            state.restore_recovery_refs(old_recovery_refs)
+            credential_state.restore_recovery_refs(
+                old_credential_recovery_refs
+            )
+            self._active_by_session[state.session_id] = active_id
+            raise
+
+    def _abandon_recovered_attempt_for_cleanup(
+        self,
+        permit: AttemptPermit,
+        state: _AttemptPermitState,
+        credential_state: _CredentialPermitState,
+    ) -> None:
+        """Release one independently snapshotted unclaimed attempt."""
+
+        with self._lock:
+            if (
+                self._attempt_permits.get(state.attempt_permit_id) is not state
+                or state.permit is not permit
+                or state.status != "active"
+                or state.transport_claim_id is not None
+                or state.terminal_guard_id is not None
+                or state.terminal_guard_digest is not None
+                or state.dns_start_id is not None
+                or state.credential_borrow_id is not None
+            ):
+                raise _attempt_error("attempt cleanup recovery 状态无效。")
+            state.status = "abandoning"
+
+        def terminal() -> None:
+            with self._lock:
+                if (
+                    self._attempt_permits.get(state.attempt_permit_id) is not state
+                    or state.status != "abandoning"
+                    or self._credential_permits.get(state.credential_permit_id)
+                    is not credential_state
+                ):
+                    raise _attempt_error("attempt cleanup recovery 状态已经变化。")
+                self._commit_recovered_attempt_terminal_locked(
+                    permit=permit,
+                    state=state,
+                    credential_state=credential_state,
+                    terminal_status="abandoned",
+                )
+
+        try:
+            state.context_ledger._finish_attempt_and_activity(
+                context=state.context,
+                reservation=state.reservation,
+                attempt_gate=self,
+                activity_id=state.credential_permit_id,
+                action=terminal,
+                _authority=_ATTEMPT_BUDGET_AUTHORITY,
+            )
+        except BaseException:
+            with self._lock:
+                if state.status == "abandoning":
+                    state.status = "active"
+            raise
+        with self._lock:
+            if state.status == "abandoning":
+                state.status = "active"
+                raise _attempt_error(
+                    "attempt cleanup transaction 未提交。"
+                )
+
+    def _recover_attempt_for_cleanup(
+        self,
+        permit: AttemptPermit,
+        *,
+        credential_permit: CredentialResolutionPermit,
+        credential_handle_id: UUID,
+        credential_handle_digest: Digest256,
+        claim_id: UUID,
+        guard_id: UUID | None,
+        guard_digest: Digest256 | None,
+        _authority: object | None = None,
+    ) -> bool:
+        """Terminalize an assigned attempt from ledger-owned owner snapshots."""
+
+        if _authority is not _TRANSPORT_ATTEMPT_AUTHORITY:
+            raise TypeError("attempt cleanup recovery requires transport")
+        if (
+            type(permit) is not AttemptPermit
+            or type(credential_permit) is not CredentialResolutionPermit
+            or type(credential_handle_id) is not UUID
+            or type(credential_handle_digest) is not Digest256
+            or type(claim_id) is not UUID
+            or (guard_id is None) != (guard_digest is None)
+            or (guard_id is not None and type(guard_id) is not UUID)
+            or (
+                guard_digest is not None
+                and type(guard_digest) is not Digest256
+            )
+        ):
+            return False
+        with self._lock:
+            matches = [
+                state
+                for key, state in self._attempt_permits.items()
+                if state.permit is permit
+                and state.attempt_permit_id == key
+            ]
+            if len(matches) != 1:
+                return False
+            state = matches[0]
+            credential_state = self._credential_permits.get(
+                state.credential_permit_id
+            )
+            if (
+                credential_state is None
+                or credential_state.permit is not credential_permit
+                or state.credential_handle_id != credential_handle_id
+                or state.credential_handle_digest != credential_handle_digest
+            ):
+                return False
+            if state.status in ("finished", "abandoned"):
+                return (
+                    state.credential_permit is None
+                    and state.context is None
+                    and state.context_ledger is None
+                    and state.reservation is None
+                    and credential_state.status == "finished"
+                    and credential_state.context is None
+                    and credential_state.context_ledger is None
+                    and state.session_id not in self._active_by_session
+                )
+            if state.credential_permit is not credential_permit:
+                return False
+            if state.status == "active":
+                if (
+                    state.transport_claim_id is not None
+                    or state.terminal_guard_id is not None
+                    or state.terminal_guard_digest is not None
+                    or state.dns_start_id is not None
+                    or state.credential_borrow_id is not None
+                ):
+                    return False
+                cleanup_kind = "abandon"
+            else:
+                if (
+                    state.status not in ("io_claimed", "wire_committed")
+                    or state.transport_claim_id != claim_id
+                    or state.credential_borrow_id is not None
+                ):
+                    return False
+                if state.terminal_guard_id is None:
+                    if state.terminal_guard_digest is not None:
+                        return False
+                elif (
+                    state.terminal_guard_id != guard_id
+                    or state.terminal_guard_digest != guard_digest
+                ):
+                    return False
+                cleanup_kind = "finish"
+            if credential_state.permit is not state.credential_permit:
+                return False
+
+        if cleanup_kind == "abandon":
+            try:
+                self._abandon_recovered_attempt_for_cleanup(
+                    permit,
+                    state,
+                    credential_state,
+                )
+            except BaseException:
+                pass
+        else:
+            with self._lock:
+                if state.status not in ("io_claimed", "wire_committed"):
+                    return state.status in ("finished", "abandoned")
+                previous_status = state.status
+                state.status = "finishing"
+
+            def terminal() -> None:
+                with self._lock:
+                    if (
+                        self._attempt_permits.get(state.attempt_permit_id)
+                        is not state
+                        or state.status != "finishing"
+                        or state.transport_claim_id != claim_id
+                        or self._credential_permits.get(
+                            state.credential_permit_id
+                        )
+                        is not credential_state
+                    ):
+                        raise _attempt_error(
+                            "attempt cleanup recovery 状态已经变化。"
+                        )
+                    if state.terminal_guard_id is None:
+                        if state.terminal_guard_digest is not None:
+                            raise _attempt_error(
+                                "attempt cleanup recovery guard 无效。"
+                            )
+                    elif (
+                        state.terminal_guard_id != guard_id
+                        or state.terminal_guard_digest != guard_digest
+                    ):
+                        raise _attempt_error(
+                            "attempt cleanup recovery guard 已变化。"
+                        )
+                    self._commit_recovered_attempt_terminal_locked(
+                        permit=permit,
+                        state=state,
+                        credential_state=credential_state,
+                        terminal_status="finished",
+                    )
+
+            try:
+                state.context_ledger._finish_attempt_and_activity(
+                    context=state.context,
+                    reservation=state.reservation,
+                    attempt_gate=self,
+                    activity_id=state.credential_permit_id,
+                    action=terminal,
+                    _authority=_ATTEMPT_BUDGET_AUTHORITY,
+                )
+            except BaseException:
+                with self._lock:
+                    if (
+                        state.status == "finishing"
+                        and state.transport_claim_id == claim_id
+                    ):
+                        state.status = previous_status
+            else:
+                with self._lock:
+                    if (
+                        state.status == "finishing"
+                        and state.transport_claim_id == claim_id
+                    ):
+                        state.status = previous_status
+
+        with self._lock:
+            return (
+                state.status in ("finished", "abandoned")
+                and state.transport_claim_id is None
+                and state.terminal_guard_id is None
+                and state.terminal_guard_digest is None
+                and state.dns_start_id is None
+                and state.credential_borrow_id is None
+                and credential_state.status == "finished"
+                and credential_state.resolved_publication_id is None
+                and state.session_id not in self._active_by_session
+            )
+
+    def _recover_published_attempt_for_cleanup(
         self,
         *,
         credential_permit: CredentialResolutionPermit,
         credential_handle_id: UUID,
         credential_handle_digest: Digest256,
         _authority: object | None = None,
-    ) -> AttemptPermit | None:
-        """Recover one unique active/unclaimed attempt by exact input proof.
+    ) -> bool:
+        """Recover and abandon one published, unclaimed attempt.
 
-        ``reserve_attempt`` publishes its permit before returning it.  If an
-        outer wrapper raises after that return but before caller assignment,
-        the trusted transport can use the original credential proof to regain
-        the cleanup anchor.  No partially reserved, claimed, terminal, or
-        ambiguous state is returned.
+        This recovery capability never claims an attempt and never returns a
+        permit that could authorize transport.  A terminal ledger observation
+        also handles the case where abandonment commits immediately before an
+        injected outer exception.
         """
 
         if _authority is not _TRANSPORT_ATTEMPT_AUTHORITY:
-            raise TypeError("attempt publication recovery requires transport")
+            raise TypeError("attempt cleanup recovery requires transport")
         if (
             type(credential_permit) is not CredentialResolutionPermit
             or type(credential_handle_id) is not UUID
             or type(credential_handle_digest) is not Digest256
-            or credential_permit._attempt_gate is not self
         ):
-            return None
-        try:
-            credential_permit.validate_integrity()
-        except (TypeError, ValueError, AttributeError):
-            return None
-
+            return False
         with self._lock:
-            try:
-                credential_state = self._lookup_credential_state_locked(
-                    credential_permit
-                )
-            except (TypeError, ValueError, AttributeError, EndpointPolicyError):
-                return None
-            if (
-                credential_state.status != "consumed"
-                or credential_state.credential_handle_id
-                != credential_handle_id
-                or credential_state.credential_handle_digest
-                != credential_handle_digest
-                or self._active_by_session.get(credential_permit.session_id)
-                != credential_permit.permit_id
-            ):
-                return None
-
-            matches: list[AttemptPermit] = []
-            for candidate_state in self._attempt_permits.values():
-                candidate = candidate_state.permit
-                if (
-                    candidate_state.status != "active"
-                    or candidate_state.transport_claim_id is not None
-                    or candidate_state.terminal_guard_id is not None
-                    or candidate_state.terminal_guard_digest is not None
-                    or candidate_state.dns_start_id is not None
-                    or candidate_state.credential_borrow_id is not None
-                    or type(candidate) is not AttemptPermit
-                    or candidate._attempt_gate is not self
-                    or candidate._credential_permit is not credential_permit
-                    or candidate.credential_permit_id
-                    != credential_permit.permit_id
-                    or candidate.credential_permit_digest
-                    != credential_permit.permit_digest
-                    or candidate.credential_handle_id
-                    != credential_handle_id
-                    or candidate.credential_handle_digest
-                    != credential_handle_digest
-                ):
-                    continue
-                try:
-                    candidate.validate_integrity()
-                except (TypeError, ValueError, AttributeError):
-                    continue
-                matches.append(candidate)
-                if len(matches) > 1:
-                    return None
-            return matches[0] if len(matches) == 1 else None
+            recovered = self._find_published_attempt_for_cleanup_locked(
+                credential_permit=credential_permit,
+                credential_handle_id=credential_handle_id,
+                credential_handle_digest=credential_handle_digest,
+            )
+            if recovered is None:
+                return False
+            attempt, state, credential_state = recovered
+            credential_permit_id = credential_state.permit_id
+            session_id = credential_state.session_id
+        try:
+            self._abandon_recovered_attempt_for_cleanup(
+                attempt,
+                state,
+                credential_state,
+            )
+        except BaseException:
+            # The context-ledger transaction may have committed before an
+            # injected wrapper raised.  Only the exact state captured above
+            # can turn that post-commit fault into successful cleanup.
+            pass
+        with self._lock:
+            return (
+                state.permit is attempt
+                and state.status in ("finished", "abandoned")
+                and state.transport_claim_id is None
+                and state.terminal_guard_id is None
+                and state.terminal_guard_digest is None
+                and state.dns_start_id is None
+                and state.credential_borrow_id is None
+                and self._credential_permits.get(credential_permit_id)
+                is credential_state
+                and credential_state.permit is credential_permit
+                and credential_state.status == "finished"
+                and credential_state.resolved_publication_id is None
+                and session_id not in self._active_by_session
+            )
 
     def _lookup_attempt_state_locked(
         self,
@@ -2076,6 +2971,9 @@ class AttemptGate:
         permit: AttemptPermit,
         *,
         claim_id: UUID,
+        expected_credential_permit: CredentialResolutionPermit | None = None,
+        expected_credential_handle_id: UUID | None = None,
+        expected_credential_handle_digest: Digest256 | None = None,
         _authority: object | None = None,
     ) -> AttemptPermit:
         """Revalidate and atomically assign one transport owner before I/O."""
@@ -2086,8 +2984,32 @@ class AttemptGate:
             raise _attempt_error("transport claim owner 无效。")
         if type(permit) is not AttemptPermit:
             raise TypeError("permit must be AttemptPermit")
+        expected_binding_supplied = any(
+            value is not None
+            for value in (
+                expected_credential_permit,
+                expected_credential_handle_id,
+                expected_credential_handle_digest,
+            )
+        )
+        if expected_binding_supplied and (
+            type(expected_credential_permit)
+            is not CredentialResolutionPermit
+            or type(expected_credential_handle_id) is not UUID
+            or type(expected_credential_handle_digest) is not Digest256
+        ):
+            raise _attempt_error("attempt expected credential proof 不完整。")
         with self._lock:
             initial_state = self._lookup_attempt_state_locked(permit)
+            if expected_binding_supplied and (
+                initial_state.credential_permit
+                is not expected_credential_permit
+                or initial_state.credential_handle_id
+                != expected_credential_handle_id
+                or initial_state.credential_handle_digest
+                != expected_credential_handle_digest
+            ):
+                raise _attempt_error("attempt 不属于预期 credential owner。")
             if (
                 initial_state.status != "active"
                 or initial_state.transport_claim_id is not None
@@ -2146,12 +3068,22 @@ class AttemptGate:
                     or state.credential_borrow_id is not None
                 ):
                     raise _attempt_error("attempt permit 已被领取或终结。")
+                if expected_binding_supplied and (
+                    state.credential_permit is not expected_credential_permit
+                    or state.credential_handle_id
+                    != expected_credential_handle_id
+                    or state.credential_handle_digest
+                    != expected_credential_handle_digest
+                ):
+                    raise _attempt_error(
+                        "attempt expected credential proof 已变化。"
+                    )
                 self._require_attempt_credential_proof_locked(permit)
                 state.status = "io_claimed"
                 return permit
 
         try:
-            return self._run_authority_path(
+            self._run_authority_path(
                 planned=planned,
                 invocation=invocation,
                 prepared=prepared,
@@ -2165,16 +3097,92 @@ class AttemptGate:
                 context_ledger=context_ledger,
                 final_action=claim,
             )
-        except BaseException:
             with self._lock:
                 current = self._lookup_attempt_state_locked(permit)
                 if (
-                    current.status == "claiming"
-                    and current.transport_claim_id == claim_id
+                    current is not initial_state
+                    or current.status != "io_claimed"
+                    or current.transport_claim_id != claim_id
+                    or current.credential_borrow_id is not None
                 ):
-                    current.status = "active"
-                    current.transport_claim_id = None
+                    raise _attempt_error(
+                        "attempt claim transaction 未提交。"
+                    )
+                if expected_binding_supplied and (
+                    current.credential_permit
+                    is not expected_credential_permit
+                    or current.credential_handle_id
+                    != expected_credential_handle_id
+                    or current.credential_handle_digest
+                    != expected_credential_handle_digest
+                ):
+                    raise _attempt_error(
+                        "attempt expected credential proof 已变化。"
+                    )
+                self._require_attempt_credential_proof_locked(permit)
+        except BaseException:
+            with self._lock:
+                if (
+                    self._attempt_permits.get(
+                        initial_state.attempt_permit_id
+                    )
+                    is initial_state
+                    and initial_state.status == "claiming"
+                    and initial_state.transport_claim_id == claim_id
+                ):
+                    initial_state.status = "active"
+                    initial_state.transport_claim_id = None
             raise
+        return permit
+
+    def _claimed_attempt_snapshot_for_transport(
+        self,
+        permit: AttemptPermit,
+        *,
+        credential_permit: CredentialResolutionPermit,
+        credential_handle_id: UUID,
+        credential_handle_digest: Digest256,
+        claim_id: UUID,
+        _authority: object | None = None,
+    ) -> tuple[UUID, Digest256]:
+        """Return immutable ledger proof for one exact claimed attempt."""
+
+        if _authority is not _TRANSPORT_ATTEMPT_AUTHORITY:
+            raise TypeError("attempt claim attestation requires transport")
+        if (
+            type(permit) is not AttemptPermit
+            or type(credential_permit) is not CredentialResolutionPermit
+            or type(credential_handle_id) is not UUID
+            or type(credential_handle_digest) is not Digest256
+            or type(claim_id) is not UUID
+        ):
+            raise _attempt_error("attempt claim attestation proof 无效。")
+        with self._lock:
+            matches = [
+                state
+                for key, state in self._attempt_permits.items()
+                if state.permit is permit and state.attempt_permit_id == key
+            ]
+            if len(matches) != 1:
+                raise _attempt_error("attempt claim attestation owner 无效。")
+            state = matches[0]
+            credential_state = self._credential_permits.get(
+                state.credential_permit_id
+            )
+            if (
+                state.status != "io_claimed"
+                or state.transport_claim_id != claim_id
+                or state.credential_permit is not credential_permit
+                or state.credential_handle_id != credential_handle_id
+                or state.credential_handle_digest != credential_handle_digest
+                or credential_state is None
+                or credential_state.permit is not credential_permit
+                or credential_state.status != "consumed"
+                or self._active_by_session.get(state.session_id)
+                != state.credential_permit_id
+            ):
+                raise _attempt_error("attempt claim attestation 未提交。")
+            return state.attempt_permit_id, state.attempt_permit_digest
 
     def _attempt_claim_is_owned(
         self,
@@ -2380,16 +3388,37 @@ class AttemptGate:
                 context_ledger=context_ledger,
                 final_action=commit,
             )
-        except BaseException:
             with self._lock:
                 current = self._lookup_attempt_state_locked(permit)
                 if (
-                    current.status == "dns_starting"
-                    and current.transport_claim_id == claim_id
-                    and current.dns_start_id == start_id
+                    current is not initial_state
+                    or current.status != "io_claimed"
+                    or current.transport_claim_id != claim_id
+                    or current.dns_start_id != start_id
+                    or current.credential_borrow_id is not None
                 ):
-                    current.status = "io_claimed"
-                    current.dns_start_id = None
+                    raise _attempt_error(
+                        "DNS START transaction 未提交。"
+                    )
+                self._require_terminal_guard_proof_locked(
+                    current,
+                    guard_id=guard_id,
+                    guard_digest=guard_digest,
+                )
+                self._require_attempt_credential_proof_locked(permit)
+        except BaseException:
+            with self._lock:
+                if (
+                    self._attempt_permits.get(
+                        initial_state.attempt_permit_id
+                    )
+                    is initial_state
+                    and initial_state.status == "dns_starting"
+                    and initial_state.transport_claim_id == claim_id
+                    and initial_state.dns_start_id == start_id
+                ):
+                    initial_state.status = "io_claimed"
+                    initial_state.dns_start_id = None
             raise
 
     def _dns_start_is_committed(
@@ -2591,6 +3620,10 @@ class AttemptGate:
                 if state.status == "abandoning":
                     state.status = "active"
             raise
+        with self._lock:
+            if state.status == "abandoning":
+                state.status = "active"
+                raise _attempt_error("attempt 废弃 transaction 未提交。")
         return True
 
     def finish_attempt(
@@ -2679,6 +3712,13 @@ class AttemptGate:
                 ):
                     state.status = previous_status
             raise
+        with self._lock:
+            if (
+                state.status == "finishing"
+                and state.transport_claim_id == claim_id
+            ):
+                state.status = previous_status
+                raise _attempt_error("attempt 终结 transaction 未提交。")
         return True
 
     def _attempt_is_terminal(

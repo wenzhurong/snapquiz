@@ -375,6 +375,7 @@ class _HandleState:
         "handle_id",
         "handle_digest",
         "publication_id",
+        "publication_id_snapshot",
         "permit",
         "gate",
         "secret",
@@ -397,6 +398,7 @@ class _HandleState:
             publication_id,
             "publication_id",
         )
+        self.publication_id_snapshot = self.publication_id
         self.permit: CredentialResolutionPermit | None = permit
         self.gate: AttemptGate | None = gate
         self.secret: bytearray | None = secret
@@ -523,6 +525,93 @@ class _CredentialLedger:
                 if len(matches) > 1:
                     return None
             return matches[0] if len(matches) == 1 else None
+
+    def _recover_active_state_for_cleanup(
+        self,
+        permit: CredentialResolutionPermit,
+        *,
+        publication_id: UUID,
+        gate: AttemptGate | None = None,
+    ) -> tuple[CredentialHandle, _HandleState] | None:
+        """Find one active publication using only ledger-owned handle proof.
+
+        Cleanup must remain possible when the returned handle's public slots
+        were changed after publication.  The state snapshots the proof that
+        was confirmed by AttemptGate, so this lookup deliberately does not
+        consult or validate any public handle field.
+        """
+
+        if type(publication_id) is not UUID or (
+            gate is not None and type(gate) is not AttemptGate
+        ):
+            return None
+
+        with self._lock:
+            matches: list[tuple[CredentialHandle, _HandleState]] = []
+            for handle, state in self._states.items():
+                if (
+                    state.status != "active"
+                    or state.handle is not handle
+                    or state.publication_id != publication_id
+                    or state.permit is not permit
+                    or type(state.gate) is not AttemptGate
+                    or (gate is not None and state.gate is not gate)
+                    or type(state.handle_id) is not UUID
+                    or type(state.handle_digest) is not Digest256
+                    or type(state.secret) is not bytearray
+                    or type(handle) is not CredentialHandle
+                ):
+                    continue
+                matches.append((handle, state))
+                if len(matches) > 1:
+                    return None
+            return matches[0] if len(matches) == 1 else None
+
+    def _cleanup_state_is_closed(
+        self,
+        handle: CredentialHandle,
+        state: _HandleState,
+    ) -> bool:
+        """Confirm cleanup without trusting a possibly changed handle."""
+
+        with self._lock:
+            current = self._states.get(handle)
+            return (
+                current is state
+                and current.handle is handle
+                and current.status == "closed"
+                and current.secret is None
+                and current.permit is None
+                and current.gate is None
+                and current.publication_id is None
+            )
+
+    def _publication_is_closed_for_cleanup(
+        self,
+        publication_id: UUID,
+    ) -> bool:
+        """Observe one exact terminal publication from immutable state."""
+
+        if type(publication_id) is not UUID:
+            return False
+        with self._lock:
+            matches = [
+                (handle, state)
+                for handle, state in self._states.items()
+                if state.publication_id_snapshot == publication_id
+                and state.handle is handle
+            ]
+            if len(matches) != 1:
+                return False
+            handle, state = matches[0]
+            return (
+                state.status == "closed"
+                and state.secret is None
+                and state.permit is None
+                and state.gate is None
+                and state.publication_id is None
+                and state.handle is handle
+            )
 
     def _release_info(
         self,
@@ -985,6 +1074,79 @@ def _read_validated_secret(
     return secret
 
 
+def _credential_gate_is_terminal_for_cleanup(
+    gate: AttemptGate,
+    permit: CredentialResolutionPermit,
+) -> bool:
+    """Observe cleanup from Gate-owned state, never transition returns."""
+
+    try:
+        return gate._credential_resolution_is_terminal_for_cleanup(
+            permit,
+            _authority=_CREDENTIAL_RESOLVER_AUTHORITY,
+        )
+    except BaseException:
+        return False
+
+
+def _recover_claimed_gate_for_cleanup(
+    gate: AttemptGate,
+    permit: CredentialResolutionPermit,
+    *,
+    claim_id: UUID,
+) -> bool:
+    """Retry a claimed Gate through wrapper and independent state paths."""
+
+    recoveries = (
+        gate._recover_claimed_credential_for_cleanup,
+        gate._recover_claimed_credential_state_for_cleanup,
+    )
+    for recovery in recoveries:
+        for _ in range(2):
+            try:
+                recovery(
+                    permit,
+                    claim_id=claim_id,
+                    _authority=_CREDENTIAL_RESOLVER_AUTHORITY,
+                )
+            except BaseException:
+                pass
+            if _credential_gate_is_terminal_for_cleanup(gate, permit):
+                return True
+    return _credential_gate_is_terminal_for_cleanup(gate, permit)
+
+
+def _recover_resolved_gate_for_cleanup(
+    gate: AttemptGate,
+    permit: CredentialResolutionPermit,
+    *,
+    publication_id: UUID,
+    handle_id: UUID,
+    handle_digest: Digest256,
+) -> bool:
+    """Retry a resolved Gate through wrapper and independent state paths."""
+
+    recoveries = (
+        gate._recover_resolved_credential_for_cleanup,
+        gate._recover_resolved_credential_state_for_cleanup,
+    )
+    for recovery in recoveries:
+        for _ in range(2):
+            try:
+                recovery(
+                    permit,
+                    publication_id=publication_id,
+                    handle_id=handle_id,
+                    handle_digest=handle_digest,
+                    _authority=_CREDENTIAL_RESOLVER_AUTHORITY,
+                )
+            except BaseException:
+                pass
+            if _credential_gate_is_terminal_for_cleanup(gate, permit):
+                return True
+    return _credential_gate_is_terminal_for_cleanup(gate, permit)
+
+
 @runtime_final
 class CredentialResolver:
     """Resolve one frozen built-in GLM binding into a one-shot handle."""
@@ -1042,6 +1204,12 @@ class CredentialResolver:
                 claim_id=claim_id,
                 _authority=_CREDENTIAL_RESOLVER_AUTHORITY,
             )
+            if not gate._credential_claim_is_owned(
+                permit,
+                claim_id=claim_id,
+                _authority=_CREDENTIAL_RESOLVER_AUTHORITY,
+            ):
+                _raise_credential_policy_error()
         except BaseException as primary:
             primary_traceback = (
                 None
@@ -1056,20 +1224,17 @@ class CredentialResolver:
                 )
                 else primary.__traceback__
             )
-            for _ in range(2):
-                try:
-                    gate._fail_credential_resolution(
-                        permit,
-                        claim_id=claim_id,
-                        _authority=_CREDENTIAL_RESOLVER_AUTHORITY,
-                    )
-                except BaseException:
-                    continue
-                break
+            _recover_claimed_gate_for_cleanup(
+                gate,
+                permit,
+                claim_id=claim_id,
+            )
             _raise_resolver_primary(primary, primary_traceback)
 
         handle: CredentialHandle | None = None
-        confirmed = False
+        handle_state: _HandleState | None = None
+        handle_id: UUID | None = None
+        handle_digest: Digest256 | None = None
         primary: BaseException | None = None
         primary_traceback: object | None = None
         try:
@@ -1086,16 +1251,34 @@ class CredentialResolver:
                 credential_value_scheme=binding.credential_value_scheme,
                 secret=secret,
             )
+            with self._ledger._lock:
+                handle_state = self._ledger._states.get(handle)
+                if (
+                    handle_state is None
+                    or handle_state.handle is not handle
+                    or handle_state.permit is not permit
+                    or handle_state.gate is not gate
+                    or handle_state.publication_id != exact_publication_id
+                ):
+                    _raise_credential_policy_error()
+                handle_id = handle_state.handle_id
+                handle_digest = handle_state.handle_digest
             gate._confirm_credential_resolution(
                 permit,
                 claim_id=claim_id,
                 publication_id=exact_publication_id,
                 resolved_binding_digest=binding.credential_binding_digest,
-                handle_id=handle.handle_id,
-                handle_digest=handle.handle_digest,
+                handle_id=handle_id,
+                handle_digest=handle_digest,
                 _authority=_CREDENTIAL_RESOLVER_AUTHORITY,
             )
-            confirmed = True
+            if not self._published_handle_is_exact_for_transport(
+                handle,
+                permit=permit,
+                publication_id=exact_publication_id,
+                _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+            ):
+                _raise_credential_policy_error()
             return handle
         except BaseException as error:
             primary = error
@@ -1113,146 +1296,194 @@ class CredentialResolver:
                 else error.__traceback__
             )
 
-        # Gate terminalization precedes ledger zeroization.  Each transition
-        # is owner/proof exact, so one pre-commit rollback can be retried
-        # without touching another resolver.  Observing after every exception
-        # also recognizes a commit-then-raise fault before any secret cleanup.
-        def gate_is_terminal() -> bool:
-            try:
-                return gate._credential_resolution_is_terminal(
-                    permit,
-                    _authority=_CREDENTIAL_RESOLVER_AUTHORITY,
-                )
-            except BaseException:
-                return False
-
-        def fail_owned_claim() -> bool:
-            for _ in range(2):
-                try:
-                    gate._fail_credential_resolution(
-                        permit,
-                        claim_id=claim_id,
-                        _authority=_CREDENTIAL_RESOLVER_AUTHORITY,
-                    )
-                except BaseException:
-                    if gate_is_terminal():
-                        return True
-                else:
-                    return True
-            return gate_is_terminal()
-
-        def abandon_resolved_proof() -> bool:
-            if handle is None:
-                return False
-            for _ in range(2):
-                try:
-                    gate._abandon_resolved_credential_resolution(
-                        permit,
-                        handle_id=handle.handle_id,
-                        handle_digest=handle.handle_digest,
-                        _authority=_CREDENTIAL_RESOLVER_AUTHORITY,
-                    )
-                except BaseException:
-                    if gate_is_terminal():
-                        return True
-                else:
-                    return True
-            return gate_is_terminal()
-
-        # Confirmation can linearize immediately before an injected
-        # BaseException.  A claim-exact failure then rejects because ownership
-        # has moved to the resolved proof; fall back to proof-exact abandon.
-        terminal = (
-            abandon_resolved_proof()
-            if confirmed and handle is not None
-            else fail_owned_claim()
-        )
-        if not terminal and handle is not None:
-            terminal = abandon_resolved_proof()
+        # Gate terminalization precedes ledger zeroization and uses only the
+        # Gate/credential-ledger snapshots captured before any return wrapper
+        # can mutate public permit or handle slots.
+        terminal = False
+        if (
+            handle is not None
+            and handle_state is not None
+            and type(handle_id) is UUID
+            and type(handle_digest) is Digest256
+        ):
+            terminal = _recover_resolved_gate_for_cleanup(
+                gate,
+                permit,
+                publication_id=exact_publication_id,
+                handle_id=handle_id,
+                handle_digest=handle_digest,
+            )
         if not terminal:
-            terminal = gate_is_terminal()
+            terminal = _recover_claimed_gate_for_cleanup(
+                gate,
+                permit,
+                claim_id=claim_id,
+            )
 
-        if handle is not None and terminal:
-            cleanup_state: _HandleState | None = None
-            try:
-                with self._ledger._lock:
-                    cleanup_state = self._ledger._states.get(handle)
-                self._ledger._discard_unpublished(handle)
-            except BaseException:
-                # Preserve the already-selected safe primary error.  Gate is
-                # irreversibly terminal, so cleanup faults cannot authorize a
-                # send and must not prevent the fallback detach/zero below.
-                pass
-            finally:
-                self._ledger._force_discard_unpublished(
-                    handle,
-                    cleanup_state,
-                )
         if terminal:
+            if handle is not None and handle_state is not None:
+                try:
+                    self._ledger._force_discard_unpublished(
+                        handle,
+                        handle_state,
+                    )
+                except BaseException:
+                    pass
             self._ledger._force_discard_for_permit(permit)
 
         assert primary is not None
         _raise_resolver_primary(primary, primary_traceback)
         raise AssertionError("unreachable")
 
-    def _recover_published_handle(
+    def _recover_published_handle_for_cleanup(
         self,
         permit: CredentialResolutionPermit,
         *,
         publication_id: UUID,
         _authority: object | None = None,
-    ) -> CredentialHandle | None:
-        """Recover one exact handle lost after ``resolve`` returned.
+    ) -> bool:
+        """Recover and close one published handle before returning.
 
-        The query exposes only the immutable handle proof, never the private
-        secret buffer.  It returns ``None`` for pre-confirmation, terminal,
-        mismatched, or ambiguous ledger state.
+        This is the loss-recovery form used when an outer ``resolve`` wrapper
+        raises after the handle was published but before the caller received
+        it.  No handle or secret leaves this method.  The ledger-owned proof is
+        used for the Gate check and final state observation, so cleanup still
+        succeeds after same-process mutation of public handle slots.
         """
 
         if _authority is not _TRANSPORT_ATTEMPT_AUTHORITY:
-            raise TypeError("credential publication recovery requires transport")
+            raise TypeError("credential cleanup recovery requires transport")
+        return self._recover_published_handle_state_for_cleanup(
+            permit,
+            publication_id=publication_id,
+            _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+        )
+
+    def _recover_published_handle_state_for_cleanup(
+        self,
+        permit: CredentialResolutionPermit,
+        *,
+        publication_id: UUID,
+        _authority: object | None = None,
+    ) -> bool:
+        """Independent ledger path for retrying lost-handle cleanup."""
+
+        if _authority is not _TRANSPORT_ATTEMPT_AUTHORITY:
+            raise TypeError("credential cleanup recovery requires transport")
         if (
             type(permit) is not CredentialResolutionPermit
             or type(publication_id) is not UUID
-            or permit._attempt_gate is None
         ):
-            return None
-        gate = permit._attempt_gate
-        if type(gate) is not AttemptGate:
-            return None
-        try:
-            permit.validate_integrity()
-        except (TypeError, ValueError, AttributeError):
-            return None
+            return False
 
-        handle = self._ledger._recover_active_for_permit(
+        recovered = self._ledger._recover_active_state_for_cleanup(
             permit,
             publication_id=publication_id,
         )
-        if handle is None:
-            return None
+        if recovered is None:
+            return False
+        handle, state = recovered
+        gate = state.gate
+        if type(gate) is not AttemptGate:
+            return False
+        gate_terminal = _recover_resolved_gate_for_cleanup(
+            gate,
+            permit,
+            publication_id=publication_id,
+            handle_id=state.handle_id,
+            handle_digest=state.handle_digest,
+        )
+        if gate_terminal:
+            try:
+                self._ledger._force_close_after_gate(handle, state)
+            except BaseException:
+                pass
+        return (
+            gate_terminal
+            and self._ledger._cleanup_state_is_closed(handle, state)
+        )
+
+    def _published_handle_is_closed_for_cleanup(
+        self,
+        permit: CredentialResolutionPermit,
+        *,
+        publication_id: UUID,
+        _authority: object | None = None,
+    ) -> bool:
+        """Observe terminal publication state without a returned handle."""
+
+        if _authority is not _TRANSPORT_ATTEMPT_AUTHORITY:
+            raise TypeError("credential cleanup observation requires transport")
+        if (
+            type(permit) is not CredentialResolutionPermit
+            or type(publication_id) is not UUID
+        ):
+            return False
+        return self._ledger._publication_is_closed_for_cleanup(publication_id)
+
+    def _published_handle_is_exact_for_transport(
+        self,
+        handle: CredentialHandle,
+        *,
+        permit: CredentialResolutionPermit,
+        publication_id: UUID,
+        _authority: object | None = None,
+    ) -> bool:
+        """Attest one returned handle against ledger and Gate snapshots."""
+
+        if _authority is not _TRANSPORT_ATTEMPT_AUTHORITY:
+            raise TypeError("credential publication attestation requires transport")
+        if (
+            type(handle) is not CredentialHandle
+            or type(permit) is not CredentialResolutionPermit
+            or type(publication_id) is not UUID
+        ):
+            return False
+        with self._ledger._lock:
+            state = self._ledger._states.get(handle)
+            if (
+                state is None
+                or state.handle is not handle
+                or state.status != "active"
+                or state.permit is not permit
+                or type(state.gate) is not AttemptGate
+                or state.publication_id != publication_id
+                or type(state.handle_id) is not UUID
+                or type(state.handle_digest) is not Digest256
+                or type(state.secret) is not bytearray
+            ):
+                return False
+            gate = state.gate
+            handle_id = state.handle_id
+            handle_digest = state.handle_digest
         try:
-            published = gate._resolved_credential_handle_is_active(
+            return gate._resolved_credential_handle_is_active(
                 permit,
                 publication_id=publication_id,
-                handle_id=handle.handle_id,
-                handle_digest=handle.handle_digest,
+                handle_id=handle_id,
+                handle_digest=handle_digest,
                 _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
             )
         except BaseException:
-            return None
-        if not published:
-            return None
-        # Refuse a handle that changed while the Gate proof was observed.
-        return (
-            handle
-            if self._ledger._recover_active_for_permit(
-                permit,
-                publication_id=publication_id,
-            )
-            is handle
-            else None
-        )
+            return False
+
+    def _handle_is_closed_for_cleanup(
+        self,
+        handle: CredentialHandle,
+        *,
+        _authority: object | None = None,
+    ) -> bool:
+        """Observe exact ledger terminal state without public handle fields."""
+
+        if _authority is not _TRANSPORT_ATTEMPT_AUTHORITY:
+            raise TypeError("credential cleanup observation requires transport")
+        if type(handle) is not CredentialHandle:
+            return False
+        with self._ledger._lock:
+            state = self._ledger._states.get(handle)
+            if state is None or state.handle is not handle:
+                return False
+        return self._ledger._cleanup_state_is_closed(handle, state)
 
     def close(self, handle: CredentialHandle) -> bool:
         state, permit, gate, integrity_is_valid = self._ledger._release_info(
@@ -1286,6 +1517,7 @@ class CredentialResolver:
         gate_is_terminal = False
         gate_committed_after_error = False
         for handle_id, handle_digest in proof_candidates:
+            transition_error: BaseException | None = None
             try:
                 gate._abandon_resolved_credential_resolution(
                     permit,
@@ -1295,22 +1527,25 @@ class CredentialResolver:
                 )
             except BaseException as error:
                 gate_error = error
-            else:
-                gate_is_terminal = True
-                break
-        if not gate_is_terminal:
+                transition_error = error
             try:
-                gate_is_terminal = gate._credential_resolution_is_terminal(
-                    permit,
-                    _authority=_CREDENTIAL_RESOLVER_AUTHORITY,
+                gate_is_terminal = (
+                    gate._credential_resolution_is_terminal_for_cleanup(
+                        permit,
+                        _authority=_CREDENTIAL_RESOLVER_AUTHORITY,
+                    )
                 )
             except BaseException:
-                pass
-            else:
-                gate_committed_after_error = gate_is_terminal
+                gate_is_terminal = False
+            if gate_is_terminal:
+                gate_committed_after_error = transition_error is not None
+                break
+            if transition_error is None:
+                gate_error = _credential_policy_error()
         if not gate_is_terminal:
             self._ledger._restore_active_after_gate_failure(handle, state)
-            assert gate_error is not None
+            if gate_error is None:
+                gate_error = _credential_policy_error()
             raise gate_error
         changed = False
         close_error: BaseException | None = None
@@ -1343,6 +1578,7 @@ class CredentialResolver:
     ) -> None:
         last_error: BaseException | None = None
         for _ in range(2):
+            transition_error: BaseException | None = None
             try:
                 gate._finish_credential_borrow(
                     attempt_permit,
@@ -1353,20 +1589,21 @@ class CredentialResolver:
                 )
             except BaseException as error:
                 last_error = error
-                try:
-                    active = gate._credential_borrow_is_active(
-                        attempt_permit,
-                        borrow_id=borrow_id,
-                        handle_id=handle_id,
-                        handle_digest=handle_digest,
-                        _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
-                    )
-                except BaseException:
-                    active = True
-                if not active:
-                    return
-            else:
+                transition_error = error
+            try:
+                active = gate._credential_borrow_is_active(
+                    attempt_permit,
+                    borrow_id=borrow_id,
+                    handle_id=handle_id,
+                    handle_digest=handle_digest,
+                    _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+                )
+            except BaseException:
+                active = True
+            if not active:
                 return
+            if transition_error is None:
+                last_error = _credential_policy_error()
         try:
             gate._force_finish_credential_borrow(
                 attempt_permit,
@@ -1377,9 +1614,20 @@ class CredentialResolver:
             )
         except BaseException as error:
             last_error = error
-        else:
+        try:
+            active = gate._credential_borrow_is_active(
+                attempt_permit,
+                borrow_id=borrow_id,
+                handle_id=handle_id,
+                handle_digest=handle_digest,
+                _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+            )
+        except BaseException:
+            active = True
+        if not active:
             return
-        assert last_error is not None
+        if last_error is None:
+            last_error = _credential_policy_error()
         raise last_error
 
     def _borrow_once(
@@ -1414,6 +1662,18 @@ class CredentialResolver:
                 handle_digest=handle_digest,
                 _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
             )
+            try:
+                borrow_is_active = gate._credential_borrow_is_active(
+                    attempt_permit,
+                    borrow_id=borrow_id,
+                    handle_id=handle_id,
+                    handle_digest=handle_digest,
+                    _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+                )
+            except BaseException:
+                borrow_is_active = False
+            if not borrow_is_active:
+                _raise_credential_policy_error()
         except BaseException as primary:
             primary_traceback = primary.__traceback__
             try:

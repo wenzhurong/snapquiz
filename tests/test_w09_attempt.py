@@ -27,6 +27,8 @@ from snapquiz.runtime.attempt import (
     CredentialResolutionPermit,
     _CREDENTIAL_RESOLVER_AUTHORITY,
     _TRANSPORT_ATTEMPT_AUTHORITY,
+    _AttemptPermitState,
+    _CredentialPermitState,
     _attempt_permit_payload,
     _credential_permit_payload,
 )
@@ -194,6 +196,38 @@ def _reserve(runtime, gate: AttemptGate) -> tuple[
     )
 
 
+def _recover_resolved_credential(
+    gate: AttemptGate,
+    permit: CredentialResolutionPermit,
+) -> bool:
+    handle_id, handle_digest = _handle_proof(permit)
+    return gate._recover_resolved_credential_for_cleanup(
+        permit,
+        publication_id=_claim_id(permit),
+        handle_id=handle_id,
+        handle_digest=handle_digest,
+        _authority=_CREDENTIAL_RESOLVER_AUTHORITY,
+    )
+
+
+def _recover_active_attempt(
+    gate: AttemptGate,
+    credential: CredentialResolutionPermit,
+    attempt: AttemptPermit,
+) -> bool:
+    handle_id, handle_digest = _handle_proof(credential)
+    return gate._recover_attempt_for_cleanup(
+        attempt,
+        credential_permit=credential,
+        credential_handle_id=handle_id,
+        credential_handle_digest=handle_digest,
+        claim_id=_transport_claim_id(attempt),
+        guard_id=None,
+        guard_digest=None,
+        _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+    )
+
+
 def _mutated_prepared(value: PreparedOutbound) -> PreparedOutbound:
     return PreparedOutbound(
         plan_id=value.plan_id,
@@ -221,6 +255,306 @@ def _slot_clone(value):
 
 
 class W09AttemptGateTest(unittest.TestCase):
+    def test_noop_authority_release_rolls_back_terminal_commits(self):
+        def no_op(*args, **kwargs):
+            del args, kwargs
+
+        with self.subTest(owner="credential"):
+            runtime = _make_runtime()
+            gate = AttemptGate()
+            credential = _authorize(runtime, gate)
+
+            with patch.object(
+                CredentialResolutionPermit,
+                "_release_authority_refs",
+                new=no_op,
+            ):
+                with self.assertRaisesRegex(
+                    EndpointPolicyError,
+                    "authority refs",
+                ):
+                    gate.abandon_credential_resolution(credential)
+
+            state = gate._credential_permits[credential.permit_id]
+            self.assertEqual(state.status, "authorized")
+            self.assertFalse(credential._released)
+            self.assertIs(credential._prepared, runtime.prepared)
+            self.assertEqual(
+                state.recovery_refs(),
+                (runtime.call_context, runtime.context_ledger),
+            )
+            self.assertEqual(
+                gate._active_by_session[credential.session_id],
+                credential.permit_id,
+            )
+            self.assertEqual(
+                runtime.context_ledger.safe_metadata()[
+                    "active_gate_activity_count"
+                ],
+                1,
+            )
+
+            self.assertTrue(gate.abandon_credential_resolution(credential))
+            self.assertEqual(state.status, "abandoned")
+            self.assertEqual(state.recovery_refs(), (None, None))
+
+        with self.subTest(owner="attempt"):
+            runtime = _make_runtime()
+            gate = AttemptGate()
+            credential, attempt = _reserve(runtime, gate)
+            claim_id = _transport_claim_id(attempt)
+            gate._claim_attempt(
+                attempt,
+                claim_id=claim_id,
+                _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+            )
+
+            with patch.object(
+                AttemptPermit,
+                "_release_authority_refs",
+                new=no_op,
+            ):
+                with self.assertRaisesRegex(
+                    EndpointPolicyError,
+                    "authority refs",
+                ):
+                    gate.finish_attempt(
+                        attempt,
+                        claim_id=claim_id,
+                        _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+                    )
+
+            state = gate._attempt_permits[attempt.attempt_permit_id]
+            credential_state = gate._credential_permits[credential.permit_id]
+            self.assertEqual(state.status, "io_claimed")
+            self.assertEqual(credential_state.status, "consumed")
+            self.assertFalse(attempt._released)
+            self.assertFalse(credential._released)
+            self.assertEqual(
+                state.recovery_refs(),
+                (
+                    credential,
+                    runtime.call_context,
+                    runtime.context_ledger,
+                    attempt._reservation,
+                ),
+            )
+            self.assertEqual(
+                credential_state.recovery_refs(),
+                (runtime.call_context, runtime.context_ledger),
+            )
+            self.assertEqual(
+                runtime.context_ledger.safe_metadata()[
+                    "in_flight_attempt_count"
+                ],
+                1,
+            )
+
+            self.assertTrue(
+                gate.finish_attempt(
+                    attempt,
+                    claim_id=claim_id,
+                    _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+                )
+            )
+            self.assertEqual(state.status, "finished")
+            self.assertEqual(
+                state.recovery_refs(),
+                (None, None, None, None),
+            )
+
+    def test_noop_recovery_ref_clear_rolls_back_recovered_cleanup(self):
+        def no_op(*args, **kwargs):
+            del args, kwargs
+
+        with self.subTest(owner="credential"):
+            runtime = _make_runtime()
+            gate = AttemptGate()
+            credential = _authorize(runtime, gate)
+            _resolve(gate, credential)
+            state = gate._credential_permits[credential.permit_id]
+
+            with patch.object(
+                _CredentialPermitState,
+                "clear_recovery_refs",
+                new=no_op,
+            ):
+                self.assertFalse(
+                    _recover_resolved_credential(gate, credential)
+                )
+
+            self.assertEqual(state.status, "resolved")
+            self.assertFalse(credential._released)
+            self.assertEqual(
+                state.recovery_refs(),
+                (runtime.call_context, runtime.context_ledger),
+            )
+            self.assertEqual(
+                gate._active_by_session[credential.session_id],
+                credential.permit_id,
+            )
+            self.assertTrue(_recover_resolved_credential(gate, credential))
+            self.assertEqual(state.status, "abandoned")
+            self.assertEqual(state.recovery_refs(), (None, None))
+
+        with self.subTest(owner="attempt"):
+            runtime = _make_runtime()
+            gate = AttemptGate()
+            credential, attempt = _reserve(runtime, gate)
+            state = gate._attempt_permits[attempt.attempt_permit_id]
+            credential_state = gate._credential_permits[credential.permit_id]
+            reservation = attempt._reservation
+
+            with patch.object(
+                _AttemptPermitState,
+                "clear_recovery_refs",
+                new=no_op,
+            ):
+                self.assertFalse(
+                    _recover_active_attempt(gate, credential, attempt)
+                )
+
+            self.assertEqual(state.status, "active")
+            self.assertEqual(credential_state.status, "consumed")
+            self.assertFalse(attempt._released)
+            self.assertFalse(credential._released)
+            self.assertEqual(
+                state.recovery_refs(),
+                (
+                    credential,
+                    runtime.call_context,
+                    runtime.context_ledger,
+                    reservation,
+                ),
+            )
+            self.assertEqual(
+                credential_state.recovery_refs(),
+                (runtime.call_context, runtime.context_ledger),
+            )
+            self.assertTrue(
+                _recover_active_attempt(gate, credential, attempt)
+            )
+            self.assertEqual(state.status, "abandoned")
+            self.assertEqual(
+                state.recovery_refs(),
+                (None, None, None, None),
+            )
+
+    def test_context_noop_action_is_rejected_by_normal_cleanup(self):
+        def no_op(*args, **kwargs):
+            del args, kwargs
+
+        with self.subTest(owner="credential"):
+            runtime = _make_runtime()
+            gate = AttemptGate()
+            credential = _authorize(runtime, gate)
+            state = gate._credential_permits[credential.permit_id]
+
+            with patch.object(
+                CallContextLedger,
+                "_finish_gate_activity",
+                new=no_op,
+            ):
+                with self.assertRaisesRegex(
+                    EndpointPolicyError,
+                    "transaction",
+                ):
+                    gate.abandon_credential_resolution(credential)
+
+            self.assertEqual(state.status, "authorized")
+            self.assertFalse(credential._released)
+            self.assertEqual(
+                state.recovery_refs(),
+                (runtime.call_context, runtime.context_ledger),
+            )
+            self.assertTrue(gate.abandon_credential_resolution(credential))
+            self.assertEqual(state.status, "abandoned")
+
+        with self.subTest(owner="attempt"):
+            runtime = _make_runtime()
+            gate = AttemptGate()
+            _, attempt = _reserve(runtime, gate)
+            claim_id = _transport_claim_id(attempt)
+            gate._claim_attempt(
+                attempt,
+                claim_id=claim_id,
+                _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+            )
+            state = gate._attempt_permits[attempt.attempt_permit_id]
+
+            with patch.object(
+                CallContextLedger,
+                "_finish_attempt_and_activity",
+                new=no_op,
+            ):
+                with self.assertRaisesRegex(
+                    EndpointPolicyError,
+                    "transaction",
+                ):
+                    gate.finish_attempt(
+                        attempt,
+                        claim_id=claim_id,
+                        _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+                    )
+
+            self.assertEqual(state.status, "io_claimed")
+            self.assertFalse(attempt._released)
+            self.assertTrue(
+                gate.finish_attempt(
+                    attempt,
+                    claim_id=claim_id,
+                    _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+                )
+            )
+            self.assertEqual(state.status, "finished")
+
+    def test_context_noop_action_is_rejected_by_recovered_cleanup(self):
+        def no_op(*args, **kwargs):
+            del args, kwargs
+
+        with self.subTest(owner="credential"):
+            runtime = _make_runtime()
+            gate = AttemptGate()
+            credential = _authorize(runtime, gate)
+            _resolve(gate, credential)
+            state = gate._credential_permits[credential.permit_id]
+
+            with patch.object(
+                CallContextLedger,
+                "_finish_gate_activity",
+                new=no_op,
+            ):
+                self.assertFalse(
+                    _recover_resolved_credential(gate, credential)
+                )
+
+            self.assertEqual(state.status, "resolved")
+            self.assertFalse(credential._released)
+            self.assertTrue(_recover_resolved_credential(gate, credential))
+            self.assertEqual(state.status, "abandoned")
+
+        with self.subTest(owner="attempt"):
+            runtime = _make_runtime()
+            gate = AttemptGate()
+            credential, attempt = _reserve(runtime, gate)
+            state = gate._attempt_permits[attempt.attempt_permit_id]
+
+            with patch.object(
+                CallContextLedger,
+                "_finish_attempt_and_activity",
+                new=no_op,
+            ):
+                self.assertFalse(
+                    _recover_active_attempt(gate, credential, attempt)
+                )
+
+            self.assertEqual(state.status, "active")
+            self.assertFalse(attempt._released)
+            self.assertTrue(
+                _recover_active_attempt(gate, credential, attempt)
+            )
+            self.assertEqual(state.status, "abandoned")
+
     def test_credential_cleanup_fault_rolls_back_and_is_retryable(self):
         runtime = _make_runtime()
         gate = AttemptGate()
@@ -761,6 +1095,42 @@ class W09AttemptGateTest(unittest.TestCase):
             1,
         )
 
+    def test_budget_reservation_normal_noop_restores_resolved_state(self):
+        runtime = _make_runtime()
+        gate = AttemptGate()
+        credential = _authorize(runtime, gate)
+        _resolve(gate, credential)
+        handle_id, handle_digest = _handle_proof(credential)
+
+        with patch.object(
+            CallContextLedger,
+            "_reserve_attempt_budgets",
+            return_value=None,
+        ):
+            with self.assertRaisesRegex(
+                EndpointPolicyError,
+                "reservation transaction 未提交",
+            ):
+                gate.reserve_attempt(
+                    credential_permit=credential,
+                    credential_handle_id=handle_id,
+                    credential_handle_digest=handle_digest,
+                )
+
+        credential_state = gate._credential_permits[credential.permit_id]
+        self.assertEqual(credential_state.status, "resolved")
+        self.assertEqual(gate._attempt_permits, {})
+        self.assertEqual(
+            runtime.context_ledger.safe_metadata()["in_flight_attempt_count"],
+            0,
+        )
+        self.assertEqual(
+            runtime.call_context.global_network_budget.snapshot().consumed,
+            0,
+        )
+        self.assertTrue(_abandon_resolved(gate, credential))
+        self.assertTrue(runtime.context_ledger.close(runtime.call_context))
+
     def test_attempt_ledger_publish_fault_restores_resolved_without_phantom(self):
         class InsertThenRaiseDict(dict):
             def __init__(self, values):
@@ -931,6 +1301,40 @@ class W09AttemptGateTest(unittest.TestCase):
             )
         )
 
+    def test_transport_claim_normal_noop_rolls_back_transient_state(self):
+        runtime = _make_runtime()
+        gate = AttemptGate()
+        _, attempt = _reserve(runtime, gate)
+        claim_id = _transport_claim_id(attempt)
+
+        with patch.object(
+            AttemptGate,
+            "_run_authority_path",
+            return_value=None,
+        ):
+            with self.assertRaisesRegex(
+                EndpointPolicyError,
+                "claim transaction 未提交",
+            ):
+                gate._claim_attempt(
+                    attempt,
+                    claim_id=claim_id,
+                    _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+                )
+
+        state = gate._attempt_permits[attempt.attempt_permit_id]
+        self.assertEqual(state.status, "active")
+        self.assertIsNone(state.transport_claim_id)
+        self.assertTrue(
+            gate.abandon_attempt(
+                attempt,
+                _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+            )
+        )
+        metadata = runtime.context_ledger.safe_metadata()
+        self.assertEqual(metadata["in_flight_attempt_count"], 0)
+        self.assertEqual(metadata["active_gate_activity_count"], 0)
+
     def test_guard_and_dns_commit_are_owner_bound_and_zero_io(self):
         runtime = _make_runtime()
         gate = AttemptGate()
@@ -1085,6 +1489,60 @@ class W09AttemptGateTest(unittest.TestCase):
                 _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
             )
         )
+
+    def test_dns_start_normal_noop_rolls_back_transient_state(self):
+        runtime = _make_runtime()
+        gate = AttemptGate()
+        _, attempt = _reserve(runtime, gate)
+        claim_id = _transport_claim_id(attempt)
+        guard_id, guard_digest = _terminal_guard_proof(attempt)
+        dns_start_id = _dns_start_id(attempt)
+        gate._claim_attempt(
+            attempt,
+            claim_id=claim_id,
+            _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+        )
+        gate._bind_terminal_guard(
+            attempt,
+            claim_id=claim_id,
+            guard_id=guard_id,
+            guard_digest=guard_digest,
+            _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+        )
+
+        with patch.object(
+            AttemptGate,
+            "_run_authority_path",
+            return_value=None,
+        ):
+            with self.assertRaisesRegex(
+                EndpointPolicyError,
+                "DNS START transaction 未提交",
+            ):
+                gate._commit_dns_start(
+                    attempt,
+                    claim_id=claim_id,
+                    guard_id=guard_id,
+                    guard_digest=guard_digest,
+                    start_id=dns_start_id,
+                    _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+                )
+
+        state = gate._attempt_permits[attempt.attempt_permit_id]
+        self.assertEqual(state.status, "io_claimed")
+        self.assertIsNone(state.dns_start_id)
+        self.assertTrue(
+            gate.finish_attempt(
+                attempt,
+                claim_id=claim_id,
+                guard_id=guard_id,
+                guard_digest=guard_digest,
+                _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+            )
+        )
+        metadata = runtime.context_ledger.safe_metadata()
+        self.assertEqual(metadata["in_flight_attempt_count"], 0)
+        self.assertEqual(metadata["active_gate_activity_count"], 0)
 
     def test_cancel_before_dns_start_rolls_back_commit_and_stays_zero_io(self):
         runtime = _make_runtime()

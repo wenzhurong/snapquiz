@@ -26,6 +26,7 @@ from snapquiz.runtime.context import CancellationReason
 from snapquiz.transport.credentials import (
     CredentialHandle,
     CredentialResolver,
+    _CredentialLedger,
     _TRANSPORT_CREDENTIAL_AUTHORITY,
 )
 from snapquiz.transport.session import SendSessionFactory, SendSessionLedger
@@ -293,6 +294,98 @@ class W09CredentialResolverTest(unittest.TestCase):
         self.assertTrue(resolver.close(handles[0]))
         self.assertFalse(resolver.close(handles[0]))
         self.assert_zero_budget(runtime)
+
+    def test_credential_claim_normal_noop_never_reads_secret(self):
+        runtime = _make_runtime()
+        gate = AttemptGate()
+        credential = _authorize(runtime, gate)
+        source = _FakeSource(bytearray(_VALID_SECRET))
+        resolver = CredentialResolver(source)
+
+        with patch.object(
+            AttemptGate,
+            "_run_authority_path",
+            return_value=None,
+        ):
+            with self.assertRaisesRegex(
+                EndpointPolicyError,
+                "credential claim transaction 未提交",
+            ):
+                resolver.resolve(credential)
+
+        self.assertEqual(source.calls, [])
+        self.assertEqual(source.returned_buffers, [])
+        state = gate._credential_permits[credential.permit_id]
+        self.assertEqual(state.status, "authorized")
+        self.assertIsNone(state.resolver_claim_id)
+        self.assertTrue(gate.abandon_credential_resolution(credential))
+        self.assert_terminal_resolver_failure(runtime, credential)
+
+    def test_credential_claim_wrapper_normal_noop_never_reads_secret(self):
+        runtime = _make_runtime()
+        gate = AttemptGate()
+        credential = _authorize(runtime, gate)
+        source = _FakeSource(bytearray(_VALID_SECRET))
+        resolver = CredentialResolver(source)
+
+        with patch.object(
+            AttemptGate,
+            "_claim_credential_resolution",
+            return_value=credential,
+        ):
+            with self.assertRaises(EndpointPolicyError):
+                resolver.resolve(credential)
+
+        self.assertEqual(source.calls, [])
+        self.assertEqual(source.returned_buffers, [])
+        self.assertEqual(resolver._ledger._states, {})
+        state = gate._credential_permits[credential.permit_id]
+        self.assertEqual(state.status, "authorized")
+        self.assertIsNone(state.resolver_claim_id)
+        self.assertEqual(gate.safe_metadata()["active_session_count"], 1)
+        self.assertTrue(gate.abandon_credential_resolution(credential))
+        self.assert_terminal_resolver_failure(runtime, credential)
+
+    def test_claim_commit_then_raise_recovery_noop_uses_state_path(self):
+        runtime = _make_runtime()
+        gate = AttemptGate()
+        credential = _authorize(runtime, gate)
+        source = _FakeSource(bytearray(_VALID_SECRET))
+        resolver = CredentialResolver(source)
+        original_claim = AttemptGate._claim_credential_resolution
+
+        def claim_then_raise(selected, *args, **kwargs):
+            original_claim(selected, *args, **kwargs)
+            raise _FatalValidationError("synthetic post-claim failure")
+
+        with (
+            patch.object(
+                AttemptGate,
+                "_claim_credential_resolution",
+                new=claim_then_raise,
+            ),
+            patch.object(
+                AttemptGate,
+                "_recover_claimed_credential_for_cleanup",
+                return_value=True,
+            ) as recovery,
+        ):
+            with self.assertRaisesRegex(
+                _FatalValidationError,
+                "post-claim",
+            ):
+                resolver.resolve(credential)
+
+        self.assertEqual(recovery.call_count, 2)
+        self.assertEqual(source.calls, [])
+        self.assertEqual(source.returned_buffers, [])
+        self.assertEqual(resolver._ledger._states, {})
+        state = gate._credential_permits[credential.permit_id]
+        self.assertEqual(state.status, "abandoned")
+        self.assertIsNone(state.resolver_claim_id)
+        self.assertIsNone(state.resolved_publication_id)
+        self.assertEqual(gate.safe_metadata()["active_session_count"], 0)
+        self.assert_terminal_resolver_failure(runtime, credential)
 
     def test_attempt_cannot_reserve_before_resolve_publishes_handle_proof(self):
         runtime = _make_runtime()
@@ -905,6 +998,109 @@ class W09CredentialResolverTest(unittest.TestCase):
             )
         )
 
+    def test_borrow_begin_normal_noop_never_exposes_secret(self):
+        runtime = _make_runtime()
+        gate = AttemptGate()
+        credential = _authorize(runtime, gate)
+        resolver = CredentialResolver(_FakeSource(bytearray(_VALID_SECRET)))
+        handle = resolver.resolve(credential)
+        attempt = gate.reserve_attempt(
+            credential_permit=credential,
+            credential_handle_id=handle.handle_id,
+            credential_handle_digest=handle.handle_digest,
+        )
+        gate._claim_attempt(
+            attempt,
+            claim_id=_transport_claim_id(attempt),
+            _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+        )
+        action_calls = []
+
+        with patch.object(
+            AttemptGate,
+            "_begin_credential_borrow",
+            return_value=None,
+        ):
+            with self.assertRaises(EndpointPolicyError):
+                resolver._borrow_once(
+                    handle,
+                    attempt,
+                    lambda view: action_calls.append(bytes(view)),
+                    _authority=_TRANSPORT_CREDENTIAL_AUTHORITY,
+                )
+
+        self.assertEqual(action_calls, [])
+        self.assertFalse(_is_closed(handle))
+        self.assertIsNone(
+            gate._attempt_permits[
+                attempt.attempt_permit_id
+            ].credential_borrow_id
+        )
+        self.assertEqual(
+            resolver._borrow_once(
+                handle,
+                attempt,
+                lambda view: bytes(view),
+                _authority=_TRANSPORT_CREDENTIAL_AUTHORITY,
+            ),
+            _VALID_SECRET,
+        )
+        self.assertTrue(
+            gate.finish_attempt(
+                attempt,
+                claim_id=_transport_claim_id(attempt),
+                _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+            )
+        )
+
+    def test_borrow_finish_normal_noop_uses_force_and_observer(self):
+        runtime = _make_runtime()
+        gate = AttemptGate()
+        credential = _authorize(runtime, gate)
+        resolver = CredentialResolver(_FakeSource(bytearray(_VALID_SECRET)))
+        handle = resolver.resolve(credential)
+        attempt = gate.reserve_attempt(
+            credential_permit=credential,
+            credential_handle_id=handle.handle_id,
+            credential_handle_digest=handle.handle_digest,
+        )
+        gate._claim_attempt(
+            attempt,
+            claim_id=_transport_claim_id(attempt),
+            _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+        )
+
+        with patch.object(
+            AttemptGate,
+            "_finish_credential_borrow",
+            return_value=None,
+        ) as finish:
+            self.assertEqual(
+                resolver._borrow_once(
+                    handle,
+                    attempt,
+                    lambda view: bytes(view),
+                    _authority=_TRANSPORT_CREDENTIAL_AUTHORITY,
+                ),
+                _VALID_SECRET,
+            )
+
+        self.assertEqual(finish.call_count, 2)
+        self.assertTrue(_is_closed(handle))
+        self.assertIsNone(resolver._ledger._states[handle].secret)
+        self.assertIsNone(
+            gate._attempt_permits[
+                attempt.attempt_permit_id
+            ].credential_borrow_id
+        )
+        self.assertTrue(
+            gate.finish_attempt(
+                attempt,
+                claim_id=_transport_claim_id(attempt),
+                _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+            )
+        )
+
     def test_borrow_finish_faults_release_marker_after_secret_is_closed(self):
         original_finish = AttemptGate._finish_credential_borrow
 
@@ -993,6 +1189,36 @@ class W09CredentialResolverTest(unittest.TestCase):
         self.assertFalse(_is_closed(handle))
         self.assertTrue(resolver.close(handle))
 
+    def test_close_gate_normal_noop_restores_active_handle(self):
+        runtime = _make_runtime()
+        gate = AttemptGate()
+        credential = _authorize(runtime, gate)
+        source = _FakeSource(bytearray(_VALID_SECRET))
+        resolver = CredentialResolver(source)
+        handle = resolver.resolve(credential)
+
+        with patch.object(
+            AttemptGate,
+            "_abandon_resolved_credential_resolution",
+            return_value=None,
+        ):
+            with self.assertRaises(EndpointPolicyError):
+                resolver.close(handle)
+
+        state = resolver._ledger._states[handle]
+        self.assertEqual(state.status, "active")
+        self.assertEqual(bytes(state.secret), _VALID_SECRET)
+        credential_state = gate._credential_permits[credential.permit_id]
+        self.assertEqual(credential_state.status, "resolved")
+        self.assertEqual(gate.safe_metadata()["active_session_count"], 1)
+        self.assertFalse(_is_closed(handle))
+
+        self.assertTrue(resolver.close(handle))
+        self.assertTrue(_is_closed(handle))
+        self.assertIsNone(state.secret)
+        self.assertEqual(source.returned_buffers, [bytearray()])
+        self.assert_terminal_resolver_failure(runtime, credential)
+
     def test_validation_base_exception_zeroizes_source_and_gate_activity(self):
         class FatalPattern:
             @staticmethod
@@ -1023,7 +1249,9 @@ class W09CredentialResolverTest(unittest.TestCase):
         credential = _authorize(runtime, gate)
         source = _FakeSource(bytearray(b"bad token"))
         resolver = CredentialResolver(source)
-        original_fail = AttemptGate._fail_credential_resolution
+        original_fail = (
+            AttemptGate._recover_claimed_credential_for_cleanup
+        )
         fail_calls = 0
 
         def fail_once(selected, *args, **kwargs):
@@ -1035,7 +1263,7 @@ class W09CredentialResolverTest(unittest.TestCase):
 
         with patch.object(
             AttemptGate,
-            "_fail_credential_resolution",
+            "_recover_claimed_credential_for_cleanup",
             new=fail_once,
         ):
             with self.assertRaises(ConfigError):
@@ -1061,7 +1289,7 @@ class W09CredentialResolverTest(unittest.TestCase):
         resolver = CredentialResolver(source)
         original_confirm = AttemptGate._confirm_credential_resolution
         original_abandon = (
-            AttemptGate._abandon_resolved_credential_resolution
+            AttemptGate._recover_resolved_credential_for_cleanup
         )
         abandon_calls = 0
 
@@ -1084,7 +1312,7 @@ class W09CredentialResolverTest(unittest.TestCase):
             ),
             patch.object(
                 AttemptGate,
-                "_abandon_resolved_credential_resolution",
+                "_recover_resolved_credential_for_cleanup",
                 new=abandon_once,
             ),
         ):
@@ -1107,6 +1335,148 @@ class W09CredentialResolverTest(unittest.TestCase):
         )
         for buffer in source.returned_buffers:
             self.assertEqual(buffer, bytearray())
+
+    def test_confirm_noop_fails_closed_and_discards_real_handle_secret(self):
+        runtime = _make_runtime()
+        gate = AttemptGate()
+        credential = _authorize(runtime, gate)
+        source = _FakeSource(bytearray(_VALID_SECRET))
+        resolver = CredentialResolver(source)
+        original_issue = _CredentialLedger._issue
+        issued: list[tuple[CredentialHandle, object, bytearray]] = []
+
+        def capture_issue(selected, *args, **kwargs):
+            handle = original_issue(selected, *args, **kwargs)
+            state = selected._states[handle]
+            issued.append((handle, state, state.secret))
+            return handle
+
+        def no_op_confirm(*args, **kwargs):
+            del args, kwargs
+
+        with (
+            patch.object(_CredentialLedger, "_issue", new=capture_issue),
+            patch.object(
+                AttemptGate,
+                "_confirm_credential_resolution",
+                new=no_op_confirm,
+            ),
+            patch.object(socket, "getaddrinfo") as getaddrinfo,
+            patch.object(socket, "socket") as socket_factory,
+        ):
+            with self.assertRaises(EndpointPolicyError):
+                resolver.resolve(credential)
+
+        self.assertEqual(len(issued), 1)
+        handle, handle_state, secret = issued[0]
+        self.assertNotIn(handle, resolver._ledger._states)
+        self.assertEqual(handle_state.status, "closed")
+        self.assertIsNone(handle_state.secret)
+        self.assertIsNone(handle_state.permit)
+        self.assertIsNone(handle_state.gate)
+        self.assertIsNone(handle_state.publication_id)
+        self.assertEqual(secret, bytearray())
+        self.assertEqual(source.returned_buffers, [bytearray()])
+        state = gate._credential_permits[credential.permit_id]
+        self.assertEqual(state.status, "abandoned")
+        self.assertIsNone(state.resolver_claim_id)
+        self.assertIsNone(state.resolved_publication_id)
+        self.assertEqual(gate._attempt_permits, {})
+        self.assert_terminal_resolver_failure(runtime, credential)
+        getaddrinfo.assert_not_called()
+        socket_factory.assert_not_called()
+
+    def test_attestation_failure_recovery_noop_uses_state_path(self):
+        runtime = _make_runtime()
+        gate = AttemptGate()
+        credential = _authorize(runtime, gate)
+        source = _FakeSource(bytearray(_VALID_SECRET))
+        resolver = CredentialResolver(source)
+        original_issue = _CredentialLedger._issue
+        issued: list[tuple[CredentialHandle, object, bytearray]] = []
+
+        def capture_issue(selected, *args, **kwargs):
+            handle = original_issue(selected, *args, **kwargs)
+            state = selected._states[handle]
+            issued.append((handle, state, state.secret))
+            return handle
+
+        with (
+            patch.object(_CredentialLedger, "_issue", new=capture_issue),
+            patch.object(
+                CredentialResolver,
+                "_published_handle_is_exact_for_transport",
+                return_value=False,
+            ),
+            patch.object(
+                AttemptGate,
+                "_recover_resolved_credential_for_cleanup",
+                return_value=True,
+            ) as recovery,
+        ):
+            with self.assertRaises(EndpointPolicyError):
+                resolver.resolve(credential)
+
+        self.assertEqual(recovery.call_count, 2)
+        self.assertEqual(len(issued), 1)
+        handle, handle_state, secret = issued[0]
+        self.assertNotIn(handle, resolver._ledger._states)
+        self.assertEqual(handle_state.status, "closed")
+        self.assertIsNone(handle_state.secret)
+        self.assertIsNone(handle_state.permit)
+        self.assertIsNone(handle_state.gate)
+        self.assertIsNone(handle_state.publication_id)
+        self.assertEqual(secret, bytearray())
+        self.assertEqual(source.returned_buffers, [bytearray()])
+        state = gate._credential_permits[credential.permit_id]
+        self.assertEqual(state.status, "abandoned")
+        self.assertIsNone(state.resolver_claim_id)
+        self.assertIsNone(state.resolved_publication_id)
+        self.assertEqual(gate.safe_metadata()["active_session_count"], 0)
+        self.assert_terminal_resolver_failure(runtime, credential)
+        with self.assertRaises(EndpointPolicyError):
+            gate.reserve_attempt(
+                credential_permit=credential,
+                credential_handle_id=handle.handle_id,
+                credential_handle_digest=handle.handle_digest,
+            )
+
+    def test_confirm_transaction_normal_noop_rolls_back_then_cleans(self):
+        runtime = _make_runtime()
+        gate = AttemptGate()
+        credential = _authorize(runtime, gate)
+        source = _FakeSource(bytearray(_VALID_SECRET))
+        resolver = CredentialResolver(source)
+        original = AttemptGate._run_authority_path
+
+        def no_op_confirmation(selected, **kwargs):
+            action = kwargs["final_action"]
+            if (
+                "_confirm_credential_resolution.<locals>.confirm"
+                in action.__qualname__
+            ):
+                return None
+            return original(selected, **kwargs)
+
+        with patch.object(
+            AttemptGate,
+            "_run_authority_path",
+            new=no_op_confirmation,
+        ):
+            with self.assertRaisesRegex(
+                EndpointPolicyError,
+                "confirmation transaction 未提交",
+            ):
+                resolver.resolve(credential)
+
+        self.assertEqual(source.calls, [GLM_CREDENTIAL_REF])
+        self.assertEqual(source.returned_buffers, [bytearray()])
+        self.assertEqual(resolver._ledger._states, {})
+        state = gate._credential_permits[credential.permit_id]
+        self.assertEqual(state.status, "abandoned")
+        self.assertIsNone(state.resolver_claim_id)
+        self.assertIsNone(state.resolved_publication_id)
+        self.assert_terminal_resolver_failure(runtime, credential)
 
     def test_blocked_read_cancel_rejects_post_read_and_zeroizes(self):
         runtime = _make_runtime()

@@ -12,6 +12,7 @@ from threading import RLock
 from uuid import UUID, uuid4
 
 from snapquiz.domain._validation import require_uuid, runtime_final
+from snapquiz.domain.digest import Digest256
 from snapquiz.domain.errors import EndpointPolicyError
 from snapquiz.runtime.attempt import (
     AttemptGate,
@@ -36,6 +37,9 @@ from snapquiz.transport.resolver import (
     PreAttemptResolverGuard,
     ResolverHelperLauncher,
     ResolverResultReceipt,
+    _ResolverLifecycleLedger,
+    _RESOLVER_LIFECYCLE_AUTHORITY,
+    _cleanup_guard,
 )
 
 
@@ -52,53 +56,6 @@ def _coordinator_error(message: str) -> EndpointPolicyError:
     )
 
 
-def _observe_attempt_terminal(
-    gate: AttemptGate,
-    attempt: AttemptPermit,
-) -> bool:
-    try:
-        return gate._attempt_is_terminal(
-            attempt,
-            _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
-        )
-    except BaseException:
-        return False
-
-
-def _finish_owned_attempt(
-    gate: AttemptGate,
-    attempt: AttemptPermit,
-    *,
-    claim_id: UUID,
-    guard: AttemptTerminalGuard | None,
-) -> tuple[bool, BaseException | None]:
-    try:
-        changed = gate.finish_attempt(
-            attempt,
-            claim_id=claim_id,
-            guard_id=None if guard is None else guard.terminal_guard_id,
-            guard_digest=None if guard is None else guard.terminal_guard_digest,
-            _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
-        )
-    except BaseException as error:
-        return _observe_attempt_terminal(gate, attempt), error
-    return changed or _observe_attempt_terminal(gate, attempt), None
-
-
-def _abandon_unclaimed_attempt(
-    gate: AttemptGate,
-    attempt: AttemptPermit,
-) -> tuple[bool, BaseException | None]:
-    try:
-        changed = gate.abandon_attempt(
-            attempt,
-            _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
-        )
-    except BaseException as error:
-        return _observe_attempt_terminal(gate, attempt), error
-    return changed or _observe_attempt_terminal(gate, attempt), None
-
-
 def _cleanup_failed_coordination(
     *,
     gate: AttemptGate,
@@ -107,8 +64,14 @@ def _cleanup_failed_coordination(
     pre_guard: PreAttemptResolverGuard | None,
     terminal_guard: AttemptTerminalGuard | None,
     credential_handle: CredentialHandle | None,
+    credential_publication_id: UUID | None = None,
+    credential_handle_id: UUID | None = None,
+    credential_handle_digest: Digest256 | None = None,
     attempt: AttemptPermit | None,
-    claim_id: UUID,
+    claim_id: UUID | None,
+    terminal_guard_id: UUID | None = None,
+    terminal_guard_digest: Digest256 | None = None,
+    helper_terminal_hint: bool = False,
 ) -> None:
     """Best-effort cleanup without ever changing the selected primary error.
 
@@ -119,8 +82,8 @@ def _cleanup_failed_coordination(
     """
 
     helper_owner: object | None = terminal_guard or pre_guard
-    helper_terminal = helper_owner is None
-    if helper_owner is not None:
+    helper_terminal = helper_terminal_hint or helper_owner is None
+    if helper_owner is not None and not helper_terminal:
         try:
             helper_owner.cleanup()  # type: ignore[union-attr]
         except BaseException:
@@ -139,42 +102,91 @@ def _cleanup_failed_coordination(
         return
 
     attempt_terminal = False
-    if attempt is not None:
-        guard_candidates: tuple[AttemptTerminalGuard | None, ...]
-        if terminal_guard is not None:
-            guard_candidates = (terminal_guard, None)
-        else:
-            guard_candidates = (None,)
-
-        # Each candidate is owner/proof exact and a rejection is side-effect
-        # free.  Trying both shapes is therefore safer than trusting an
-        # observer after a commit-then-raise fault: a bound Gate accepts only
-        # the exact guard, while a pre-bind Gate accepts only the no-guard
-        # shape.  If the claim itself never committed, both reject and exact
-        # active-attempt abandonment remains available.
-        for selected_guard in guard_candidates:
-            attempt_terminal, _ = _finish_owned_attempt(
-                gate,
-                attempt,
-                claim_id=claim_id,
-                guard=selected_guard,
-            )
-            if attempt_terminal:
-                break
-        if not attempt_terminal:
-            attempt_terminal, _ = _abandon_unclaimed_attempt(gate, attempt)
-
-    if credential_handle is not None and (
-        attempt is None or attempt_terminal
-    ):
-        # A consumed handle becomes closable only after its AttemptGate state
-        # is terminal.  Retain it as the recovery anchor when owner-bound Gate
-        # completion is not proven.
+    if attempt is not None and type(claim_id) is UUID:
         try:
-            credential_resolver.close(credential_handle)
+            attempt_terminal = gate._recover_attempt_for_cleanup(
+                attempt,
+                credential_permit=credential_permit,
+                credential_handle_id=credential_handle_id,
+                credential_handle_digest=credential_handle_digest,
+                claim_id=claim_id,
+                guard_id=terminal_guard_id,
+                guard_digest=terminal_guard_digest,
+                _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+            )
+        except BaseException:
+            attempt_terminal = False
+
+    # A wrapper may publish the real AttemptPermit, then return a different
+    # object normally.  The assigned object cannot identify that live ledger
+    # entry, so fall back to the frozen credential proof used for reservation.
+    if (
+        not attempt_terminal
+        and type(credential_handle_id) is UUID
+        and type(credential_handle_digest) is Digest256
+    ):
+        try:
+            attempt_terminal = gate._recover_published_attempt_for_cleanup(
+                credential_permit=credential_permit,
+                credential_handle_id=credential_handle_id,
+                credential_handle_digest=credential_handle_digest,
+                _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+            )
+        except BaseException:
+            attempt_terminal = False
+
+    handle_terminal = False
+    if type(credential_publication_id) is UUID:
+        try:
+            credential_resolver._recover_published_handle_for_cleanup(
+                credential_permit,
+                publication_id=credential_publication_id,
+                _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+            )
         except BaseException:
             pass
-    elif attempt is None:
+        try:
+            handle_terminal = (
+                credential_resolver._published_handle_is_closed_for_cleanup(
+                    credential_permit,
+                    publication_id=credential_publication_id,
+                    _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+                )
+            )
+        except BaseException:
+            handle_terminal = False
+        if not handle_terminal:
+            try:
+                credential_resolver._recover_published_handle_state_for_cleanup(
+                    credential_permit,
+                    publication_id=credential_publication_id,
+                    _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+                )
+            except BaseException:
+                pass
+            try:
+                handle_terminal = (
+                    credential_resolver._published_handle_is_closed_for_cleanup(
+                        credential_permit,
+                        publication_id=credential_publication_id,
+                        _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+                    )
+                )
+            except BaseException:
+                handle_terminal = False
+
+    if credential_handle is not None and not handle_terminal:
+        try:
+            handle_terminal = (
+                credential_resolver._handle_is_closed_for_cleanup(
+                    credential_handle,
+                    _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+                )
+            )
+        except BaseException:
+            handle_terminal = False
+
+    if credential_handle is None and attempt is None:
         # Covers launch-before-read failures.  CredentialResolver owns any
         # permit it successfully claimed, so this public transition can only
         # abandon the still-authorized pre-read state.
@@ -216,6 +228,12 @@ class PreparedResolverAttempt:
         "_gate",
         "_credential_resolver",
         "_terminal_guard",
+        "_terminal_guard_ledger_snapshot",
+        "_attempt_permit_snapshot",
+        "_credential_permit_snapshot",
+        "_credential_handle_snapshot",
+        "_credential_handle_id_snapshot",
+        "_credential_handle_digest_snapshot",
         "_status",
         "_lock",
     )
@@ -226,11 +244,14 @@ class PreparedResolverAttempt:
         gate: AttemptGate,
         credential_resolver: CredentialResolver,
         terminal_guard: AttemptTerminalGuard,
+        terminal_guard_ledger: _ResolverLifecycleLedger,
         credential_handle: CredentialHandle,
         attempt_permit: AttemptPermit,
         result_receipt: ResolverResultReceipt,
         resolution_set: ResolutionSet,
         transport_claim_id: UUID,
+        terminal_guard_id: UUID,
+        terminal_guard_digest: Digest256,
         dns_start_id: UUID,
         _authority: object | None = None,
     ) -> None:
@@ -242,6 +263,10 @@ class PreparedResolverAttempt:
             raise TypeError("credential_resolver must be CredentialResolver")
         if type(terminal_guard) is not AttemptTerminalGuard:
             raise TypeError("terminal_guard must be AttemptTerminalGuard")
+        if type(terminal_guard_ledger) is not _ResolverLifecycleLedger:
+            raise TypeError(
+                "terminal_guard_ledger must be _ResolverLifecycleLedger"
+            )
         if type(credential_handle) is not CredentialHandle:
             raise TypeError("credential_handle must be CredentialHandle")
         if type(attempt_permit) is not AttemptPermit:
@@ -251,31 +276,42 @@ class PreparedResolverAttempt:
         if type(resolution_set) is not ResolutionSet:
             raise TypeError("resolution_set must be ResolutionSet")
         require_uuid(transport_claim_id, "transport_claim_id")
+        require_uuid(terminal_guard_id, "terminal_guard_id")
         require_uuid(dns_start_id, "dns_start_id")
+        _, terminal_snapshot = terminal_guard_ledger.require_exact_terminal_guard(
+            terminal_guard,
+            terminal_guard._capability,
+        )
+        if (
+            terminal_guard_id != terminal_snapshot.terminal_guard_id
+            or terminal_guard_digest != terminal_snapshot.terminal_guard_digest
+        ):
+            raise _coordinator_error("resolver terminal guard snapshot 不匹配。")
 
         attempt_permit.validate_integrity()
         credential_handle.validate_integrity()
         resolution_set.validate_binding(attempt_permit, result_receipt)
+        credential_permit_snapshot = attempt_permit._credential_permit
+        if type(credential_permit_snapshot) is not CredentialResolutionPermit:
+            raise _coordinator_error("resolver credential owner proof 无效。")
         exact = (
             attempt_permit._attempt_gate is gate,
             attempt_permit.credential_handle_id == credential_handle.handle_id,
             attempt_permit.credential_handle_digest
             == credential_handle.handle_digest,
-            terminal_guard.attempt_permit_id
+            terminal_snapshot.attempt_permit_id
             == attempt_permit.attempt_permit_id,
-            terminal_guard.attempt_permit_digest
+            terminal_snapshot.attempt_permit_digest
             == attempt_permit.attempt_permit_digest,
-            terminal_guard.transport_claim_id == transport_claim_id,
+            terminal_snapshot.transport_claim_id == transport_claim_id,
             result_receipt.lifecycle_id == terminal_guard.lifecycle_id,
             result_receipt.attempt_permit_id
             == attempt_permit.attempt_permit_id,
             result_receipt.attempt_permit_digest
             == attempt_permit.attempt_permit_digest,
             result_receipt.transport_claim_id == transport_claim_id,
-            result_receipt.terminal_guard_id
-            == terminal_guard.terminal_guard_id,
-            result_receipt.terminal_guard_digest
-            == terminal_guard.terminal_guard_digest,
+            result_receipt.terminal_guard_id == terminal_guard_id,
+            result_receipt.terminal_guard_digest == terminal_guard_digest,
             result_receipt.dns_start_id == dns_start_id,
             resolution_set.receipt_digest == result_receipt.receipt_digest,
         )
@@ -284,8 +320,8 @@ class PreparedResolverAttempt:
         if not gate._dns_start_is_committed(
             attempt_permit,
             claim_id=transport_claim_id,
-            guard_id=terminal_guard.terminal_guard_id,
-            guard_digest=terminal_guard.terminal_guard_digest,
+            guard_id=terminal_guard_id,
+            guard_digest=terminal_guard_digest,
             start_id=dns_start_id,
             _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
         ):
@@ -298,12 +334,21 @@ class PreparedResolverAttempt:
             ("result_receipt", result_receipt),
             ("resolution_set", resolution_set),
             ("transport_claim_id", transport_claim_id),
-            ("terminal_guard_id", terminal_guard.terminal_guard_id),
-            ("terminal_guard_digest", terminal_guard.terminal_guard_digest),
+            ("terminal_guard_id", terminal_guard_id),
+            ("terminal_guard_digest", terminal_guard_digest),
             ("dns_start_id", dns_start_id),
             ("_gate", gate),
             ("_credential_resolver", credential_resolver),
             ("_terminal_guard", terminal_guard),
+            ("_terminal_guard_ledger_snapshot", terminal_guard_ledger),
+            ("_attempt_permit_snapshot", attempt_permit),
+            ("_credential_permit_snapshot", credential_permit_snapshot),
+            ("_credential_handle_snapshot", credential_handle),
+            ("_credential_handle_id_snapshot", credential_handle.handle_id),
+            (
+                "_credential_handle_digest_snapshot",
+                credential_handle.handle_digest,
+            ),
             ("_status", "active"),
             ("_lock", RLock()),
         )
@@ -373,39 +418,65 @@ class PreparedResolverAttempt:
 
             errors: list[BaseException] = []
             try:
-                self._terminal_guard.cleanup()
+                _cleanup_guard(
+                    self._terminal_guard,
+                    self._terminal_guard_ledger_snapshot,
+                    observer=None,
+                    suppress_errors=False,
+                )
             except BaseException as error:
                 errors.append(error)
 
             helper_terminal = False
             try:
                 helper_terminal = (
-                    self._terminal_guard.safe_metadata()["state"] == "terminal"
+                    self._terminal_guard_ledger_snapshot.is_terminal()
                 )
             except BaseException:
                 pass
 
             attempt_terminal = False
             if helper_terminal:
-                attempt_terminal, finish_error = _finish_owned_attempt(
-                    self._gate,
-                    self.attempt_permit,
-                    claim_id=self.transport_claim_id,
-                    guard=self._terminal_guard,
-                )
-                if finish_error is not None:
-                    errors.append(finish_error)
+                try:
+                    attempt_terminal = (
+                        self._gate._recover_attempt_for_cleanup(
+                            self._attempt_permit_snapshot,
+                            credential_permit=self._credential_permit_snapshot,
+                            credential_handle_id=(
+                                self._credential_handle_id_snapshot
+                            ),
+                            credential_handle_digest=(
+                                self._credential_handle_digest_snapshot
+                            ),
+                            claim_id=self.transport_claim_id,
+                            guard_id=self.terminal_guard_id,
+                            guard_digest=self.terminal_guard_digest,
+                            _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+                        )
+                    )
+                except BaseException:
+                    attempt_terminal = False
 
             if attempt_terminal:
                 try:
-                    self._credential_resolver.close(self.credential_handle)
+                    self._credential_resolver.close(
+                        self._credential_handle_snapshot
+                    )
                 except BaseException as error:
                     errors.append(error)
 
+            handle_terminal = False
+            try:
+                handle_terminal = (
+                    self._credential_resolver._handle_is_closed_for_cleanup(
+                        self._credential_handle_snapshot,
+                        _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+                    )
+                )
+            except BaseException:
+                pass
             all_terminal = (
-                helper_terminal
-                and attempt_terminal
-                and self.credential_handle.is_closed
+                helper_terminal and attempt_terminal and handle_terminal
             )
             object.__setattr__(
                 self,
@@ -426,16 +497,14 @@ def coordinate_resolver_attempt(
     credential_resolver: CredentialResolver,
     gate: AttemptGate,
     credential_permit: CredentialResolutionPermit,
-    lifecycle_id: UUID,
-    transport_claim_id: UUID,
-    dns_start_id: UUID,
     observer: LifecycleObserver | None = None,
 ) -> PreparedResolverAttempt:
     """Resolve exactly once through READY -> secret -> claim -> DNS START.
 
-    ``transport_claim_id`` and ``dns_start_id`` are caller-generated owner
-    proofs.  No target-bearing START is written unless every Gate transition
-    returns normally *and* the exact committed proof can be observed.
+    The launcher generates the lifecycle, claim, and DNS-start role IDs as one
+    exact capability before spawn.  No target-bearing START is written unless
+    every Gate transition returns normally and the committed capability proofs
+    remain exact.
     """
 
     if type(launcher) is not ResolverHelperLauncher:
@@ -446,35 +515,48 @@ def coordinate_resolver_attempt(
         raise TypeError("gate must be AttemptGate")
     if type(credential_permit) is not CredentialResolutionPermit:
         raise TypeError("credential_permit must be CredentialResolutionPermit")
-    require_uuid(lifecycle_id, "lifecycle_id")
-    require_uuid(transport_claim_id, "transport_claim_id")
-    require_uuid(dns_start_id, "dns_start_id")
     if credential_permit._attempt_gate is not gate:
         raise _coordinator_error("credential permit 不属于当前 AttemptGate。")
 
     pre_guard: PreAttemptResolverGuard | None = None
     terminal_guard: AttemptTerminalGuard | None = None
     credential_handle: CredentialHandle | None = None
+    credential_handle_id: UUID | None = None
+    credential_handle_digest: Digest256 | None = None
     attempt: AttemptPermit | None = None
-    ready_publication_id = uuid4()
+    terminal_guard_id: UUID | None = None
+    terminal_guard_digest: Digest256 | None = None
+    helper_cleanup_terminal = False
+    credential_publication_id: UUID | None = None
+    ready_ledger_snapshot: _ResolverLifecycleLedger | None = None
+    attempt_permit_id: UUID | None = None
+    attempt_permit_digest: Digest256 | None = None
     ready_reservation_owner = object()
+    ready_launch_owner = object()
     try:
-        ready_publication_ticket = launcher._reserve_ready_publication(
-            publication_id=ready_publication_id,
-            lifecycle_id=lifecycle_id,
+        ready_publication_ticket = launcher._reserve_lifecycle_capability(
             reservation_owner=ready_reservation_owner,
-            _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+            _authority=_RESOLVER_LIFECYCLE_AUTHORITY,
         )
+        # Keep even normal-return aliases inside the reservation recovery
+        # window.  A wrong object must not strand the real reserved ticket.
+        ready_capability_snapshot = (
+            launcher._reserved_lifecycle_snapshot_for_owner(
+                ready_publication_ticket,
+                reservation_owner=ready_reservation_owner,
+                _authority=_RESOLVER_LIFECYCLE_AUTHORITY,
+            )
+        )
+        transport_claim_id = ready_capability_snapshot.transport_claim_id
+        dns_start_id = ready_capability_snapshot.dns_start_id
     except BaseException:
         # Reservation itself can return through an outer wrapper that raises
         # before assignment.  The pre-created owner identity removes only
         # this exact still-reserved entry and cannot steal a colliding caller.
         try:
-            launcher._recover_ready_reservation(
-                publication_id=ready_publication_id,
-                lifecycle_id=lifecycle_id,
+            launcher._recover_lifecycle_reservation(
                 reservation_owner=ready_reservation_owner,
-                _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+                _authority=_RESOLVER_LIFECYCLE_AUTHORITY,
             )
         except BaseException:
             pass
@@ -485,8 +567,9 @@ def coordinate_resolver_attempt(
             pre_guard=None,
             terminal_guard=None,
             credential_handle=None,
+            credential_publication_id=None,
             attempt=None,
-            claim_id=transport_claim_id,
+            claim_id=None,
         )
         raise
     try:
@@ -494,40 +577,54 @@ def coordinate_resolver_attempt(
         # external boundary.  Its spawn request contains neither target nor
         # secret data, and READY must complete before credential resolution.
         try:
-            pre_guard = launcher.launch_ready(
-                lifecycle_id=lifecycle_id,
+            candidate_pre_guard = launcher._launch_ready(
+                capability=ready_publication_ticket,
+                launch_owner=ready_launch_owner,
                 observer=observer,
-                publication_ticket=ready_publication_ticket,
+                _authority=_RESOLVER_LIFECYCLE_AUTHORITY,
             )
             if not launcher._consume_ready_publication(
                 ready_publication_ticket,
-                pre_guard,
-                _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+                candidate_pre_guard,
+                _authority=_RESOLVER_LIFECYCLE_AUTHORITY,
             ):
                 raise _coordinator_error(
                     "resolver READY publication 未能精确消费。"
                 )
+            ready_ledger_snapshot = launcher._accepted_ready_guard_ledger(
+                ready_publication_ticket,
+                candidate_pre_guard,
+                launch_owner=ready_launch_owner,
+                _authority=_RESOLVER_LIFECYCLE_AUTHORITY,
+            )
+            pre_guard = candidate_pre_guard
         except BaseException:
-            # An outer wrapper can raise after launch_ready() returned but
-            # before assignment.  Only this pre-spawn-reserved ticket can
-            # recover the exact published guard; an unused reservation is
-            # consumed without manufacturing an owner.
+            # Cleanup is performed inside the launcher against the exact
+            # pre-created launch owner.  No live guard is returned to this
+            # exception path, and a concurrent loser cannot steal a winner.
             try:
-                recovered_pre_guard = (
-                    launcher._recover_ready_publication(
+                helper_cleanup_terminal = (
+                    launcher._recover_ready_publication_for_cleanup(
                         ready_publication_ticket,
-                        _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+                        launch_owner=ready_launch_owner,
+                        _authority=_RESOLVER_LIFECYCLE_AUTHORITY,
                     )
+                    or helper_cleanup_terminal
                 )
             except BaseException:
-                recovered_pre_guard = None
-            if recovered_pre_guard is not None:
-                pre_guard = recovered_pre_guard
+                pass
+            try:
+                launcher._recover_lifecycle_reservation(
+                    reservation_owner=ready_reservation_owner,
+                    _authority=_RESOLVER_LIFECYCLE_AUTHORITY,
+                )
+            except BaseException:
+                pass
             raise
 
         credential_publication_id = uuid4()
         try:
-            credential_handle = credential_resolver.resolve(
+            candidate_credential_handle = credential_resolver.resolve(
                 credential_permit,
                 publication_id=credential_publication_id,
             )
@@ -537,50 +634,71 @@ def coordinate_resolver_attempt(
             # unique exact proof for cleanup; the original exception still
             # forbids every later transition, including START.
             try:
-                recovered_handle = (
-                    credential_resolver._recover_published_handle(
-                        credential_permit,
-                        publication_id=credential_publication_id,
-                        _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
-                    )
+                credential_resolver._recover_published_handle_for_cleanup(
+                    credential_permit,
+                    publication_id=credential_publication_id,
+                    _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
                 )
             except BaseException:
-                recovered_handle = None
-            if recovered_handle is not None:
-                credential_handle = recovered_handle
+                pass
             raise
+
+        candidate_credential_handle.validate_integrity()
+        if not credential_resolver._published_handle_is_exact_for_transport(
+            candidate_credential_handle,
+            permit=credential_permit,
+            publication_id=credential_publication_id,
+            _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+        ):
+            raise _coordinator_error(
+                "credential handle publication 未能精确证明。"
+            )
+        credential_handle = candidate_credential_handle
+        credential_handle_id = candidate_credential_handle.handle_id
+        credential_handle_digest = candidate_credential_handle.handle_digest
 
         try:
             attempt = gate.reserve_attempt(
                 credential_permit=credential_permit,
-                credential_handle_id=credential_handle.handle_id,
-                credential_handle_digest=credential_handle.handle_digest,
+                credential_handle_id=credential_handle_id,
+                credential_handle_digest=credential_handle_digest,
             )
         except BaseException:
             # Same return/assignment window for AttemptPermit publication.
             # Recovery requires the exact input handle proof and accepts only
             # one active, unclaimed attempt; it is used solely for cleanup.
             try:
-                recovered_attempt = gate._recover_published_attempt(
+                gate._recover_published_attempt_for_cleanup(
                     credential_permit=credential_permit,
-                    credential_handle_id=credential_handle.handle_id,
-                    credential_handle_digest=credential_handle.handle_digest,
+                    credential_handle_id=credential_handle_id,
+                    credential_handle_digest=credential_handle_digest,
                     _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
                 )
             except BaseException:
-                recovered_attempt = None
-            if recovered_attempt is not None:
-                attempt = recovered_attempt
+                pass
             raise
 
         try:
             gate._claim_attempt(
                 attempt,
                 claim_id=transport_claim_id,
+                expected_credential_permit=credential_permit,
+                expected_credential_handle_id=credential_handle_id,
+                expected_credential_handle_digest=credential_handle_digest,
                 _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
             )
         except BaseException:
             raise
+        attempt_permit_id, attempt_permit_digest = (
+            gate._claimed_attempt_snapshot_for_transport(
+                attempt,
+                credential_permit=credential_permit,
+                credential_handle_id=credential_handle_id,
+                credential_handle_digest=credential_handle_digest,
+                claim_id=transport_claim_id,
+                _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+            )
+        )
         if not gate._attempt_claim_is_owned(
             attempt,
             claim_id=transport_claim_id,
@@ -589,36 +707,71 @@ def coordinate_resolver_attempt(
             raise _coordinator_error("transport claim 未能精确提交。")
 
         try:
-            terminal_guard = pre_guard.transfer(
-                attempt_permit_id=attempt.attempt_permit_id,
-                attempt_permit_digest=attempt.attempt_permit_digest,
-                transport_claim_id=transport_claim_id,
+            candidate_terminal_guard = pre_guard._transfer(
+                attempt_permit_id=attempt_permit_id,
+                attempt_permit_digest=attempt_permit_digest,
                 observer=observer,
+                _authority=_RESOLVER_LIFECYCLE_AUTHORITY,
             )
+            if ready_ledger_snapshot is None:
+                raise _coordinator_error(
+                    "resolver READY ledger snapshot 缺失。"
+                )
+            _, transferred_snapshot = (
+                ready_ledger_snapshot.require_exact_terminal_guard(
+                    candidate_terminal_guard,
+                    ready_publication_ticket,
+                )
+            )
+            if (
+                transferred_snapshot.attempt_permit_id != attempt_permit_id
+                or transferred_snapshot.attempt_permit_digest
+                != attempt_permit_digest
+                or transferred_snapshot.transport_claim_id
+                != transport_claim_id
+            ):
+                raise _coordinator_error(
+                    "resolver terminal guard owner proof 不匹配。"
+                )
+            terminal_guard = candidate_terminal_guard
         except BaseException:
-            # transfer() can also return normally into an outer wrapper that
+            # _transfer() can also return normally into an outer wrapper that
             # raises before assignment.  The ledger retains the exact former
             # pre-owner so only its matching terminal guard can be recovered.
             try:
-                recovered_guard = pre_guard._recover_transferred_guard(
-                    attempt_permit_id=attempt.attempt_permit_id,
-                    attempt_permit_digest=attempt.attempt_permit_digest,
-                    transport_claim_id=transport_claim_id,
-                    _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
-                )
+                if ready_ledger_snapshot is not None:
+                    helper_cleanup_terminal = (
+                        ready_ledger_snapshot.recover_transferred_guard_for_cleanup(
+                            pre_guard,
+                            attempt_permit_id=attempt_permit_id,
+                            attempt_permit_digest=attempt_permit_digest,
+                        )
+                        or helper_cleanup_terminal
+                    )
+                else:
+                    helper_cleanup_terminal = (
+                        pre_guard._recover_transferred_guard_for_cleanup(
+                            attempt_permit_id=attempt_permit_id,
+                            attempt_permit_digest=attempt_permit_digest,
+                            _authority=_RESOLVER_LIFECYCLE_AUTHORITY,
+                        )
+                        or helper_cleanup_terminal
+                    )
             except BaseException:
-                recovered_guard = None
-            if recovered_guard is not None:
-                terminal_guard = recovered_guard
-                pre_guard = None
+                pass
             raise
         pre_guard = None
+        terminal_snapshot = terminal_guard._proof_snapshot(
+            _authority=_RESOLVER_LIFECYCLE_AUTHORITY,
+        )
+        terminal_guard_id = terminal_snapshot.terminal_guard_id
+        terminal_guard_digest = terminal_snapshot.terminal_guard_digest
         try:
             gate._bind_terminal_guard(
                 attempt,
                 claim_id=transport_claim_id,
-                guard_id=terminal_guard.terminal_guard_id,
-                guard_digest=terminal_guard.terminal_guard_digest,
+                guard_id=terminal_guard_id,
+                guard_digest=terminal_guard_digest,
                 _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
             )
         except BaseException:
@@ -626,8 +779,8 @@ def coordinate_resolver_attempt(
         if not gate._terminal_guard_is_bound(
             attempt,
             claim_id=transport_claim_id,
-            guard_id=terminal_guard.terminal_guard_id,
-            guard_digest=terminal_guard.terminal_guard_digest,
+            guard_id=terminal_guard_id,
+            guard_digest=terminal_guard_digest,
             _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
         ):
             raise _coordinator_error("terminal guard 未能精确绑定。")
@@ -637,8 +790,8 @@ def coordinate_resolver_attempt(
             gate._commit_dns_start(
                 attempt,
                 claim_id=transport_claim_id,
-                guard_id=terminal_guard.terminal_guard_id,
-                guard_digest=terminal_guard.terminal_guard_digest,
+                guard_id=terminal_guard_id,
+                guard_digest=terminal_guard_digest,
                 start_id=dns_start_id,
                 _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
             )
@@ -649,8 +802,8 @@ def coordinate_resolver_attempt(
                 gate._dns_start_is_committed(
                     attempt,
                     claim_id=transport_claim_id,
-                    guard_id=terminal_guard.terminal_guard_id,
-                    guard_digest=terminal_guard.terminal_guard_digest,
+                    guard_id=terminal_guard_id,
+                    guard_digest=terminal_guard_digest,
                     start_id=dns_start_id,
                     _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
                 )
@@ -660,27 +813,30 @@ def coordinate_resolver_attempt(
         if not gate._dns_start_is_committed(
             attempt,
             claim_id=transport_claim_id,
-            guard_id=terminal_guard.terminal_guard_id,
-            guard_digest=terminal_guard.terminal_guard_digest,
+            guard_id=terminal_guard_id,
+            guard_digest=terminal_guard_digest,
             start_id=dns_start_id,
             _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
         ):
             raise _coordinator_error("DNS START 提交证明不确定。")
 
-        terminal_guard.start(
+        terminal_guard._start(
             hostname=hostname,
             port=port,
             network_policy_ref=INTERNET_PUBLIC_ADDRESS_POLICY_REF,
             network_policy_digest=INTERNET_PUBLIC_ADDRESS_POLICY_DIGEST,
-            dns_start_id=dns_start_id,
             observer=observer,
+            _authority=_RESOLVER_LIFECYCLE_AUTHORITY,
         )
-        result_receipt = terminal_guard.read_result_receipt(observer=observer)
+        result_receipt = terminal_guard._read_result_receipt(
+            observer=observer,
+            _authority=_RESOLVER_LIFECYCLE_AUTHORITY,
+        )
         if not gate._dns_start_is_committed(
             attempt,
             claim_id=transport_claim_id,
-            guard_id=terminal_guard.terminal_guard_id,
-            guard_digest=terminal_guard.terminal_guard_digest,
+            guard_id=terminal_guard_id,
+            guard_digest=terminal_guard_digest,
             start_id=dns_start_id,
             _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
         ):
@@ -693,15 +849,29 @@ def coordinate_resolver_attempt(
             gate=gate,
             credential_resolver=credential_resolver,
             terminal_guard=terminal_guard,
+            terminal_guard_ledger=ready_ledger_snapshot,
             credential_handle=credential_handle,
             attempt_permit=attempt,
             result_receipt=result_receipt,
             resolution_set=resolution,
             transport_claim_id=transport_claim_id,
+            terminal_guard_id=terminal_guard_id,
+            terminal_guard_digest=terminal_guard_digest,
             dns_start_id=dns_start_id,
             _authority=_PREPARED_RESOLVER_ATTEMPT_AUTHORITY,
         )
     except BaseException:
+        try:
+            helper_cleanup_terminal = (
+                launcher._recover_ready_publication_for_cleanup(
+                    ready_publication_ticket,
+                    launch_owner=ready_launch_owner,
+                    _authority=_RESOLVER_LIFECYCLE_AUTHORITY,
+                )
+                or helper_cleanup_terminal
+            )
+        except BaseException:
+            pass
         _cleanup_failed_coordination(
             gate=gate,
             credential_permit=credential_permit,
@@ -709,8 +879,14 @@ def coordinate_resolver_attempt(
             pre_guard=pre_guard,
             terminal_guard=terminal_guard,
             credential_handle=credential_handle,
+            credential_publication_id=credential_publication_id,
+            credential_handle_id=credential_handle_id,
+            credential_handle_digest=credential_handle_digest,
             attempt=attempt,
             claim_id=transport_claim_id,
+            terminal_guard_id=terminal_guard_id,
+            terminal_guard_digest=terminal_guard_digest,
+            helper_terminal_hint=helper_cleanup_terminal,
         )
         raise
 
