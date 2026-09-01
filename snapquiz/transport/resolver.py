@@ -3,10 +3,11 @@
 This module deliberately contains no process implementation.  A helper can
 only be reached through injected ``HelperSpawner``/``HelperKernel`` objects;
 that injection point is a trusted test seam, not a production authorization
-boundary.  A future coordinator must prove the matching AttemptGate claim and
-DNS-start commit before calling ``transfer``/``start``.  The production
-placeholder fails closed until that coordinator and an independently
-executable, ``posix_spawn`` based adapter are implemented and validated.
+boundary.  The offline coordinator proves the matching AttemptGate claim and
+DNS-start commit before calling ``transfer``/``start``; factory capability
+sealing remains pending.  The production placeholder fails closed until an
+independently executable, ``posix_spawn`` based adapter is implemented and
+validated.
 Importing and constructing the contracts performs no process, DNS, file,
 environment, or socket I/O.
 """
@@ -33,7 +34,7 @@ from snapquiz.runtime.attempt import _TRANSPORT_ATTEMPT_AUTHORITY
 RESOLVER_HELPER_PROTOCOL_VERSION = "snapquiz.resolver-helper.v2"
 RESOLVER_HELPER_START_SCHEMA_VERSION = "snapquiz.resolver-start.v2"
 RESOLVER_TERMINAL_GUARD_SCHEMA_VERSION = "snapquiz.resolver-terminal-guard.v1"
-RESOLVER_RESULT_RECEIPT_SCHEMA_VERSION = "snapquiz.resolver-result-receipt.v1"
+RESOLVER_RESULT_RECEIPT_SCHEMA_VERSION = "snapquiz.resolver-result-receipt.v2"
 READY_FRAME = b"SNAPQUIZ-RESOLVER/2 READY\n"
 MAX_READY_FRAME_BYTES = 64
 MAX_START_FRAME_BYTES = 4_096
@@ -107,8 +108,8 @@ class HelperKernel(Protocol):
     def terminate(self) -> None:
         """Best-effort stop of the helper, whether it is alive or exited."""
 
-    def reap(self) -> None:
-        """Reap the helper exactly once."""
+    def reap(self) -> int:
+        """Reap the helper exactly once and return its plain exit status."""
 
     def close_pipes(self) -> None:
         """Close every helper-owned parent-side pipe exactly once."""
@@ -138,6 +139,10 @@ class _ResultReceiptIssuanceSnapshot(NamedTuple):
     raw_transcript_byte_size: int
     raw_transcript_digest: Digest256
     raw_transcript: bytes
+    stdout_eof: bool
+    child_reaped: bool
+    child_exit_status: int
+    helper_pipes_closed: bool
     receipt_digest: Digest256
     issued_digest: Digest256
 
@@ -158,6 +163,17 @@ class _ResolutionPublicationSnapshot(NamedTuple):
     resolution_digest: Digest256
     canonical_payload: bytes
     candidates: tuple[_ResolutionCandidatePublicationSnapshot, ...]
+
+
+class _CleanupPlan(NamedTuple):
+    """Ledger-claimed external actions for one terminal cleanup pass."""
+
+    kernel: HelperKernel | None
+    claimed: bool
+    terminate: bool
+    reap: bool
+    close_pipes: bool
+    inherited_failure: bool
 
 
 def _lifecycle_error(message: str) -> EndpointPolicyError:
@@ -329,6 +345,15 @@ class _ResolverLifecycleLedger:
         "_kernel",
         "_state",
         "_cleanup_claimed",
+        "_terminate_claimed",
+        "_terminated",
+        "_eof_probe_claimed",
+        "_stdout_eof",
+        "_reap_claimed",
+        "_child_reaped",
+        "_child_exit_status",
+        "_pipes_close_claimed",
+        "_helper_pipes_closed",
         "_dns_start_id",
         "_start_frame_digest",
         "_issued_receipt",
@@ -344,6 +369,15 @@ class _ResolverLifecycleLedger:
         self._kernel: HelperKernel | None = None
         self._state = "created"
         self._cleanup_claimed = False
+        self._terminate_claimed = False
+        self._terminated = False
+        self._eof_probe_claimed = False
+        self._stdout_eof = False
+        self._reap_claimed = False
+        self._child_reaped = False
+        self._child_exit_status: int | None = None
+        self._pipes_close_claimed = False
+        self._helper_pipes_closed = False
         self._dns_start_id: UUID | None = None
         self._start_frame_digest: Digest256 | None = None
         self._issued_receipt: ResolverResultReceipt | None = None
@@ -462,6 +496,129 @@ class _ResolverLifecycleLedger:
             target="result_reading",
         )
 
+    def claim_stdout_eof_probe(self, owner: object) -> HelperKernel:
+        """Claim the sole read after RESULT before touching helper stdout."""
+
+        with self._lock:
+            if (
+                self._owner is not owner
+                or self._state != "result_reading"
+                or self._eof_probe_claimed
+                or self._stdout_eof
+                or self._kernel is None
+            ):
+                raise _lifecycle_error("resolver RESULT EOF probe 状态无效。")
+            self._eof_probe_claimed = True
+            self._state = "result_eof_probing"
+            return self._kernel
+
+    def commit_stdout_eof(self, owner: object) -> None:
+        with self._lock:
+            if (
+                self._owner is not owner
+                or self._state != "result_eof_probing"
+                or not self._eof_probe_claimed
+                or self._stdout_eof
+            ):
+                raise _lifecycle_error("resolver RESULT EOF proof 状态无效。")
+            self._stdout_eof = True
+            self._state = "result_eof"
+
+    def claim_result_reap(self, owner: object) -> HelperKernel:
+        """Claim the only success-path reap before calling the kernel."""
+
+        with self._lock:
+            if (
+                self._owner is not owner
+                or self._state != "result_eof"
+                or not self._stdout_eof
+                or self._reap_claimed
+                or self._child_reaped
+                or self._kernel is None
+            ):
+                raise _lifecycle_error("resolver child reap 状态无效。")
+            self._reap_claimed = True
+            self._state = "result_reaping"
+            return self._kernel
+
+    def commit_result_reap(self, owner: object, exit_status: object) -> None:
+        """Commit one exact plain exit status; only zero may publish RESULT."""
+
+        try:
+            checked_status = require_plain_int(
+                exit_status,
+                "child_exit_status",
+            )
+        except (TypeError, ValueError):
+            raise _lifecycle_error("resolver child 退出状态合同无效。") from None
+        with self._lock:
+            if (
+                self._owner is not owner
+                or self._state != "result_reaping"
+                or not self._reap_claimed
+                or self._child_reaped
+            ):
+                raise _lifecycle_error("resolver child reap proof 状态无效。")
+            self._child_reaped = True
+            self._child_exit_status = checked_status
+            self._state = (
+                "result_reaped" if checked_status == 0 else "result_exit_rejected"
+            )
+        if checked_status != 0:
+            raise _lifecycle_error("resolver child 退出状态不是 0。")
+
+    def claim_result_pipe_close(self, owner: object) -> HelperKernel:
+        """Claim parent-side pipe closure after an exact successful reap."""
+
+        with self._lock:
+            if (
+                self._owner is not owner
+                or self._state != "result_reaped"
+                or not self._stdout_eof
+                or not self._child_reaped
+                or self._child_exit_status != 0
+                or self._pipes_close_claimed
+                or self._helper_pipes_closed
+                or self._kernel is None
+            ):
+                raise _lifecycle_error("resolver helper pipe close 状态无效。")
+            self._pipes_close_claimed = True
+            self._state = "result_pipes_closing"
+            return self._kernel
+
+    def commit_result_pipe_close(self, owner: object) -> None:
+        with self._lock:
+            if (
+                self._owner is not owner
+                or self._state != "result_pipes_closing"
+                or not self._pipes_close_claimed
+                or self._helper_pipes_closed
+            ):
+                raise _lifecycle_error("resolver helper pipe proof 状态无效。")
+            self._helper_pipes_closed = True
+            self._state = "result_resources_closed"
+
+    def result_attestation_for(
+        self,
+        owner: object,
+    ) -> tuple[bool, bool, int, bool]:
+        with self._lock:
+            if (
+                self._owner is not owner
+                or self._state != "result_resources_closed"
+                or not self._stdout_eof
+                or not self._child_reaped
+                or self._child_exit_status != 0
+                or not self._helper_pipes_closed
+            ):
+                raise _lifecycle_error("resolver RESULT completion proof 不完整。")
+            return (
+                self._stdout_eof,
+                self._child_reaped,
+                self._child_exit_status,
+                self._helper_pipes_closed,
+            )
+
     def issue_result_receipt(
         self,
         owner: object,
@@ -471,7 +628,7 @@ class _ResolverLifecycleLedger:
         with self._lock:
             if (
                 self._owner is not owner
-                or self._state != "result_reading"
+                or self._state != "result_resources_closed"
                 or type(owner) is not AttemptTerminalGuard
                 or type(receipt) is not ResolverResultReceipt
                 or receipt._ledger is not self
@@ -480,11 +637,15 @@ class _ResolverLifecycleLedger:
                 or self._issued_receipt_snapshot is not None
                 or self._dns_start_id != receipt.dns_start_id
                 or self._start_frame_digest != receipt.start_frame_digest
+                or receipt.stdout_eof is not self._stdout_eof
+                or receipt.child_reaped is not self._child_reaped
+                or receipt.child_exit_status != self._child_exit_status
+                or receipt.helper_pipes_closed is not self._helper_pipes_closed
             ):
                 raise _lifecycle_error("resolver RESULT receipt 发行状态无效。")
             self._issued_receipt = receipt
             self._issued_receipt_snapshot = snapshot
-            self._state = "result_read"
+            self._state = "result_attested"
 
     def is_exact_receipt_issued(
         self,
@@ -516,7 +677,7 @@ class _ResolverLifecycleLedger:
     ) -> bool:
         snapshot = self._issued_receipt_snapshot
         return (
-            self._state == "result_read"
+            self._state == "result_attested"
             and self._owner is owner
             and type(owner) is AttemptTerminalGuard
             and type(receipt) is ResolverResultReceipt
@@ -527,6 +688,10 @@ class _ResolverLifecycleLedger:
             and _matches_result_receipt_snapshot(receipt, snapshot)
             and self._dns_start_id == snapshot.dns_start_id
             and self._start_frame_digest == snapshot.start_frame_digest
+            and self._stdout_eof is snapshot.stdout_eof
+            and self._child_reaped is snapshot.child_reaped
+            and self._child_exit_status == snapshot.child_exit_status
+            and self._helper_pipes_closed is snapshot.helper_pipes_closed
         )
 
     def issue_resolution(
@@ -595,24 +760,101 @@ class _ResolverLifecycleLedger:
             self._owner = replacement
             self._state = target
 
-    def claim_cleanup(self, owner: object) -> tuple[HelperKernel | None, bool]:
+    def claim_cleanup(self, owner: object) -> _CleanupPlan:
         with self._lock:
             if self._state == "terminal":
-                return None, False
+                return _CleanupPlan(None, False, False, False, False, False)
             if self._owner is not owner:
                 raise _lifecycle_error("resolver helper cleanup owner 不匹配。")
             if self._state == "cleanup_failed":
                 raise _lifecycle_error("resolver helper cleanup 尚未证明完成。")
             if self._cleanup_claimed:
-                return None, False
+                return _CleanupPlan(None, False, False, False, False, False)
+
+            kernel = self._kernel
+            inherited_failure = (
+                (self._reap_claimed and not self._child_reaped)
+                or (
+                    self._pipes_close_claimed
+                    and not self._helper_pipes_closed
+                )
+                or (self._terminate_claimed and not self._terminated)
+            )
+            terminate = (
+                kernel is not None
+                and not self._child_reaped
+                and not self._reap_claimed
+                and not self._terminate_claimed
+            )
+            reap = (
+                kernel is not None
+                and not self._child_reaped
+                and not self._reap_claimed
+            )
+            close_pipes = (
+                kernel is not None
+                and not self._helper_pipes_closed
+                and not self._pipes_close_claimed
+            )
+
+            # Claim each selected external action before exposing the plan.
+            # A return-then-raise fault must never permit a second reap/close.
+            if terminate:
+                self._terminate_claimed = True
+            if reap:
+                self._reap_claimed = True
+            if close_pipes:
+                self._pipes_close_claimed = True
             self._cleanup_claimed = True
             self._state = "cleaning"
-            return self._kernel, True
+            return _CleanupPlan(
+                kernel,
+                True,
+                terminate,
+                reap,
+                close_pipes,
+                inherited_failure,
+            )
+
+    def commit_cleanup_action(
+        self,
+        owner: object,
+        action_name: str,
+        result: object = None,
+    ) -> None:
+        with self._lock:
+            if self._owner is not owner or self._state != "cleaning":
+                raise _lifecycle_error("resolver helper cleanup 状态已经变化。")
+            if action_name == "terminate":
+                if not self._terminate_claimed or self._terminated:
+                    raise _lifecycle_error("resolver helper terminate proof 无效。")
+                self._terminated = True
+                return
+            if action_name == "reap":
+                if not self._reap_claimed or self._child_reaped:
+                    raise _lifecycle_error("resolver helper reap proof 无效。")
+                checked_status = require_plain_int(
+                    result,
+                    "child_exit_status",
+                )
+                self._child_reaped = True
+                self._child_exit_status = checked_status
+                return
+            if action_name == "close_pipes":
+                if not self._pipes_close_claimed or self._helper_pipes_closed:
+                    raise _lifecycle_error("resolver helper pipe proof 无效。")
+                self._helper_pipes_closed = True
+                return
+            raise ValueError("unknown resolver helper cleanup action")
 
     def finish_cleanup(self, owner: object) -> None:
         with self._lock:
             if self._owner is not owner or self._state != "cleaning":
                 raise _lifecycle_error("resolver helper cleanup 状态已经变化。")
+            if self._kernel is not None and (
+                not self._child_reaped or not self._helper_pipes_closed
+            ):
+                raise _lifecycle_error("resolver helper 资源终结证明不完整。")
             self._kernel = None
             self._pre_owner = None
             self._owner = None
@@ -656,6 +898,10 @@ class _ResolverLifecycleLedger:
                 "cleanup_claimed": self._cleanup_claimed,
                 "dns_start_committed": self._dns_start_id is not None,
                 "result_receipt_issued": self._issued_receipt is not None,
+                "stdout_eof": self._stdout_eof,
+                "child_reaped": self._child_reaped,
+                "child_exit_status": self._child_exit_status,
+                "helper_pipes_closed": self._helper_pipes_closed,
             }
 
 
@@ -667,12 +913,12 @@ def _cleanup_guard(
     suppress_errors: bool,
 ) -> bool:
     try:
-        kernel, claimed = ledger.claim_cleanup(guard)
+        plan = ledger.claim_cleanup(guard)
     except BaseException:
         if suppress_errors:
             return False
         raise
-    if not claimed:
+    if not plan.claimed:
         return False
 
     observer_error: BaseException | None = None
@@ -681,21 +927,36 @@ def _cleanup_guard(
     except BaseException as error:
         observer_error = error
 
-    cleanup_failed = False
-    if kernel is not None:
-        for action_name in ("terminate", "reap", "close_pipes"):
+    cleanup_failed = plan.inherited_failure
+    if plan.kernel is not None:
+        actions = (
+            ("terminate", plan.terminate),
+            ("reap", plan.reap),
+            ("close_pipes", plan.close_pipes),
+        )
+        for action_name, selected in actions:
+            if not selected:
+                continue
             try:
-                action = getattr(kernel, action_name)
-                action()
+                action = getattr(plan.kernel, action_name)
+                result = action()
+                ledger.commit_cleanup_action(guard, action_name, result)
             except BaseException:
                 cleanup_failed = True
-    try:
-        if cleanup_failed:
+    if cleanup_failed:
+        try:
             ledger.mark_cleanup_failed(guard)
-        else:
+        except BaseException:
+            pass
+    else:
+        try:
             ledger.finish_cleanup(guard)
-    except BaseException:
-        cleanup_failed = True
+        except BaseException:
+            cleanup_failed = True
+            try:
+                ledger.mark_cleanup_failed(guard)
+            except BaseException:
+                pass
 
     if observer_error is not None and not suppress_errors:
         raise observer_error
@@ -741,6 +1002,10 @@ def _result_receipt_payload(receipt: "ResolverResultReceipt") -> dict[str, objec
         "start_frame_digest": receipt.start_frame_digest,
         "raw_transcript_byte_size": receipt.raw_transcript_byte_size,
         "raw_transcript_digest": receipt.raw_transcript_digest,
+        "stdout_eof": receipt.stdout_eof,
+        "child_reaped": receipt.child_reaped,
+        "child_exit_status": receipt.child_exit_status,
+        "helper_pipes_closed": receipt.helper_pipes_closed,
     }
 
 
@@ -764,6 +1029,10 @@ def _capture_result_receipt_snapshot(
         raw_transcript_byte_size=receipt.raw_transcript_byte_size,
         raw_transcript_digest=receipt.raw_transcript_digest,
         raw_transcript=receipt._raw_transcript,
+        stdout_eof=receipt.stdout_eof,
+        child_reaped=receipt.child_reaped,
+        child_exit_status=receipt.child_exit_status,
+        helper_pipes_closed=receipt.helper_pipes_closed,
         receipt_digest=receipt.receipt_digest,
         issued_digest=receipt._issued_digest,
     )
@@ -793,6 +1062,10 @@ def _matches_result_receipt_snapshot(
         == snapshot.raw_transcript_byte_size
         and current.raw_transcript_digest == snapshot.raw_transcript_digest
         and current.raw_transcript == snapshot.raw_transcript
+        and current.stdout_eof is snapshot.stdout_eof
+        and current.child_reaped is snapshot.child_reaped
+        and current.child_exit_status == snapshot.child_exit_status
+        and current.helper_pipes_closed is snapshot.helper_pipes_closed
         and current.receipt_digest == snapshot.receipt_digest
         and current.issued_digest == snapshot.issued_digest
     )
@@ -864,10 +1137,12 @@ def _matches_resolution_publication_snapshot(
 
 @runtime_final
 class ResolverResultReceipt:
-    """Factory-only proof that one exact helper RESULT was fully read.
+    """Factory-only proof of exact RESULT completion and helper release.
 
     The raw transcript is retained privately for the address-policy factory;
-    callers receive neither naked helper bytes nor a forgeable proof bag.
+    callers receive neither naked helper bytes nor a forgeable proof bag.  A
+    receipt exists only after stdout EOF, exit status zero, one successful
+    reap, and parent-side pipe closure are all ledger-attested.
     """
 
     __slots__ = (
@@ -881,6 +1156,10 @@ class ResolverResultReceipt:
         "start_frame_digest",
         "raw_transcript_byte_size",
         "raw_transcript_digest",
+        "stdout_eof",
+        "child_reaped",
+        "child_exit_status",
+        "helper_pipes_closed",
         "receipt_digest",
         "_issued_digest",
         "_raw_transcript",
@@ -896,6 +1175,10 @@ class ResolverResultReceipt:
         dns_start_id: UUID,
         exact_start_frame_digest: Digest256,
         raw_transcript: bytes,
+        stdout_eof: bool = False,
+        child_reaped: bool = False,
+        child_exit_status: int = -1,
+        helper_pipes_closed: bool = False,
         _authority: object | None = None,
     ) -> None:
         if _authority is not _RESULT_RECEIPT_FACTORY_AUTHORITY:
@@ -913,6 +1196,18 @@ class ResolverResultReceipt:
             or b"\r" in checked_transcript
         ):
             raise _lifecycle_error("RESULT transcript 边界无效。")
+        if (
+            stdout_eof is not True
+            or child_reaped is not True
+            or helper_pipes_closed is not True
+        ):
+            raise _lifecycle_error("RESULT completion attestation 无效。")
+        checked_exit_status = require_plain_int(
+            child_exit_status,
+            "child_exit_status",
+        )
+        if checked_exit_status != 0:
+            raise _lifecycle_error("RESULT child exit status 无效。")
         values = (
             ("lifecycle_id", issuer.lifecycle_id),
             ("attempt_permit_id", issuer.attempt_permit_id),
@@ -933,6 +1228,10 @@ class ResolverResultReceipt:
                 "raw_transcript_digest",
                 result_transcript_digest(checked_transcript),
             ),
+            ("stdout_eof", True),
+            ("child_reaped", True),
+            ("child_exit_status", checked_exit_status),
+            ("helper_pipes_closed", True),
             ("_raw_transcript", checked_transcript),
             ("_issuer", issuer),
             ("_ledger", ledger),
@@ -971,7 +1270,8 @@ class ResolverResultReceipt:
             "ResolverResultReceipt("
             f"lifecycle_id={self.lifecycle_id!r}, "
             f"attempt_permit_id={self.attempt_permit_id!r}, "
-            f"raw_transcript_byte_size={self.raw_transcript_byte_size!r})"
+            f"raw_transcript_byte_size={self.raw_transcript_byte_size!r}, "
+            f"child_exit_status={self.child_exit_status!r})"
         )
 
     def validate_integrity(self) -> None:
@@ -997,6 +1297,10 @@ class ResolverResultReceipt:
             "raw_transcript_byte_size",
             minimum=1,
         )
+        require_plain_int(
+            self.child_exit_status,
+            "child_exit_status",
+        )
         if (
             self.raw_transcript_byte_size > MAX_RESULT_TRANSCRIPT_BYTES
             or type(self._raw_transcript) is not bytes
@@ -1005,6 +1309,10 @@ class ResolverResultReceipt:
             or b"\r" in self._raw_transcript
             or result_transcript_digest(self._raw_transcript)
             != self.raw_transcript_digest
+            or self.stdout_eof is not True
+            or self.child_reaped is not True
+            or self.child_exit_status != 0
+            or self.helper_pipes_closed is not True
         ):
             raise ValueError("resolver result transcript integrity mismatch")
         if (
@@ -1100,6 +1408,10 @@ class ResolverResultReceipt:
             "start_frame_digest_prefix": str(self.start_frame_digest)[:12],
             "raw_transcript_byte_size": self.raw_transcript_byte_size,
             "raw_transcript_digest_prefix": str(self.raw_transcript_digest)[:12],
+            "stdout_eof": self.stdout_eof,
+            "child_reaped": self.child_reaped,
+            "child_exit_status": self.child_exit_status,
+            "helper_pipes_closed": self.helper_pipes_closed,
             "receipt_digest_prefix": str(self.receipt_digest)[:12],
         }
 
@@ -1382,7 +1694,7 @@ class AttemptTerminalGuard:
         *,
         observer: LifecycleObserver | None = None,
     ) -> ResolverResultReceipt:
-        """Read one bounded RESULT and issue its exact non-byte receipt."""
+        """Attest one RESULT, EOF, exit-zero, reap, and closed pipes."""
 
         try:
             self._ledger.commit_result_read(self)
@@ -1395,20 +1707,47 @@ class AttemptTerminalGuard:
             transcript = frame[:-1]
             if not transcript or len(transcript) > MAX_RESULT_TRANSCRIPT_BYTES:
                 raise _lifecycle_error("RESULT transcript 超过上限。")
+
+            eof_kernel = self._ledger.claim_stdout_eof_probe(self)
+            trailing = eof_kernel.read_stdout(1)
+            if type(trailing) is not bytes or len(trailing) > 1:
+                raise _lifecycle_error("RESULT EOF probe 读取合同无效。")
+            if trailing:
+                raise _lifecycle_error("RESULT 后存在第二帧或尾随输出。")
+            self._ledger.commit_stdout_eof(self)
+
+            reap_kernel = self._ledger.claim_result_reap(self)
+            exit_status = reap_kernel.reap()
+            self._ledger.commit_result_reap(self, exit_status)
+
+            close_kernel = self._ledger.claim_result_pipe_close(self)
+            close_kernel.close_pipes()
+            self._ledger.commit_result_pipe_close(self)
+
             dns_start_id, exact_start_digest = self._ledger.start_proof_for(
                 self,
-                states=("result_reading",),
+                states=("result_resources_closed",),
             )
+            (
+                stdout_eof,
+                child_reaped,
+                child_exit_status,
+                helper_pipes_closed,
+            ) = self._ledger.result_attestation_for(self)
             receipt = ResolverResultReceipt(
                 issuer=self,
                 ledger=self._ledger,
                 dns_start_id=dns_start_id,
                 exact_start_frame_digest=exact_start_digest,
                 raw_transcript=transcript,
+                stdout_eof=stdout_eof,
+                child_reaped=child_reaped,
+                child_exit_status=child_exit_status,
+                helper_pipes_closed=helper_pipes_closed,
                 _authority=_RESULT_RECEIPT_FACTORY_AUTHORITY,
             )
             self._ledger.issue_result_receipt(self, receipt)
-            _notify(observer, "result_read", self.safe_metadata())
+            _notify(observer, "result_attested", self.safe_metadata())
             return receipt
         except BaseException:
             _cleanup_guard(

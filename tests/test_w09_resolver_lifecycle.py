@@ -47,9 +47,10 @@ RESULT = (
 
 
 class _FakeKernel:
-    def __init__(self, chunks, *, faults=None) -> None:
+    def __init__(self, chunks, *, faults=None, exit_status: object = 0) -> None:
         self.chunks = list(chunks)
         self.faults = {} if faults is None else dict(faults)
+        self.exit_status = exit_status
         self.read_limits: list[int] = []
         self.writes: list[bytes] = []
         self.events: list[str] = []
@@ -80,9 +81,10 @@ class _FakeKernel:
         self.events.append("terminate")
         self._fault("terminate")
 
-    def reap(self) -> None:
+    def reap(self) -> int:
         self.events.append("reap")
         self._fault("reap")
+        return self.exit_status  # type: ignore[return-value]
 
     def close_pipes(self) -> None:
         self.events.append("close_pipes")
@@ -99,8 +101,8 @@ class _FakeSpawner:
         return self.kernel
 
 
-def _launcher(chunks, *, faults=None):
-    kernel = _FakeKernel(chunks, faults=faults)
+def _launcher(chunks, *, faults=None, exit_status: object = 0):
+    kernel = _FakeKernel(chunks, faults=faults, exit_status=exit_status)
     spawner = _FakeSpawner(kernel)
     return (
         ResolverHelperLauncher(spawner, executable=EXECUTABLE),
@@ -109,10 +111,17 @@ def _launcher(chunks, *, faults=None):
     )
 
 
-def _ready(chunks=None, *, faults=None, observer=None):
+def _ready(
+    chunks=None,
+    *,
+    faults=None,
+    exit_status: object = 0,
+    observer=None,
+):
     launcher, spawner, kernel = _launcher(
         [READY_FRAME] if chunks is None else chunks,
         faults=faults,
+        exit_status=exit_status,
     )
     guard = launcher.launch_ready(
         lifecycle_id=LIFECYCLE_ID,
@@ -172,6 +181,10 @@ class W09ResolverLifecycleTest(unittest.TestCase):
         self.assertEqual(receipt.dns_start_id, DNS_START_ID)
         self.assertEqual(receipt.raw_transcript_byte_size, len(RESULT))
         self.assertEqual(receipt.start_frame_digest, start_frame_digest(kernel.writes[0]))
+        self.assertIs(receipt.stdout_eof, True)
+        self.assertIs(receipt.child_reaped, True)
+        self.assertEqual(receipt.child_exit_status, 0)
+        self.assertIs(receipt.helper_pipes_closed, True)
         receipt.validate_integrity()
         self.assertIs(copy.copy(receipt), receipt)
         self.assertIs(copy.deepcopy(receipt), receipt)
@@ -192,7 +205,10 @@ class W09ResolverLifecycleTest(unittest.TestCase):
             forged._validate_exact_issuance(
                 _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
             )
-        self.assertEqual(attempt.safe_metadata()["state"], "result_read")
+        self.assertEqual(attempt.safe_metadata()["state"], "result_attested")
+        self.assertEqual(kernel.events[-3:], ["read", "reap", "close_pipes"])
+        self.assertEqual(kernel.read_limits[-1], 1)
+        self.assertEqual(_cleanup_counts(kernel), (0, 1, 1))
         self.assertTrue(attempt.cleanup())
         self.assertFalse(attempt.cleanup())
 
@@ -212,7 +228,7 @@ class W09ResolverLifecycleTest(unittest.TestCase):
         self.assertEqual(frame["attempt_permit_id"], str(ATTEMPT_ID))
         self.assertEqual(frame["transport_claim_id"], str(CLAIM_ID))
         self.assertEqual(frame["dns_start_id"], str(DNS_START_ID))
-        self.assertEqual(_cleanup_counts(kernel), (1, 1, 1))
+        self.assertEqual(_cleanup_counts(kernel), (0, 1, 1))
 
     def test_spawn_and_ready_metadata_never_receive_target_or_secret(self):
         pre, spawner, kernel = _ready()
@@ -366,6 +382,183 @@ class W09ResolverLifecycleTest(unittest.TestCase):
                     attempt.read_result_receipt()
                 self.assertEqual(_cleanup_counts(kernel), (1, 1, 1))
 
+    def test_result_second_frame_in_next_chunk_fails_closed(self):
+        pre, _, kernel = _ready(
+            [
+                READY_FRAME,
+                RESULT + b"\n",
+                b'{"kind":"RESULT"}\n',
+            ]
+        )
+        attempt = _transfer(pre)
+        _start(attempt)
+
+        with self.assertRaises(EndpointPolicyError):
+            attempt.read_result_receipt()
+
+        self.assertIsNone(attempt._ledger._issued_receipt)
+        self.assertEqual(kernel.read_limits[-1], 1)
+        self.assertEqual(_cleanup_counts(kernel), (1, 1, 1))
+        self.assertEqual(attempt.safe_metadata()["state"], "terminal")
+
+    def test_result_second_frame_in_same_chunk_fails_closed(self):
+        pre, _, kernel = _ready(
+            [READY_FRAME, RESULT + b"\n" + b'{"kind":"RESULT"}\n']
+        )
+        attempt = _transfer(pre)
+        _start(attempt)
+
+        with self.assertRaises(EndpointPolicyError):
+            attempt.read_result_receipt()
+
+        self.assertIsNone(attempt._ledger._issued_receipt)
+        self.assertEqual(_cleanup_counts(kernel), (1, 1, 1))
+        self.assertEqual(attempt.safe_metadata()["state"], "terminal")
+
+    def test_result_eof_probe_rejects_invalid_read_contract(self):
+        for name, invalid in (
+            ("mutable", bytearray()),
+            ("text", ""),
+            ("overread", b"xx"),
+        ):
+            with self.subTest(name=name):
+                pre, _, kernel = _ready([READY_FRAME, RESULT + b"\n"])
+                attempt = _transfer(pre)
+                _start(attempt)
+                original_read = kernel.read_stdout
+                eof_calls = 0
+
+                def invalid_eof_read(max_bytes):
+                    nonlocal eof_calls
+                    if max_bytes == 1:
+                        eof_calls += 1
+                        return invalid
+                    return original_read(max_bytes)
+
+                with patch.object(
+                    kernel,
+                    "read_stdout",
+                    side_effect=invalid_eof_read,
+                ):
+                    with self.assertRaises(EndpointPolicyError):
+                        attempt.read_result_receipt()
+
+                self.assertEqual(eof_calls, 1)
+                self.assertIsNone(attempt._ledger._issued_receipt)
+                self.assertEqual(_cleanup_counts(kernel), (1, 1, 1))
+                self.assertEqual(attempt.safe_metadata()["state"], "terminal")
+
+    def test_result_eof_probe_base_exception_reads_once(self):
+        pre, _, kernel = _ready([READY_FRAME, RESULT + b"\n"])
+        attempt = _transfer(pre)
+        _start(attempt)
+        original_read = kernel.read_stdout
+        eof_calls = 0
+
+        def fail_eof_read(max_bytes):
+            nonlocal eof_calls
+            if max_bytes == 1:
+                eof_calls += 1
+                raise KeyboardInterrupt("raw EOF read")
+            return original_read(max_bytes)
+
+        with patch.object(kernel, "read_stdout", side_effect=fail_eof_read):
+            with self.assertRaisesRegex(KeyboardInterrupt, "raw EOF"):
+                attempt.read_result_receipt()
+
+        self.assertEqual(eof_calls, 1)
+        self.assertIsNone(attempt._ledger._issued_receipt)
+        self.assertEqual(_cleanup_counts(kernel), (1, 1, 1))
+        self.assertEqual(attempt.safe_metadata()["state"], "terminal")
+
+    def test_result_requires_exact_plain_zero_exit_status(self):
+        cases = (
+            ("positive", 1),
+            ("signal", -9),
+            ("bool", True),
+            ("none", None),
+            ("text", "0"),
+            ("float", 0.0),
+        )
+        for name, exit_status in cases:
+            with self.subTest(name=name):
+                pre, _, kernel = _ready(
+                    [READY_FRAME, RESULT + b"\n"],
+                    exit_status=exit_status,
+                )
+                attempt = _transfer(pre)
+                _start(attempt)
+
+                with self.assertRaises(EndpointPolicyError):
+                    attempt.read_result_receipt()
+
+                self.assertIsNone(attempt._ledger._issued_receipt)
+                self.assertEqual(kernel.events.count("reap"), 1)
+                self.assertEqual(kernel.events.count("terminate"), 0)
+                self.assertEqual(kernel.events.count("close_pipes"), 1)
+                counts = _cleanup_counts(kernel)
+                try:
+                    attempt.cleanup()
+                except EndpointPolicyError:
+                    pass
+                self.assertEqual(_cleanup_counts(kernel), counts)
+
+    def test_result_reap_and_close_faults_never_repeat_actions(self):
+        cases = (
+            ("reap", KeyboardInterrupt("raw result reap")),
+            ("close_pipes", RuntimeError("raw result close")),
+            ("close_pipes", KeyboardInterrupt("raw result close base")),
+        )
+        for action, error in cases:
+            with self.subTest(action=action, error_type=type(error).__name__):
+                pre, _, kernel = _ready(
+                    [READY_FRAME, RESULT + b"\n"],
+                    faults={action: error},
+                )
+                attempt = _transfer(pre)
+                _start(attempt)
+
+                with self.assertRaises(type(error)):
+                    attempt.read_result_receipt()
+
+                self.assertIsNone(attempt._ledger._issued_receipt)
+                self.assertEqual(kernel.events.count("reap"), 1)
+                self.assertEqual(kernel.events.count("terminate"), 0)
+                self.assertEqual(kernel.events.count("close_pipes"), 1)
+                counts = _cleanup_counts(kernel)
+                with self.assertRaises(EndpointPolicyError):
+                    attempt.cleanup()
+                self.assertEqual(_cleanup_counts(kernel), counts)
+                self.assertEqual(
+                    attempt.safe_metadata()["state"],
+                    "cleanup_failed",
+                )
+
+    def test_result_action_commit_then_raise_never_repeats_kernel_actions(self):
+        for method_name in ("commit_result_reap", "commit_result_pipe_close"):
+            with self.subTest(method_name=method_name):
+                pre, _, kernel = _ready([READY_FRAME, RESULT + b"\n"])
+                attempt = _transfer(pre)
+                _start(attempt)
+                ledger_type = type(attempt._ledger)
+                original_commit = getattr(ledger_type, method_name)
+
+                def commit_then_raise(instance, *args, **kwargs):
+                    original_commit(instance, *args, **kwargs)
+                    raise RuntimeError(f"{method_name} postcommit")
+
+                with patch.object(
+                    ledger_type,
+                    method_name,
+                    new=commit_then_raise,
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "postcommit"):
+                        attempt.read_result_receipt()
+
+                self.assertIsNone(attempt._ledger._issued_receipt)
+                self.assertEqual(_cleanup_counts(kernel), (0, 1, 1))
+                self.assertEqual(attempt.safe_metadata()["state"], "terminal")
+
     def test_result_limit_excludes_lf_and_exact_limit_receives_a_receipt(self):
         transcript = b"x" * MAX_RESULT_TRANSCRIPT_BYTES
         pre, _, kernel = _ready([READY_FRAME, transcript + b"\n"])
@@ -376,8 +569,9 @@ class W09ResolverLifecycleTest(unittest.TestCase):
 
         self.assertEqual(receipt.raw_transcript_byte_size, 16 * 1024)
         self.assertEqual(MAX_RESULT_FRAME_BYTES, MAX_RESULT_TRANSCRIPT_BYTES + 1)
+        self.assertEqual(_cleanup_counts(kernel), (0, 1, 1))
         attempt.cleanup()
-        self.assertEqual(_cleanup_counts(kernel), (1, 1, 1))
+        self.assertEqual(_cleanup_counts(kernel), (0, 1, 1))
 
     def test_receipt_recomputed_after_raw_tamper_cannot_replace_ledger_snapshot(self):
         pre, _, kernel = _ready([READY_FRAME, RESULT + b"\n"])
@@ -404,7 +598,7 @@ class W09ResolverLifecycleTest(unittest.TestCase):
             )
 
         self.assertTrue(attempt.cleanup())
-        self.assertEqual(_cleanup_counts(kernel), (1, 1, 1))
+        self.assertEqual(_cleanup_counts(kernel), (0, 1, 1))
 
     def test_result_observer_fault_returns_no_receipt_and_cleans_owner(self):
         pre, _, kernel = _ready([READY_FRAME, RESULT + b"\n"])
@@ -413,8 +607,8 @@ class W09ResolverLifecycleTest(unittest.TestCase):
         returned = []
 
         def fail_after_commit(event, metadata):
-            self.assertEqual(event, "result_read")
-            self.assertEqual(metadata["state"], "result_read")
+            self.assertEqual(event, "result_attested")
+            self.assertEqual(metadata["state"], "result_attested")
             raise RuntimeError("result observer fault")
 
         with self.assertRaisesRegex(RuntimeError, "result observer fault"):
@@ -422,9 +616,13 @@ class W09ResolverLifecycleTest(unittest.TestCase):
 
         self.assertEqual(returned, [])
         self.assertEqual(attempt.safe_metadata()["state"], "terminal")
-        self.assertEqual(_cleanup_counts(kernel), (1, 1, 1))
+        self.assertEqual(_cleanup_counts(kernel), (0, 1, 1))
         terminal_receipt = attempt._ledger._issued_receipt
         self.assertIs(type(terminal_receipt), ResolverResultReceipt)
+        self.assertIs(terminal_receipt.stdout_eof, True)
+        self.assertIs(terminal_receipt.child_reaped, True)
+        self.assertEqual(terminal_receipt.child_exit_status, 0)
+        self.assertIs(terminal_receipt.helper_pipes_closed, True)
         with self.assertRaisesRegex(ValueError, "exactly issued"):
             terminal_receipt._validate_exact_issuance(
                 _authority=_TRANSPORT_ATTEMPT_AUTHORITY,

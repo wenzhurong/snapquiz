@@ -246,8 +246,9 @@ class _Kernel:
     def terminate(self) -> None:
         self.events.append("terminate")
 
-    def reap(self) -> None:
+    def reap(self) -> int:
         self.events.append("reap")
+        return 0
 
     def close_pipes(self) -> None:
         self.events.append("close_pipes")
@@ -528,8 +529,8 @@ class W09ResolutionPublicationTest(unittest.TestCase):
         _, _, attempt, _, guard, _, _ = publication
 
         def fail_after_issue(event, metadata):
-            self.assertEqual(event, "result_read")
-            self.assertEqual(metadata["state"], "result_read")
+            self.assertEqual(event, "result_attested")
+            self.assertEqual(metadata["state"], "result_attested")
             raise RuntimeError("observer after RESULT issue")
 
         try:

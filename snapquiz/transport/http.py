@@ -198,8 +198,9 @@ class PreparedResolverAttempt:
     """Factory-only owner of one resolved, not-yet-wired attempt.
 
     B2b can consume the exact attempt, credential handle, and ResolutionSet.
-    If it does not, the caller must explicitly call :meth:`close` to reap the
-    helper, terminalize the owner-bound attempt, and close the secret handle.
+    The RESULT path has already reaped the helper and closed its pipes.  If B2b
+    does not consume this object, the caller must explicitly call :meth:`close`
+    to terminalize the helper ledger, owner-bound attempt, and secret handle.
     """
 
     __slots__ = (

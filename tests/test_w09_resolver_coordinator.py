@@ -100,17 +100,22 @@ class _FakeKernel:
         *,
         result_address: str,
         cleanup_fault: BaseException | None = None,
+        close_fault: BaseException | None = None,
     ) -> None:
         self._chunks = [READY_FRAME]
         self.events = events
         self.writes: list[bytes] = []
         self.result_address = result_address
         self.cleanup_fault = cleanup_fault
+        self.close_fault = close_fault
 
     def read_stdout(self, max_bytes: int) -> bytes:
-        self.events.append(
-            "ready_read" if not self.writes else "result_read"
-        )
+        if not self.writes:
+            self.events.append("ready_read")
+        elif self._chunks:
+            self.events.append("result_read")
+        else:
+            self.events.append("result_eof")
         if not self._chunks:
             return b""
         selected = self._chunks.pop(0)
@@ -137,11 +142,14 @@ class _FakeKernel:
         if self.cleanup_fault is not None:
             raise self.cleanup_fault
 
-    def reap(self) -> None:
+    def reap(self) -> int:
         self.events.append("reap")
+        return 0
 
     def close_pipes(self) -> None:
         self.events.append("close_pipes")
+        if self.close_fault is not None:
+            raise self.close_fault
 
 
 class _FakeSpawner:
@@ -224,12 +232,14 @@ def _components(
     result_address: str = "8.8.8.8",
     source_value=VALID_SECRET,
     cleanup_fault: BaseException | None = None,
+    close_fault: BaseException | None = None,
 ):
     events: list[str] = []
     kernel = _FakeKernel(
         events,
         result_address=result_address,
         cleanup_fault=cleanup_fault,
+        close_fault=close_fault,
     )
     spawner = _FakeSpawner(kernel, events)
     launcher = ResolverHelperLauncher(spawner, executable=EXECUTABLE)
@@ -273,7 +283,15 @@ def _poison_real_io():
 
 
 class W09ResolverCoordinatorTest(unittest.TestCase):
-    def _coordinate(self, launcher, resolver, gate, credential):
+    def _coordinate(
+        self,
+        launcher,
+        resolver,
+        gate,
+        credential,
+        *,
+        observer=None,
+    ):
         with _poison_real_io():
             return coordinate_resolver_attempt(
                 launcher=launcher,
@@ -283,6 +301,7 @@ class W09ResolverCoordinatorTest(unittest.TestCase):
                 lifecycle_id=LIFECYCLE_ID,
                 transport_claim_id=TRANSPORT_CLAIM_ID,
                 dns_start_id=DNS_START_ID,
+                observer=observer,
             )
 
     def test_strict_order_exact_proofs_and_explicit_close(self):
@@ -293,13 +312,16 @@ class W09ResolverCoordinatorTest(unittest.TestCase):
 
         self.assertIs(type(prepared), PreparedResolverAttempt)
         self.assertEqual(
-            events[:5],
+            events[:8],
             [
                 "spawn",
                 "ready_read",
                 "credential_read",
                 "start_write",
                 "result_read",
+                "result_eof",
+                "reap",
+                "close_pipes",
             ],
         )
         self.assertEqual(len(spawner.requests), 1)
@@ -326,14 +348,18 @@ class W09ResolverCoordinatorTest(unittest.TestCase):
             gate,
         )
         self.assertFalse(prepared.is_closed)
-        self.assertEqual(_cleanup_counts(kernel), (0, 0, 0))
+        self.assertEqual(_cleanup_counts(kernel), (0, 1, 1))
+        self.assertTrue(prepared.result_receipt.stdout_eof)
+        self.assertTrue(prepared.result_receipt.child_reaped)
+        self.assertEqual(prepared.result_receipt.child_exit_status, 0)
+        self.assertTrue(prepared.result_receipt.helper_pipes_closed)
         self.assertEqual(_consumed_budgets(runtime), (1, 1, 1))
 
         self.assertTrue(prepared.close())
         self.assertFalse(prepared.close())
         self.assertTrue(prepared.is_closed)
         self.assertTrue(prepared.credential_handle.is_closed)
-        self.assertEqual(_cleanup_counts(kernel), (1, 1, 1))
+        self.assertEqual(_cleanup_counts(kernel), (0, 1, 1))
         self.assertEqual(
             runtime.context_ledger.safe_metadata()["in_flight_attempt_count"],
             0,
@@ -1027,7 +1053,7 @@ class W09ResolverCoordinatorTest(unittest.TestCase):
         self.assertEqual(raised.exception.stage, "address_policy")
         self.assertEqual(events.count("start_write"), 1)
         self.assertEqual(events.count("result_read"), 1)
-        self.assertEqual(_cleanup_counts(kernel), (1, 1, 1))
+        self.assertEqual(_cleanup_counts(kernel), (0, 1, 1))
         self.assertEqual(
             runtime.context_ledger.safe_metadata()["in_flight_attempt_count"],
             0,
@@ -1037,32 +1063,52 @@ class W09ResolverCoordinatorTest(unittest.TestCase):
         self.assertEqual(state.status, "closed")
         self.assertIsNone(state.secret)
 
-    def test_close_keeps_gate_and_handle_when_helper_cleanup_is_unproven(self):
+    def test_result_attestation_observer_fault_closes_gate_and_credential(self):
         runtime, gate, credential = _make_authorized_credential()
-        launcher, resolver, _, _, kernel, _ = _components(
-            cleanup_fault=RuntimeError("synthetic terminate failure")
-        )
-        prepared = self._coordinate(launcher, resolver, gate, credential)
+        launcher, resolver, _, _, kernel, _ = _components()
+        observations = []
 
-        with self.assertRaises(EndpointPolicyError) as raised:
-            prepared.close()
+        def fail_after_attestation(event, metadata):
+            observations.append((event, metadata["state"]))
+            if event == "result_attested":
+                raise RuntimeError("result attestation observer fault")
 
-        self.assertEqual(raised.exception.stage, "resolver_helper")
-        self.assertFalse(prepared.is_closed)
-        self.assertFalse(prepared.credential_handle.is_closed)
-        self.assertEqual(_cleanup_counts(kernel), (1, 1, 1))
+        with self.assertRaisesRegex(RuntimeError, "attestation observer"):
+            self._coordinate(
+                launcher,
+                resolver,
+                gate,
+                credential,
+                observer=fail_after_attestation,
+            )
+
+        self.assertIn(("result_attested", "result_attested"), observations)
+        self.assertEqual(_cleanup_counts(kernel), (0, 1, 1))
         self.assertEqual(
             runtime.context_ledger.safe_metadata()["in_flight_attempt_count"],
-            1,
+            0,
         )
-        attempt_state = gate._attempt_permits[
-            prepared.attempt_permit.attempt_permit_id
-        ]
-        self.assertEqual(attempt_state.status, "io_claimed")
-        self.assertEqual(attempt_state.transport_claim_id, TRANSPORT_CLAIM_ID)
+        handle_state = next(iter(resolver._ledger._states.values()))
+        self.assertEqual(handle_state.status, "closed")
+        self.assertIsNone(handle_state.secret)
+
+    def test_close_never_repeats_attested_helper_actions(self):
+        runtime, gate, credential = _make_authorized_credential()
+        launcher, resolver, _, _, kernel, _ = _components()
+        prepared = self._coordinate(launcher, resolver, gate, credential)
+        kernel.cleanup_fault = RuntimeError("terminate must stay unreachable")
+
+        self.assertTrue(prepared.close())
+        self.assertTrue(prepared.is_closed)
+        self.assertTrue(prepared.credential_handle.is_closed)
+        self.assertEqual(_cleanup_counts(kernel), (0, 1, 1))
+        self.assertEqual(
+            runtime.context_ledger.safe_metadata()["in_flight_attempt_count"],
+            0,
+        )
         handle_state = resolver._ledger._states[prepared.credential_handle]
-        self.assertEqual(handle_state.status, "active")
-        self.assertIsNotNone(handle_state.secret)
+        self.assertEqual(handle_state.status, "closed")
+        self.assertIsNone(handle_state.secret)
 
     def test_close_retains_handle_until_attempt_finish_is_proven(self):
         runtime, gate, credential = _make_authorized_credential()
@@ -1079,7 +1125,7 @@ class W09ResolverCoordinatorTest(unittest.TestCase):
 
         self.assertFalse(prepared.is_closed)
         self.assertFalse(prepared.credential_handle.is_closed)
-        self.assertEqual(_cleanup_counts(kernel), (1, 1, 1))
+        self.assertEqual(_cleanup_counts(kernel), (0, 1, 1))
         self.assertEqual(
             runtime.context_ledger.safe_metadata()["in_flight_attempt_count"],
             1,
@@ -1091,7 +1137,7 @@ class W09ResolverCoordinatorTest(unittest.TestCase):
         self.assertTrue(prepared.close())
         self.assertTrue(prepared.is_closed)
         self.assertTrue(prepared.credential_handle.is_closed)
-        self.assertEqual(_cleanup_counts(kernel), (1, 1, 1))
+        self.assertEqual(_cleanup_counts(kernel), (0, 1, 1))
         self.assertEqual(
             runtime.context_ledger.safe_metadata()["in_flight_attempt_count"],
             0,
@@ -1100,15 +1146,13 @@ class W09ResolverCoordinatorTest(unittest.TestCase):
     def test_failure_does_not_drop_recovery_anchor_on_cleanup_fault(self):
         runtime, gate, credential = _make_authorized_credential()
         launcher, resolver, _, _, kernel, _ = _components(
-            result_address="127.0.0.1",
-            cleanup_fault=RuntimeError("synthetic terminate failure"),
+            close_fault=RuntimeError("synthetic close failure"),
         )
 
-        with self.assertRaises(EndpointPolicyError) as raised:
+        with self.assertRaisesRegex(RuntimeError, "synthetic close failure"):
             self._coordinate(launcher, resolver, gate, credential)
 
-        self.assertEqual(raised.exception.stage, "address_policy")
-        self.assertEqual(_cleanup_counts(kernel), (1, 1, 1))
+        self.assertEqual(_cleanup_counts(kernel), (0, 1, 1))
         self.assertEqual(
             runtime.context_ledger.safe_metadata()["in_flight_attempt_count"],
             1,
@@ -1135,7 +1179,7 @@ class W09ResolverCoordinatorTest(unittest.TestCase):
                 self._coordinate(launcher, resolver, gate, credential)
 
         self.assertEqual(raised.exception.stage, "address_policy")
-        self.assertEqual(_cleanup_counts(kernel), (1, 1, 1))
+        self.assertEqual(_cleanup_counts(kernel), (0, 1, 1))
         self.assertEqual(
             runtime.context_ledger.safe_metadata()["in_flight_attempt_count"],
             1,
