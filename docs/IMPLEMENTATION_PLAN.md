@@ -4,7 +4,7 @@
 >
 > **实施基线**：`2026-08-31`，W09-A 与 W09-B0 的远端基线为 `main@8a50b7d`；W09-B1 已在本工作包完成离线实现与验证
 >
-> **实现快照**：M0–M4、M5/W08、W09-A 与 W09-B0 已完成、提交并推送；M5 仍在进行。本工作包又完成 W09-B1 的 factory-only `CredentialHandle`、私有 mutable-secret ledger、built-in GLM frozen-binding resolver、caller handle proof、owner-only one-shot borrow 与 fault/race cleanup。production credential source、B2 cancellable DNS/peer、B3 exact TLS/HTTP 与 B4 全资源终态矩阵仍未实现，因此仍没有可发送 Transport。用户已有的 `README.md` 改动保持未暂存且未被本轮修改。应用仍被有意冻结，没有真实截图、真实人机预览、出站传输或可执行解题链。
+> **实现快照**：M0–M4、M5/W08、W09-A、W09-B0 与 W09-B1 已完成、提交并推送至 `main@543d390`；M5 仍在进行。当前未提交工作区推进了 W09-B2a 的 caller-owned `io_claimed`、terminal-guard/DNS START proof、冻结地址策略、ResolutionSet/pure peer matcher 与 injected helper lifecycle 原语。唯一 coordinator、cancellable native helper、result/start binding、真实 DNS/numeric connect/peer、B3 exact TLS/HTTP 与 B4 全资源终态矩阵仍未实现，因此仍没有可发送 Transport。用户已有的 `README.md` 改动保持未暂存且未被本轮修改。应用仍被有意冻结，没有真实截图、真实人机预览、出站传输或可执行解题链。
 >
 > **规范来源**：[`ARCHITECTURE.md`](./ARCHITECTURE.md) 是目标行为与安全约束的唯一规范；本文只负责依赖顺序、工作包、状态和验收证据，不能弱化 Spec。
 
@@ -177,7 +177,7 @@ W09-A 已提交并推送的离线边界：
 - factory-only、immutable `ConsentUseLease` 绑定 grant 的授权前/消费后 revision、Authorization、approval、exact session/ledger、plan/stage/operation/invocation、capture/credential/envelope 与半开有效期；AttemptGate 不接收 lease 或 bypass 参数，而是在每个 resolver pre-read、budget reserve 与 transport pre-wire 阶段从 exact session 自动查询账本映射。普通 PrivacyGate 在 grant 消费后仍拒绝旧 AuthorizationContext，只有该 exact session 的 lease-aware authority 路径可以继续；
 - 当前 permit 路径是零 I/O 原语，不读取 secret、不构造 client、不解析 DNS，也不发送 HTTP；已消费的 attempt budget 不因失败或取消退还。
 
-因此 M5 仍为 `in_progress`：W09-A 与 W09-B0 已进入远端 `main@8a50b7d`，W09-B1 已在本工作包完成最终增量复核和离线故障/竞态矩阵，未发现剩余 P0/P1。W09-B1 complete 只表示延迟 secret resolve、handle proof、owner-only one-shot borrow 与凭据终态合同成立；W09-B 仍缺 production cancellable DNS、TLS/hostname、精确单请求 HTTP/1.1 `send_once`、DNS 全结果、连接 peer/rebinding、redirect 禁止、bounded response 与完整 I/O cleanup。Phase 1 Transport 固定走自有的 exact 单请求 HTTP/1.1 路径，不使用 SDK/httpx 的隐式行为；禁止自动 retry、redirect、连接池复用、HTTP/2、proxy、chunked request 与透明压缩，任何额外 HTTP 请求都必须是新的获批 attempt。
+因此 M5 仍为 `in_progress`：W09-A、W09-B0 与 W09-B1 已进入远端 `main@543d390`；当前未提交工作区推进了 W09-B2a 的 owner-bound AttemptGate、纯地址策略与 injected helper lifecycle 离线原语。W09-B1 complete 只表示延迟 secret resolve、handle proof、owner-only one-shot borrow 与凭据终态合同成立；当前 B2a 也只表示 fake-kernel 下的 READY/ownership/START/地址整组策略原语成立，尚未达到 complete。W09-B 仍缺唯一 coordinator、cancellable production DNS/native strict-spawn、result/start proof binding、numeric connect、TLS/hostname、精确单请求 HTTP/1.1 `send_once`、真实连接 peer/rebinding、redirect 禁止、bounded response 与完整 I/O cleanup。Phase 1 Transport 固定走自有的 exact 单请求 HTTP/1.1 路径，不使用 SDK/httpx 的隐式行为；禁止自动 retry、redirect、连接池复用、HTTP/2、proxy、chunked request 与透明压缩，任何额外 HTTP 请求都必须是新的获批 attempt。
 
 production DNS resolver 是 W09-B/M5 的硬门槛：解析必须可取消、可观测并受同一 monotonic deadline 严格约束，校验全部解析结果，并在连接后核对实际 peer 以阻止 rebinding。把不可取消的 `getaddrinfo` 留在后台、仅让前台超时返回不算满足门槛；该问题未解决前只能推进 fake resolver/transport 的离线矩阵，不得将 W09-B 或 M5 标记 complete。
 
@@ -192,6 +192,8 @@ W09-B0 已冻结后续实施顺序与边界：
 - **B4 fault/race/cleanup**：覆盖每个 resource acquisition 点、并发 claim/replay、blocked resolver cancellation、mixed DNS、peer mismatch、TLS、partial wire、wire commit vs revoke、3xx 不二发、framing 与 terminal cleanup；claimed attempt 在任一 BaseException 下 exactly-once 终结，handle/helper/pipe/selector/raw+TLS socket/Gate activity/in-flight 全清，预算不退且 cleanup error 无 raw cause/context。另取 macOS resolver liveness 证据；B4 前不得把 W09-B/M5、live API、Provider 可用性或 supported 标记 complete。
 
 W09-B1 本工作包已完成：`CredentialResolver.resolve()` 只消费 exact permit，并以 caller-generated resolver owner 先独占 Gate；built-in GLM binding 的 exact lookup、一次 fake-source read、1..4096-byte Bearer 校验、post-read full-authority recheck、handle proof 确认与安全异常映射均已落地。`CredentialHandle` 不可复制/序列化，secret 只在私有 mutable buffer 中持有；borrow 期间 Gate 以 owner-specific marker 阻止 attempt 终结或第二借用者释放其状态，完成后先释放 view/清零 ledger secret，再释放 marker。resolve/close/borrow 的 pre-commit、commit-then-raise、BaseException、并发 owner/publication/close 与 traceback-local 泄漏均有永久回归；默认测试阻断 environment/file/DNS/socket 并只用 fake source。完整离线测试为 401/401，W09 三模块为 61/61，关键六场景连续 20 轮通过；96 个 Python 文件通过 3.10 AST grammar，`compileall`、依赖方向与 `git diff --check` 通过。本机实际运行时仍为 Python 3.12.13，真实 Python 3.10 runtime suite 证据仍缺失。该状态不包含 production credential source、DNS、socket、HTTP、Provider API 或可执行 Transport。
+
+W09-B2a 当前工作区已完成第一段离线原语：AttemptGate transport claim 使用 caller UUID 并线性化为 `io_claimed`，terminal guard 与 DNS START 以 primitive ID/digest exact 绑定；finish/abandon 的 commit-then-raise 不再错误重开终态。`transport/address_policy.py` 冻结内容寻址 IANA literal policy，严格解析 canonical JSON transcript，在去重前限制 32 条/16 KiB，任一非法候选整组拒绝，随后确定性去重排序并生成 AttemptPermit-bound `ResolutionSet`；pure peer matcher 只做 family/packed/port 精确比较。`transport/resolver.py` 只接受 injected `HelperSpawner/HelperKernel`，以 ledger object identity 执行 READY→ownership transfer→single START→bounded result→cleanup 状态；production spawner 仍零进程 fail-closed。新增后的 W09 owner tests 为 66/66，完整离线 suite 为 436/436，99 个 Python 文件通过 3.10 AST grammar，`compileall` 与 `git diff --check` 通过；本机仍为 Python 3.12.13。B2a 还必须补唯一 coordinator、deadline/cancellation、child exit/result-to-START proof、cleanup-failure recovery 合同；B2b 再补 native helper/spawn shim、真实 process/pipe/select/kill/reap/FD liveness、DNS、numeric socket/connect/getpeername。当前不包含 HTTP 或 Provider API，因此 W09-B2/M5 继续保持未完成。
 
 ### M6：合成图 live smoke
 
@@ -228,8 +230,9 @@ W09-B1 本工作包已完成：`CredentialResolver.resolve()` 只消费 exact pe
 | W09-A | Runtime authority、ConsentUseLease 与 two-stage attempt permits | W08 | `privacy/consent.py`、`transport/session.py`、`runtime/clock.py`、`runtime/authority.py`、`runtime/context.py`、`runtime/attempt.py` | privacy 后立即建 Context、deadline/cancel、generation/session lease、原子预算、resolver/transport one-shot claim |
 | W09-B0 | Credential/DNS/Transport 合同冻结 | W09-A | Spec、Plan | handle proof、post-read/pre-wire authority、可取消 DNS、全结果/peer、wire framing 与 limits |
 | W09-B1 | CredentialHandle 与 frozen-binding resolver | W09-B0 | `transport/credentials.py`、`runtime/attempt.py`（单向依赖） | exact-one-read、handle proof、post-read authority、header value、并发/重放、泄漏/清理、零 DNS/socket |
-| W09-B2 | 可取消 DNS、地址策略与 peer binding | W09-B1 | `transport/http.py`、resolver helper | cancel/reap、全结果整组策略、numeric connect、peer/rebinding |
-| W09-B3 | exact nonblocking TLS/HTTP/1.1 `send_once` | W09-B2 | `transport/http.py` | TLS/hostname/SNI、single request、严格 framing/limits、零 redirect/retry |
+| W09-B2a | owner、地址策略与 helper 离线生命周期 | W09-B1 | `runtime/attempt.py`、`transport/address_policy.py`、`transport/resolver.py` | `io_claimed` owner/guard、READY/transfer/single START、16 KiB/32 条整组地址策略、coordinator/cancel/result binding、production fail-closed |
+| W09-B2b | production 可取消 DNS、numeric connect 与 peer binding | W09-B2a | `transport/http.py`、native resolver helper/spawn shim | strict no-fork/close-FD、cancel/kill/reap、单 numeric connect、真实 peer/rebinding |
+| W09-B3 | exact nonblocking TLS/HTTP/1.1 `send_once` | W09-B2b | `transport/http.py` | TLS/hostname/SNI、single request、严格 framing/limits、零 redirect/retry |
 | W09-B4 | Transport 故障/竞态/终态矩阵 | W09-B3 | `tests/test_w09_transport.py` | 每个资源点 cleanup、首字节线性化、macOS resolver liveness |
 | W10 | 新 multimodal pipeline | W06,W07,W09-B4 | `pipelines/multimodal.py` | 完整 gate 顺序和故障矩阵 |
 | W11 | GLM synthetic live smoke | W03,W10 | `scripts/`、非敏感 fixture | M0 已完成；opt-in 单次实调证据 |
@@ -240,7 +243,7 @@ W09-B1 本工作包已完成：`CredentialResolver.resolve()` 只消费 exact pe
 
 W01/W02 可以与 W03 并行，但 W04 之后的任何运行时接线都必须等待 W03；W11/W13 的任何 synthetic live 之前均必须完成 W03/M0；W12 之前禁止真实用户截图远程发送。
 
-当前工作包状态：W01–W09-A 与 W09-B0 complete 并已推送至 `main@8a50b7d`；W09-B1 complete；W09-B2–B4 与 W10–W15 为 `pending`。W09-B1 complete 只表示离线 CredentialHandle/resolver 与 secret lifecycle 原语存在，仍不表示 production credential source、DNS/HTTP Transport、Provider、真实 macOS 捕获、传输或发布链可用，因此 M5 保持 `in_progress`。
+当前工作包状态：W01–W09-B1 complete 并已推送至 `main@543d390`；W09-B2a 第一段离线原语已在当前工作区实现但整个 B2a 仍为 `in_progress` 且尚未提交；W09-B2b–B4 与 W10–W15 为 `pending`。当前增量只表示 owner/address/fake-helper 原语存在，仍不表示 production credential source、resolver/process、DNS/numeric connect/HTTP Transport、Provider、真实 macOS 捕获、传输或发布链可用，因此 W09-B2 与 M5 保持 `in_progress`。
 
 ## 6. 测试与证据矩阵
 
@@ -269,9 +272,9 @@ W01/W02 可以与 W03 并行，但 W04 之后的任何运行时接线都必须�
 
 ## 7. 近期执行顺序
 
-1. **已完成并推送** M5/W08、W09-A 与 W09-B0，远端基线为 `main@8a50b7d`；
-2. **本工作包已完成** W09-B1：CredentialHandle、私有 secret ledger、frozen-binding resolver、caller handle proof 与 owner-only one-shot borrow 已通过离线合同、安全和竞态矩阵；
-3. **下一步**实现 W09-B2 production cancellable resolver、全结果地址策略、numeric connect 与 peer/rebinding proof；随后完成 B3 exact Transport 与 B4 全资源矩阵；
+1. **已完成并推送** M5/W08、W09-A、W09-B0 与 W09-B1，远端基线为 `main@543d390`；
+2. **当前工作区已实现、尚未提交** W09-B2a 第一段：owner-bound `io_claimed`、terminal-guard/DNS START proof、内容寻址地址策略、ResolutionSet/pure peer matcher 与 injected helper lifecycle 已通过离线合同和故障矩阵；
+3. **下一步**先收口 W09-B2a 的唯一 coordinator、deadline/cancellation、result/start proof 与 cleanup-failure recovery，再实现 W09-B2b native strict-spawn production resolver、真实 cancel/kill/reap/FD liveness、numeric single-connect 与 peer/rebinding proof；随后完成 B3 exact Transport 与 B4 全资源矩阵；
 4. W09-A/W09-B 完成后组装 W10 multimodal pipeline，跑从 PrivacyGate 到 result validation 的完整 gate 顺序和副作用负向矩阵；
 5. 只有上述离线工作全部通过并获得另行明确授权，才在 M6/W11 使用固定非敏感合成图执行一次、无自动 retry 的首次真实 API smoke；
 6. M6/W11 通过后，再于 M7/W12 接入真实 macOS topology/选区/用户截图纵切；
@@ -300,3 +303,5 @@ W01/W02 可以与 W03 并行，但 W04 之后的任何运行时接线都必须�
 - W08 专项离线 `unittest` 为 31/31，工作区完整离线 `unittest` 为 305/305；三类新增竞态又重复执行 90 次通过。实现与验证未读取 secret、构造 SDK/client、访问文件/环境、sleep、执行真实截图、DNS/socket/HTTP、Provider live API 或真实 macOS TCC/E2E。W08 已提交并推送为 `8333adf feat: add one-shot egress authorization`；`README.md` 用户改动仍保持未暂存且未被本轮修改。
 - 完成 M5/W09-A 并连同 W09-B0 提交推送为 `8a50b7d feat: add runtime attempt authorization`：新增 trusted clock/monotonic deadline、Registry/Policy lease、RuntimeCallFactory/CallContext、operation/global/billable budget、cancellation/close、session-bound one-shot ConsentUseLease 与 two-stage AttemptGate permit；同时冻结 B1 CredentialHandle/frozen-binding resolver、B2 production cancellable DNS/all-result/peer、B3 exact nonblocking TLS/HTTP/1.1 与 B4 fault/race/cleanup。该提交不包含真实 secret、capture、DNS/socket/HTTP、Provider API、合并或部署；用户 `README.md` 改动未被纳入。
 - 完成 M5/W09-B1：新增 factory-only `CredentialHandle`、私有 mutable-secret ledger、built-in GLM exact frozen-binding resolver、resolver claim owner、caller-supplied handle proof、AttemptPermit v2 与 owner-specific one-shot borrow marker；严格 Bearer 校验与 typed error/source-traceback 清理、resolve/close/borrow 的单故障和 commit-then-raise、handle-return publication、并发 owner/close/finish、replay/tamper/zero-I/O 均有回归。W09 三模块 61/61、完整离线测试 401/401、关键六场景连续 20 轮通过；96 个 Python 文件通过 3.10 AST grammar，`compileall`、依赖方向与 `git diff --check` 通过。本机为 Python 3.12.13，真实 3.10 runtime suite 仍缺失。未读取真实环境凭据，未执行 capture、DNS/socket/HTTP 或 Provider API；production credential source 与 W09-B2–B4 仍未完成，M5 保持 `in_progress`。
+- W09-B1 已提交并推送为 `543d390 feat: add frozen credential resolution`；仅包含 Spec/Plan、AttemptPermit v2、CredentialHandle/resolver 与对应测试，用户已有 `README.md` 改动继续保持未暂存且未纳入。提交与推送未读取真实 secret，未执行 capture、DNS/socket/HTTP、Provider API、合并或部署。
+- 推进 M5/W09-B2a 第一段离线原语：AttemptGate 增加 caller-owned `io_claimed`、exact terminal guard 与 one-shot DNS START proof，并修复 terminal commit-then-raise 的错误重开风险；新增冻结 IANA-2025-10-09 policy 的 `address_policy`、AttemptPermit-bound `ResolutionSet`、pure peer matcher，以及 injected fake-kernel 的 resolver READY/owner-transfer/single-START/bounded-result/cleanup ledger。完整离线测试 436/436、W09 owner 相关三模块 66/66、99 文件 Python 3.10 grammar、compileall 与 diff check 通过；全程零真实进程、凭据、DNS/socket/HTTP。production spawner 明确 fail-closed，B2a coordinator/cancellation/result binding/cleanup recovery 与 B2b native launcher/真实 liveness/numeric connect、B3–B4 仍待完成；本批当前尚未提交。

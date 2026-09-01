@@ -802,11 +802,23 @@ class _CredentialPermitState:
 
 
 class _AttemptPermitState:
-    __slots__ = ("permit", "status", "credential_borrow_id")
+    __slots__ = (
+        "permit",
+        "status",
+        "transport_claim_id",
+        "terminal_guard_id",
+        "terminal_guard_digest",
+        "dns_start_id",
+        "credential_borrow_id",
+    )
 
     def __init__(self, permit: AttemptPermit) -> None:
         self.permit = permit
         self.status = "active"
+        self.transport_claim_id: UUID | None = None
+        self.terminal_guard_id: UUID | None = None
+        self.terminal_guard_digest: Digest256 | None = None
+        self.dns_start_id: UUID | None = None
         self.credential_borrow_id: UUID | None = None
 
 
@@ -1631,6 +1643,11 @@ class AttemptGate:
         credential_snapshot = self._snapshot_slots(credential)
         permit_snapshot = self._snapshot_slots(permit)
         old_attempt_status = state.status
+        old_transport_claim_id = state.transport_claim_id
+        old_terminal_guard_id = state.terminal_guard_id
+        old_terminal_guard_digest = state.terminal_guard_digest
+        old_dns_start_id = state.dns_start_id
+        old_credential_borrow_id = state.credential_borrow_id
         old_credential_status = credential_state.status
         try:
             credential._release_authority_refs(
@@ -1640,6 +1657,11 @@ class AttemptGate:
                 _authority=_PERMIT_RELEASE_AUTHORITY,
             )
             state.status = terminal_status
+            state.transport_claim_id = None
+            state.terminal_guard_id = None
+            state.terminal_guard_digest = None
+            state.dns_start_id = None
+            state.credential_borrow_id = None
             credential_state.status = "finished"
             if (
                 self._active_by_session.get(permit.session_id)
@@ -1651,6 +1673,11 @@ class AttemptGate:
             self._restore_slots(credential, credential_snapshot)
             self._restore_slots(permit, permit_snapshot)
             state.status = old_attempt_status
+            state.transport_claim_id = old_transport_claim_id
+            state.terminal_guard_id = old_terminal_guard_id
+            state.terminal_guard_digest = old_terminal_guard_digest
+            state.dns_start_id = old_dns_start_id
+            state.credential_borrow_id = old_credential_borrow_id
             credential_state.status = old_credential_status
             self._active_by_session[permit.session_id] = active_id
             raise
@@ -1872,22 +1899,54 @@ class AttemptGate:
             raise _attempt_error("attempt 的凭据句柄证明已经变化。")
         return credential
 
+    @staticmethod
+    def _require_transport_owner_locked(
+        state: _AttemptPermitState,
+        claim_id: UUID,
+    ) -> None:
+        if state.transport_claim_id != claim_id:
+            raise _attempt_error("attempt 不属于当前 transport owner。")
+
+    @staticmethod
+    def _require_terminal_guard_proof_locked(
+        state: _AttemptPermitState,
+        *,
+        guard_id: UUID | None,
+        guard_digest: Digest256 | None,
+    ) -> None:
+        if state.terminal_guard_id is None:
+            if guard_id is not None or guard_digest is not None:
+                raise _attempt_error("attempt 尚未绑定 terminal guard。")
+            return
+        if (
+            state.terminal_guard_id != guard_id
+            or state.terminal_guard_digest != guard_digest
+        ):
+            raise _attempt_error("attempt 的 terminal guard 证明不匹配。")
+
     def _claim_attempt(
         self,
         permit: AttemptPermit,
         *,
+        claim_id: UUID,
         _authority: object | None = None,
     ) -> AttemptPermit:
-        """Revalidate and atomically claim immediately before wire work."""
+        """Revalidate and atomically assign one transport owner before I/O."""
 
         if _authority is not _TRANSPORT_ATTEMPT_AUTHORITY:
             raise TypeError("attempt claim requires trusted transport")
+        if type(claim_id) is not UUID:
+            raise _attempt_error("transport claim owner 无效。")
         if type(permit) is not AttemptPermit:
             raise TypeError("permit must be AttemptPermit")
         with self._lock:
             initial_state = self._lookup_attempt_state_locked(permit)
             if (
                 initial_state.status != "active"
+                or initial_state.transport_claim_id is not None
+                or initial_state.terminal_guard_id is not None
+                or initial_state.terminal_guard_digest is not None
+                or initial_state.dns_start_id is not None
                 or initial_state.credential_borrow_id is not None
             ):
                 raise _attempt_error("attempt permit 已被领取或终结。")
@@ -1905,6 +1964,7 @@ class AttemptGate:
                 credential._context,
                 credential._context_ledger,
             )
+            initial_state.transport_claim_id = claim_id
             initial_state.status = "claiming"
         (
             planned,
@@ -1935,11 +1995,12 @@ class AttemptGate:
                 state = self._lookup_attempt_state_locked(permit)
                 if (
                     state.status != "claiming"
+                    or state.transport_claim_id != claim_id
                     or state.credential_borrow_id is not None
                 ):
                     raise _attempt_error("attempt permit 已被领取或终结。")
                 self._require_attempt_credential_proof_locked(permit)
-                state.status = "sending"
+                state.status = "io_claimed"
                 return permit
 
         try:
@@ -1960,9 +2021,261 @@ class AttemptGate:
         except BaseException:
             with self._lock:
                 current = self._lookup_attempt_state_locked(permit)
-                if current.status == "claiming":
+                if (
+                    current.status == "claiming"
+                    and current.transport_claim_id == claim_id
+                ):
                     current.status = "active"
+                    current.transport_claim_id = None
             raise
+
+    def _attempt_claim_is_owned(
+        self,
+        permit: AttemptPermit,
+        *,
+        claim_id: UUID,
+        _authority: object | None = None,
+    ) -> bool:
+        """Observe an exact caller-generated owner after claim raises."""
+
+        if _authority is not _TRANSPORT_ATTEMPT_AUTHORITY:
+            raise TypeError("attempt claim observation requires transport")
+        if type(claim_id) is not UUID:
+            return False
+        with self._lock:
+            state = self._lookup_attempt_state_locked(permit)
+            return (
+                state.transport_claim_id == claim_id
+                and state.status
+                in (
+                    "claiming",
+                    "io_claimed",
+                    "dns_starting",
+                    "wire_committing",
+                    "wire_committed",
+                    "finishing",
+                )
+            )
+
+    def _bind_terminal_guard(
+        self,
+        permit: AttemptPermit,
+        *,
+        claim_id: UUID,
+        guard_id: UUID,
+        guard_digest: Digest256,
+        _authority: object | None = None,
+    ) -> None:
+        """Bind the proof of an already completed local helper handoff once."""
+
+        if _authority is not _TRANSPORT_ATTEMPT_AUTHORITY:
+            raise TypeError("terminal guard binding requires trusted transport")
+        if type(claim_id) is not UUID or type(guard_id) is not UUID:
+            raise _attempt_error("transport 或 terminal guard owner 无效。")
+        if type(guard_digest) is not Digest256:
+            raise _attempt_error("terminal guard digest 无效。")
+        with self._lock:
+            state = self._lookup_attempt_state_locked(permit)
+            if (
+                state.status != "io_claimed"
+                or state.terminal_guard_id is not None
+                or state.terminal_guard_digest is not None
+                or state.dns_start_id is not None
+                or state.credential_borrow_id is not None
+            ):
+                raise _attempt_error("attempt 当前不能绑定 terminal guard。")
+            self._require_transport_owner_locked(state, claim_id)
+            self._require_attempt_credential_proof_locked(permit)
+            state.terminal_guard_id = guard_id
+            state.terminal_guard_digest = guard_digest
+
+    def _terminal_guard_is_bound(
+        self,
+        permit: AttemptPermit,
+        *,
+        claim_id: UUID,
+        guard_id: UUID,
+        guard_digest: Digest256,
+        _authority: object | None = None,
+    ) -> bool:
+        """Observe exact helper ownership proof after a bind fault."""
+
+        if _authority is not _TRANSPORT_ATTEMPT_AUTHORITY:
+            raise TypeError("terminal guard observation requires transport")
+        if (
+            type(claim_id) is not UUID
+            or type(guard_id) is not UUID
+            or type(guard_digest) is not Digest256
+        ):
+            return False
+        with self._lock:
+            state = self._lookup_attempt_state_locked(permit)
+            return (
+                state.transport_claim_id == claim_id
+                and state.terminal_guard_id == guard_id
+                and state.terminal_guard_digest == guard_digest
+                and state.status
+                in (
+                    "io_claimed",
+                    "dns_starting",
+                    "wire_committing",
+                    "wire_committed",
+                    "finishing",
+                )
+            )
+
+    def _commit_dns_start(
+        self,
+        permit: AttemptPermit,
+        *,
+        claim_id: UUID,
+        guard_id: UUID,
+        guard_digest: Digest256,
+        start_id: UUID,
+        _authority: object | None = None,
+    ) -> None:
+        """Revalidate all authority immediately before one helper START."""
+
+        if _authority is not _TRANSPORT_ATTEMPT_AUTHORITY:
+            raise TypeError("DNS start commit requires trusted transport")
+        if (
+            type(claim_id) is not UUID
+            or type(guard_id) is not UUID
+            or type(start_id) is not UUID
+        ):
+            raise _attempt_error("DNS START owner proof 无效。")
+        if type(guard_digest) is not Digest256:
+            raise _attempt_error("terminal guard digest 无效。")
+        with self._lock:
+            initial_state = self._lookup_attempt_state_locked(permit)
+            if (
+                initial_state.status != "io_claimed"
+                or initial_state.dns_start_id is not None
+                or initial_state.credential_borrow_id is not None
+            ):
+                raise _attempt_error("attempt 当前不能提交 DNS START。")
+            self._require_transport_owner_locked(initial_state, claim_id)
+            self._require_terminal_guard_proof_locked(
+                initial_state,
+                guard_id=guard_id,
+                guard_digest=guard_digest,
+            )
+            credential = self._require_attempt_credential_proof_locked(permit)
+            bindings = (
+                credential._planned,
+                credential._invocation,
+                credential._prepared,
+                credential._authorization,
+                credential._consent_ledger,
+                credential._session,
+                credential._approval_ledger,
+                credential._session_ledger,
+                credential._authority_ledger,
+                credential._context,
+                credential._context_ledger,
+            )
+            initial_state.dns_start_id = start_id
+            initial_state.status = "dns_starting"
+        (
+            planned,
+            invocation,
+            prepared,
+            authorization,
+            consent_ledger,
+            session,
+            approval_ledger,
+            session_ledger,
+            authority_ledger,
+            context,
+            context_ledger,
+        ) = bindings
+
+        def commit(
+            stage: ExecutionPlanStage,
+            operation: ExecutionPlanNetworkOperation,
+            sample: ClockSample,
+        ) -> None:
+            del stage, operation
+            if (
+                sample.wall_time < session.issued_at
+                or sample.wall_time >= session.valid_until
+            ):
+                raise _attempt_error("发送会话已经过期或尚未生效。")
+            with self._lock:
+                state = self._lookup_attempt_state_locked(permit)
+                if (
+                    state.status != "dns_starting"
+                    or state.transport_claim_id != claim_id
+                    or state.dns_start_id != start_id
+                    or state.credential_borrow_id is not None
+                ):
+                    raise _attempt_error("DNS START 提交状态已经变化。")
+                self._require_terminal_guard_proof_locked(
+                    state,
+                    guard_id=guard_id,
+                    guard_digest=guard_digest,
+                )
+                self._require_attempt_credential_proof_locked(permit)
+                state.status = "io_claimed"
+
+        try:
+            self._run_authority_path(
+                planned=planned,
+                invocation=invocation,
+                prepared=prepared,
+                authorization=authorization,
+                consent_ledger=consent_ledger,
+                session=session,
+                approval_ledger=approval_ledger,
+                session_ledger=session_ledger,
+                authority_ledger=authority_ledger,
+                context=context,
+                context_ledger=context_ledger,
+                final_action=commit,
+            )
+        except BaseException:
+            with self._lock:
+                current = self._lookup_attempt_state_locked(permit)
+                if (
+                    current.status == "dns_starting"
+                    and current.transport_claim_id == claim_id
+                    and current.dns_start_id == start_id
+                ):
+                    current.status = "io_claimed"
+                    current.dns_start_id = None
+            raise
+
+    def _dns_start_is_committed(
+        self,
+        permit: AttemptPermit,
+        *,
+        claim_id: UUID,
+        guard_id: UUID,
+        guard_digest: Digest256,
+        start_id: UUID,
+        _authority: object | None = None,
+    ) -> bool:
+        """Observe only a completed, proof-exact START authorization."""
+
+        if _authority is not _TRANSPORT_ATTEMPT_AUTHORITY:
+            raise TypeError("DNS start observation requires transport")
+        if (
+            type(claim_id) is not UUID
+            or type(guard_id) is not UUID
+            or type(guard_digest) is not Digest256
+            or type(start_id) is not UUID
+        ):
+            return False
+        with self._lock:
+            state = self._lookup_attempt_state_locked(permit)
+            return (
+                state.status
+                in ("io_claimed", "wire_committing", "wire_committed", "finishing")
+                and state.transport_claim_id == claim_id
+                and state.terminal_guard_id == guard_id
+                and state.terminal_guard_digest == guard_digest
+                and state.dns_start_id == start_id
+            )
 
     def _begin_credential_borrow(
         self,
@@ -1983,7 +2296,7 @@ class AttemptGate:
             raise _attempt_error("凭据句柄证明无效。")
         with self._lock:
             state = self._lookup_attempt_state_locked(permit)
-            if state.status != "sending":
+            if state.status != "io_claimed":
                 raise _attempt_error("attempt 当前不能借用凭据。")
             if state.credential_borrow_id is not None:
                 raise _attempt_error("attempt 已有凭据借用 owner。")
@@ -2011,7 +2324,7 @@ class AttemptGate:
         with self._lock:
             state = self._lookup_attempt_state_locked(permit)
             if (
-                state.status != "sending"
+                state.status != "io_claimed"
                 or state.credential_borrow_id != borrow_id
                 or permit.credential_handle_id != handle_id
                 or permit.credential_handle_digest != handle_digest
@@ -2041,7 +2354,7 @@ class AttemptGate:
             ):
                 raise _attempt_error("attempt 的凭据句柄证明不匹配。")
             return (
-                state.status == "sending"
+                state.status == "io_claimed"
                 and state.credential_borrow_id == borrow_id
             )
 
@@ -2061,7 +2374,7 @@ class AttemptGate:
         with self._lock:
             state = self._lookup_attempt_state_locked(permit)
             if (
-                state.status != "sending"
+                state.status != "io_claimed"
                 or state.credential_borrow_id != borrow_id
                 or permit.credential_handle_id != handle_id
                 or permit.credential_handle_digest != handle_digest
@@ -2086,7 +2399,14 @@ class AttemptGate:
             state = self._lookup_attempt_state_locked(permit)
             if state.status in ("abandoned", "finished"):
                 return False
-            if state.status != "active" or state.credential_borrow_id is not None:
+            if (
+                state.status != "active"
+                or state.transport_claim_id is not None
+                or state.terminal_guard_id is not None
+                or state.terminal_guard_digest is not None
+                or state.dns_start_id is not None
+                or state.credential_borrow_id is not None
+            ):
                 raise _attempt_error("已领取或正在终结的 attempt 不能废弃。")
             context_ledger = permit._context_ledger
             reservation = permit._reservation
@@ -2121,7 +2441,8 @@ class AttemptGate:
             )
         except BaseException:
             with self._lock:
-                state.status = "active"
+                if state.status == "abandoning":
+                    state.status = "active"
             raise
         return True
 
@@ -2129,31 +2450,60 @@ class AttemptGate:
         self,
         permit: AttemptPermit,
         *,
+        claim_id: UUID,
+        guard_id: UUID | None = None,
+        guard_digest: Digest256 | None = None,
         _authority: object | None = None,
     ) -> bool:
         """Release in-flight state; consumed budgets are never refunded."""
 
         if _authority is not _TRANSPORT_ATTEMPT_AUTHORITY:
             raise TypeError("attempt completion requires trusted transport")
+        if type(claim_id) is not UUID:
+            raise _attempt_error("transport claim owner 无效。")
+        if (guard_id is None) != (guard_digest is None):
+            raise _attempt_error("terminal guard 证明不完整。")
+        if guard_id is not None and type(guard_id) is not UUID:
+            raise _attempt_error("terminal guard owner 无效。")
+        if guard_digest is not None and type(guard_digest) is not Digest256:
+            raise _attempt_error("terminal guard digest 无效。")
         if type(permit) is not AttemptPermit:
             raise TypeError("permit must be AttemptPermit")
         with self._lock:
             state = self._lookup_attempt_state_locked(permit)
             if state.status in ("finished", "abandoned"):
                 return False
-            if state.status != "sending" or state.credential_borrow_id is not None:
+            if (
+                state.status not in ("io_claimed", "wire_committed")
+                or state.credential_borrow_id is not None
+            ):
                 raise _attempt_error("attempt permit 尚未由 transport 领取。")
+            self._require_transport_owner_locked(state, claim_id)
+            self._require_terminal_guard_proof_locked(
+                state,
+                guard_id=guard_id,
+                guard_digest=guard_digest,
+            )
             context_ledger = permit._context_ledger
             reservation = permit._reservation
             credential = permit._credential_permit
             context = credential._context
+            previous_status = state.status
             state.status = "finishing"
 
         def terminal() -> None:
             with self._lock:
                 current = self._lookup_attempt_state_locked(permit)
-                if current.status != "finishing":
+                if (
+                    current.status != "finishing"
+                    or current.transport_claim_id != claim_id
+                ):
                     raise _attempt_error("attempt 终结状态已经变化。")
+                self._require_terminal_guard_proof_locked(
+                    current,
+                    guard_id=guard_id,
+                    guard_digest=guard_digest,
+                )
                 credential_state = self._credential_permits[
                     permit.credential_permit_id
                 ]
@@ -2176,9 +2526,27 @@ class AttemptGate:
             )
         except BaseException:
             with self._lock:
-                state.status = "sending"
+                if (
+                    state.status == "finishing"
+                    and state.transport_claim_id == claim_id
+                ):
+                    state.status = previous_status
             raise
         return True
+
+    def _attempt_is_terminal(
+        self,
+        permit: AttemptPermit,
+        *,
+        _authority: object | None = None,
+    ) -> bool:
+        """Observe terminal commit without reopening on an outer fault."""
+
+        if _authority is not _TRANSPORT_ATTEMPT_AUTHORITY:
+            raise TypeError("attempt terminal observation requires transport")
+        with self._lock:
+            state = self._lookup_attempt_state_locked(permit)
+            return state.status in ("finished", "abandoned")
 
     def safe_metadata(self) -> dict[str, int]:
         with self._lock:

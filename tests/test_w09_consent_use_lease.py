@@ -40,6 +40,9 @@ SESSION_AT = NOW + timedelta(seconds=5)
 SECOND_DECISION_ID = UUID("50000000-0000-0000-0000-000000000002")
 _TEST_HANDLE_NAMESPACE = UUID("10515800-6bd7-5f3c-ae75-a295863909b1")
 _TEST_CLAIM_NAMESPACE = UUID("6a7ee735-79dd-5192-bfb5-ab7b4f4cf4b2")
+_TEST_TRANSPORT_CLAIM_NAMESPACE = UUID(
+    "1c78dcad-5aa4-58cd-9736-b353f3a0e393"
+)
 
 
 class _ForbiddenEnvironment:
@@ -161,6 +164,13 @@ def _handle_proof(credential):
     return handle_id, handle_digest
 
 
+def _transport_claim_id(attempt):
+    return uuid5(
+        _TEST_TRANSPORT_CLAIM_NAMESPACE,
+        str(attempt.attempt_permit_id),
+    )
+
+
 def _abandon_resolved(gate, credential):
     handle_id, handle_digest = _handle_proof(credential)
     return gate._abandon_resolved_credential_resolution(
@@ -180,12 +190,15 @@ def _finish_one_attempt(runtime, gate):
         credential_handle_id=handle_id,
         credential_handle_digest=handle_digest,
     )
+    transport_claim_id = _transport_claim_id(attempt)
     gate._claim_attempt(
         attempt,
+        claim_id=transport_claim_id,
         _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
     )
     gate.finish_attempt(
         attempt,
+        claim_id=transport_claim_id,
         _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
     )
     return credential, attempt
@@ -773,6 +786,7 @@ class W09ConsentUseLeaseTest(unittest.TestCase):
         with self.assertRaises((EndpointPolicyError, SnapTimeoutError)):
             wire_gate._claim_attempt(
                 attempt,
+                claim_id=_transport_claim_id(attempt),
                 _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
             )
         self.assertEqual(
@@ -961,6 +975,7 @@ class W09ConsentUseLeaseTest(unittest.TestCase):
         with self.assertRaises(EndpointPolicyError):
             wire_gate._claim_attempt(
                 attempt,
+                claim_id=_transport_claim_id(attempt),
                 _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
             )
         self.assertEqual(

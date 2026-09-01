@@ -11,6 +11,7 @@ from threading import Barrier, Event, Lock, Thread
 from types import TracebackType
 import unittest
 from unittest.mock import patch
+from uuid import UUID, uuid5
 
 from snapquiz.config.profiles import GLM_CREDENTIAL_REF
 from snapquiz.domain.errors import (
@@ -36,6 +37,9 @@ from tests.w09_helpers import make_w09_runtime
 
 SESSION_ISSUED_AT = NOW + timedelta(seconds=5)
 _VALID_SECRET = b"synthetic-token.ABC_123~+/=="
+_TEST_TRANSPORT_CLAIM_NAMESPACE = UUID(
+    "1c78dcad-5aa4-58cd-9736-b353f3a0e393"
+)
 
 
 class _ForbiddenEnvironment:
@@ -168,6 +172,13 @@ def _all_budgets(runtime):
         *runtime.call_context.operation_budgets,
         runtime.call_context.global_network_budget,
         runtime.call_context.billable_budget,
+    )
+
+
+def _transport_claim_id(attempt):
+    return uuid5(
+        _TEST_TRANSPORT_CLAIM_NAMESPACE,
+        str(attempt.attempt_permit_id),
     )
 
 
@@ -591,6 +602,7 @@ class W09CredentialResolverTest(unittest.TestCase):
         )
         gate._claim_attempt(
             attempt,
+            claim_id=_transport_claim_id(attempt),
             _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
         )
         retained_views: list[memoryview] = []
@@ -629,6 +641,7 @@ class W09CredentialResolverTest(unittest.TestCase):
         self.assertTrue(
             gate.finish_attempt(
                 attempt,
+                claim_id=_transport_claim_id(attempt),
                 _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
             )
         )
@@ -722,6 +735,7 @@ class W09CredentialResolverTest(unittest.TestCase):
         )
         gate._claim_attempt(
             attempt,
+            claim_id=_transport_claim_id(attempt),
             _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
         )
         retained: list[memoryview] = []
@@ -744,6 +758,7 @@ class W09CredentialResolverTest(unittest.TestCase):
         self.assertTrue(
             gate.finish_attempt(
                 attempt,
+                claim_id=_transport_claim_id(attempt),
                 _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
             )
         )
@@ -761,6 +776,7 @@ class W09CredentialResolverTest(unittest.TestCase):
         )
         gate._claim_attempt(
             attempt,
+            claim_id=_transport_claim_id(attempt),
             _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
         )
         entered = Event()
@@ -797,6 +813,7 @@ class W09CredentialResolverTest(unittest.TestCase):
         with self.assertRaises(EndpointPolicyError):
             gate.finish_attempt(
                 attempt,
+                claim_id=_transport_claim_id(attempt),
                 _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
             )
         with self.assertRaises(EndpointPolicyError):
@@ -826,6 +843,7 @@ class W09CredentialResolverTest(unittest.TestCase):
         self.assertTrue(
             gate.finish_attempt(
                 attempt,
+                claim_id=_transport_claim_id(attempt),
                 _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
             )
         )
@@ -843,6 +861,7 @@ class W09CredentialResolverTest(unittest.TestCase):
         )
         gate._claim_attempt(
             attempt,
+            claim_id=_transport_claim_id(attempt),
             _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
         )
         original_begin = AttemptGate._begin_credential_borrow
@@ -881,6 +900,7 @@ class W09CredentialResolverTest(unittest.TestCase):
         self.assertTrue(
             gate.finish_attempt(
                 attempt,
+                claim_id=_transport_claim_id(attempt),
                 _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
             )
         )
@@ -904,6 +924,7 @@ class W09CredentialResolverTest(unittest.TestCase):
                 )
                 gate._claim_attempt(
                     attempt,
+                    claim_id=_transport_claim_id(attempt),
                     _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
                 )
                 finish_calls = 0
@@ -949,6 +970,7 @@ class W09CredentialResolverTest(unittest.TestCase):
                 self.assertTrue(
                     gate.finish_attempt(
                         attempt,
+                        claim_id=_transport_claim_id(attempt),
                         _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
                     )
                 )

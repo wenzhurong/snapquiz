@@ -45,6 +45,13 @@ from tests.w09_helpers import make_w09_runtime
 SESSION_ISSUED_AT = NOW + timedelta(seconds=5)
 _TEST_HANDLE_NAMESPACE = UUID("10515800-6bd7-5f3c-ae75-a295863909b1")
 _TEST_CLAIM_NAMESPACE = UUID("6a7ee735-79dd-5192-bfb5-ab7b4f4cf4b2")
+_TEST_TRANSPORT_CLAIM_NAMESPACE = UUID(
+    "1c78dcad-5aa4-58cd-9736-b353f3a0e393"
+)
+_TEST_TERMINAL_GUARD_NAMESPACE = UUID(
+    "56133922-befc-5a9f-bd3e-086df91aaf86"
+)
+_TEST_DNS_START_NAMESPACE = UUID("b08c4dc4-4296-55cb-bfde-47ced6dc56a7")
 
 
 def _handle_proof(
@@ -64,6 +71,35 @@ def _handle_proof(
 
 def _claim_id(permit: CredentialResolutionPermit) -> UUID:
     return uuid5(_TEST_CLAIM_NAMESPACE, str(permit.permit_id))
+
+
+def _transport_claim_id(permit: AttemptPermit, suffix: str = "owner") -> UUID:
+    return uuid5(
+        _TEST_TRANSPORT_CLAIM_NAMESPACE,
+        f"{permit.attempt_permit_id}:{suffix}",
+    )
+
+
+def _terminal_guard_proof(
+    permit: AttemptPermit,
+) -> tuple[UUID, Digest256]:
+    guard_id = uuid5(
+        _TEST_TERMINAL_GUARD_NAMESPACE,
+        str(permit.attempt_permit_id),
+    )
+    return guard_id, digest256(
+        "TestAttemptTerminalGuard",
+        "snapquiz.test-attempt-terminal-guard.v1",
+        {
+            "attempt_permit_id": permit.attempt_permit_id,
+            "attempt_permit_digest": permit.attempt_permit_digest,
+            "guard_id": guard_id,
+        },
+    )
+
+
+def _dns_start_id(permit: AttemptPermit) -> UUID:
+    return uuid5(_TEST_DNS_START_NAMESPACE, str(permit.attempt_permit_id))
 
 
 def _make_runtime():
@@ -232,8 +268,10 @@ class W09AttemptGateTest(unittest.TestCase):
         runtime = _make_runtime()
         gate = AttemptGate()
         credential, attempt = _reserve(runtime, gate)
+        transport_claim_id = _transport_claim_id(attempt)
         gate._claim_attempt(
             attempt,
+            claim_id=transport_claim_id,
             _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
         )
         original_release = AttemptPermit._release_authority_refs
@@ -250,12 +288,13 @@ class W09AttemptGateTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "injected attempt"):
                 gate.finish_attempt(
                     attempt,
+                    claim_id=transport_claim_id,
                     _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
                 )
 
         attempt_state = gate._attempt_permits[attempt.attempt_permit_id]
         credential_state = gate._credential_permits[credential.permit_id]
-        self.assertEqual(attempt_state.status, "sending")
+        self.assertEqual(attempt_state.status, "io_claimed")
         self.assertEqual(credential_state.status, "consumed")
         self.assertFalse(attempt._released)
         self.assertFalse(credential._released)
@@ -283,6 +322,7 @@ class W09AttemptGateTest(unittest.TestCase):
         self.assertTrue(
             gate.finish_attempt(
                 attempt,
+                claim_id=transport_claim_id,
                 _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
             )
         )
@@ -465,21 +505,26 @@ class W09AttemptGateTest(unittest.TestCase):
         with self.assertRaises(EndpointPolicyError):
             gate.finish_attempt(
                 attempt,
+                claim_id=_transport_claim_id(attempt),
                 _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
             )
+        transport_claim_id = _transport_claim_id(attempt)
         gate._claim_attempt(
             attempt,
+            claim_id=transport_claim_id,
             _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
         )
         self.assertTrue(
             gate.finish_attempt(
                 attempt,
+                claim_id=transport_claim_id,
                 _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
             )
         )
         self.assertFalse(
             gate.finish_attempt(
                 attempt,
+                claim_id=transport_claim_id,
                 _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
             )
         )
@@ -703,6 +748,7 @@ class W09AttemptGateTest(unittest.TestCase):
         self.assertFalse(
             gate.finish_attempt(
                 result[0],
+                claim_id=_transport_claim_id(result[0]),
                 _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
             )
         )
@@ -768,13 +814,16 @@ class W09AttemptGateTest(unittest.TestCase):
         barrier = Barrier(3)
         lock = Lock()
         successes = []
+        winning_claim_ids: list[UUID] = []
         errors = []
 
-        def worker() -> None:
+        def worker(suffix: str) -> None:
+            claim_id = _transport_claim_id(attempt, suffix)
             barrier.wait()
             try:
                 claimed = gate._claim_attempt(
                     attempt,
+                    claim_id=claim_id,
                     _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
                 )
             except BaseException as error:
@@ -783,8 +832,12 @@ class W09AttemptGateTest(unittest.TestCase):
             else:
                 with lock:
                     successes.append(claimed)
+                    winning_claim_ids.append(claim_id)
 
-        threads = [Thread(target=worker) for _ in range(2)]
+        threads = [
+            Thread(target=worker, args=(f"worker-{index}",))
+            for index in range(2)
+        ]
         for thread in threads:
             thread.start()
         barrier.wait()
@@ -797,14 +850,384 @@ class W09AttemptGateTest(unittest.TestCase):
         self.assertTrue(
             gate.finish_attempt(
                 attempt,
+                claim_id=winning_claim_ids[0],
                 _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
             )
         )
         with self.assertRaises(EndpointPolicyError):
             gate._claim_attempt(
                 attempt,
+                claim_id=_transport_claim_id(attempt, "replay"),
                 _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
             )
+
+    def test_transport_claim_owner_recovers_precommit_and_observes_postcommit(self):
+        runtime = _make_runtime()
+        gate = AttemptGate()
+        _, attempt = _reserve(runtime, gate)
+        claim_id = _transport_claim_id(attempt)
+
+        with patch.object(
+            AttemptGate,
+            "_run_authority_path",
+            side_effect=RuntimeError("synthetic claim precommit"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "claim precommit"):
+                gate._claim_attempt(
+                    attempt,
+                    claim_id=claim_id,
+                    _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+                )
+
+        state = gate._attempt_permits[attempt.attempt_permit_id]
+        self.assertEqual(state.status, "active")
+        self.assertIsNone(state.transport_claim_id)
+        self.assertFalse(
+            gate._attempt_claim_is_owned(
+                attempt,
+                claim_id=claim_id,
+                _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+            )
+        )
+
+        original = AttemptGate._run_authority_path
+
+        def commit_then_raise(selected, **kwargs):
+            original(selected, **kwargs)
+            raise RuntimeError("synthetic claim postcommit")
+
+        with patch.object(
+            AttemptGate,
+            "_run_authority_path",
+            new=commit_then_raise,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "claim postcommit"):
+                gate._claim_attempt(
+                    attempt,
+                    claim_id=claim_id,
+                    _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+                )
+
+        self.assertEqual(state.status, "io_claimed")
+        self.assertTrue(
+            gate._attempt_claim_is_owned(
+                attempt,
+                claim_id=claim_id,
+                _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+            )
+        )
+        self.assertFalse(
+            gate._attempt_claim_is_owned(
+                attempt,
+                claim_id=_transport_claim_id(attempt, "wrong-owner"),
+                _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+            )
+        )
+        self.assertTrue(
+            gate.finish_attempt(
+                attempt,
+                claim_id=claim_id,
+                _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+            )
+        )
+
+    def test_guard_and_dns_commit_are_owner_bound_and_zero_io(self):
+        runtime = _make_runtime()
+        gate = AttemptGate()
+        _, attempt = _reserve(runtime, gate)
+        claim_id = _transport_claim_id(attempt)
+        guard_id, guard_digest = _terminal_guard_proof(attempt)
+        dns_start_id = _dns_start_id(attempt)
+        gate._claim_attempt(
+            attempt,
+            claim_id=claim_id,
+            _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+        )
+        gate._bind_terminal_guard(
+            attempt,
+            claim_id=claim_id,
+            guard_id=guard_id,
+            guard_digest=guard_digest,
+            _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+        )
+        self.assertTrue(
+            gate._terminal_guard_is_bound(
+                attempt,
+                claim_id=claim_id,
+                guard_id=guard_id,
+                guard_digest=guard_digest,
+                _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+            )
+        )
+        with self.assertRaises(EndpointPolicyError):
+            gate._bind_terminal_guard(
+                attempt,
+                claim_id=claim_id,
+                guard_id=guard_id,
+                guard_digest=guard_digest,
+                _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+            )
+        with self.assertRaises(EndpointPolicyError):
+            gate.finish_attempt(
+                attempt,
+                claim_id=claim_id,
+                _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+            )
+        with self.assertRaises(EndpointPolicyError):
+            gate._commit_dns_start(
+                attempt,
+                claim_id=_transport_claim_id(attempt, "wrong-owner"),
+                guard_id=guard_id,
+                guard_digest=guard_digest,
+                start_id=dns_start_id,
+                _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+            )
+
+        with (
+            patch.object(builtins, "open") as open_file,
+            patch.object(os, "getenv") as getenv,
+            patch.object(socket, "getaddrinfo") as getaddrinfo,
+            patch.object(socket, "socket") as socket_factory,
+            patch.object(time, "sleep") as sleep,
+        ):
+            gate._commit_dns_start(
+                attempt,
+                claim_id=claim_id,
+                guard_id=guard_id,
+                guard_digest=guard_digest,
+                start_id=dns_start_id,
+                _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+            )
+            self.assertTrue(
+                gate._dns_start_is_committed(
+                    attempt,
+                    claim_id=claim_id,
+                    guard_id=guard_id,
+                    guard_digest=guard_digest,
+                    start_id=dns_start_id,
+                    _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+                )
+            )
+        self.assertTrue(
+            gate.finish_attempt(
+                attempt,
+                claim_id=claim_id,
+                guard_id=guard_id,
+                guard_digest=guard_digest,
+                _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+            )
+        )
+        open_file.assert_not_called()
+        getenv.assert_not_called()
+        getaddrinfo.assert_not_called()
+        socket_factory.assert_not_called()
+        sleep.assert_not_called()
+
+    def test_dns_start_postcommit_fault_is_observable_and_not_reopened(self):
+        runtime = _make_runtime()
+        gate = AttemptGate()
+        _, attempt = _reserve(runtime, gate)
+        claim_id = _transport_claim_id(attempt)
+        guard_id, guard_digest = _terminal_guard_proof(attempt)
+        dns_start_id = _dns_start_id(attempt)
+        gate._claim_attempt(
+            attempt,
+            claim_id=claim_id,
+            _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+        )
+        gate._bind_terminal_guard(
+            attempt,
+            claim_id=claim_id,
+            guard_id=guard_id,
+            guard_digest=guard_digest,
+            _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+        )
+        original = AttemptGate._run_authority_path
+
+        def commit_then_raise(selected, **kwargs):
+            original(selected, **kwargs)
+            raise RuntimeError("synthetic DNS START postcommit")
+
+        with patch.object(
+            AttemptGate,
+            "_run_authority_path",
+            new=commit_then_raise,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "START postcommit"):
+                gate._commit_dns_start(
+                    attempt,
+                    claim_id=claim_id,
+                    guard_id=guard_id,
+                    guard_digest=guard_digest,
+                    start_id=dns_start_id,
+                    _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+                )
+
+        state = gate._attempt_permits[attempt.attempt_permit_id]
+        self.assertEqual(state.status, "io_claimed")
+        self.assertEqual(state.dns_start_id, dns_start_id)
+        self.assertTrue(
+            gate._dns_start_is_committed(
+                attempt,
+                claim_id=claim_id,
+                guard_id=guard_id,
+                guard_digest=guard_digest,
+                start_id=dns_start_id,
+                _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+            )
+        )
+        self.assertTrue(
+            gate.finish_attempt(
+                attempt,
+                claim_id=claim_id,
+                guard_id=guard_id,
+                guard_digest=guard_digest,
+                _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+            )
+        )
+
+    def test_cancel_before_dns_start_rolls_back_commit_and_stays_zero_io(self):
+        runtime = _make_runtime()
+        gate = AttemptGate()
+        _, attempt = _reserve(runtime, gate)
+        claim_id = _transport_claim_id(attempt)
+        guard_id, guard_digest = _terminal_guard_proof(attempt)
+        dns_start_id = _dns_start_id(attempt)
+        gate._claim_attempt(
+            attempt,
+            claim_id=claim_id,
+            _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+        )
+        gate._bind_terminal_guard(
+            attempt,
+            claim_id=claim_id,
+            guard_id=guard_id,
+            guard_digest=guard_digest,
+            _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+        )
+        runtime.cancellation_source.cancel(
+            reason=CancellationReason.USER_REQUEST
+        )
+
+        with (
+            patch.object(socket, "getaddrinfo") as getaddrinfo,
+            patch.object(socket, "socket") as socket_factory,
+        ):
+            with self.assertRaises(CancelledError):
+                gate._commit_dns_start(
+                    attempt,
+                    claim_id=claim_id,
+                    guard_id=guard_id,
+                    guard_digest=guard_digest,
+                    start_id=dns_start_id,
+                    _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+                )
+
+        state = gate._attempt_permits[attempt.attempt_permit_id]
+        self.assertEqual(state.status, "io_claimed")
+        self.assertIsNone(state.dns_start_id)
+        self.assertFalse(
+            gate._dns_start_is_committed(
+                attempt,
+                claim_id=claim_id,
+                guard_id=guard_id,
+                guard_digest=guard_digest,
+                start_id=dns_start_id,
+                _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+            )
+        )
+        getaddrinfo.assert_not_called()
+        socket_factory.assert_not_called()
+        self.assertTrue(
+            gate.finish_attempt(
+                attempt,
+                claim_id=claim_id,
+                guard_id=guard_id,
+                guard_digest=guard_digest,
+                _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+            )
+        )
+
+    def test_terminal_commit_then_raise_never_reopens_attempt_state(self):
+        original = CallContextLedger._finish_attempt_and_activity
+
+        def commit_then_raise(ledger, **kwargs):
+            original(ledger, **kwargs)
+            raise RuntimeError("synthetic terminal postcommit")
+
+        runtime = _make_runtime()
+        gate = AttemptGate()
+        _, attempt = _reserve(runtime, gate)
+        claim_id = _transport_claim_id(attempt)
+        gate._claim_attempt(
+            attempt,
+            claim_id=claim_id,
+            _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+        )
+        with patch.object(
+            CallContextLedger,
+            "_finish_attempt_and_activity",
+            new=commit_then_raise,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "terminal postcommit"):
+                gate.finish_attempt(
+                    attempt,
+                    claim_id=claim_id,
+                    _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+                )
+        self.assertEqual(
+            gate._attempt_permits[attempt.attempt_permit_id].status,
+            "finished",
+        )
+        self.assertTrue(
+            gate._attempt_is_terminal(
+                attempt,
+                _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+            )
+        )
+        self.assertEqual(
+            runtime.context_ledger.safe_metadata()["in_flight_attempt_count"],
+            0,
+        )
+        self.assertFalse(
+            gate.finish_attempt(
+                attempt,
+                claim_id=claim_id,
+                _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+            )
+        )
+
+        abandoned_runtime = _make_runtime()
+        abandoned_gate = AttemptGate()
+        _, abandoned = _reserve(abandoned_runtime, abandoned_gate)
+        with patch.object(
+            CallContextLedger,
+            "_finish_attempt_and_activity",
+            new=commit_then_raise,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "terminal postcommit"):
+                abandoned_gate.abandon_attempt(
+                    abandoned,
+                    _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+                )
+        self.assertEqual(
+            abandoned_gate._attempt_permits[
+                abandoned.attempt_permit_id
+            ].status,
+            "abandoned",
+        )
+        self.assertTrue(
+            abandoned_gate._attempt_is_terminal(
+                abandoned,
+                _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+            )
+        )
+        self.assertFalse(
+            abandoned_gate.abandon_attempt(
+                abandoned,
+                _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+            )
+        )
 
     def test_transport_claim_rejects_gate_handle_proof_replacement_and_recovers(self):
         runtime = _make_runtime()
@@ -815,10 +1238,12 @@ class W09AttemptGateTest(unittest.TestCase):
         replacement_digest = Digest256("f" * 64)
         self.assertNotEqual(replacement_digest, original_digest)
         credential_state.credential_handle_digest = replacement_digest
+        transport_claim_id = _transport_claim_id(attempt)
 
         with self.assertRaises(EndpointPolicyError):
             gate._claim_attempt(
                 attempt,
+                claim_id=transport_claim_id,
                 _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
             )
         self.assertEqual(
@@ -830,6 +1255,7 @@ class W09AttemptGateTest(unittest.TestCase):
         self.assertIs(
             gate._claim_attempt(
                 attempt,
+                claim_id=transport_claim_id,
                 _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
             ),
             attempt,
@@ -837,6 +1263,7 @@ class W09AttemptGateTest(unittest.TestCase):
         self.assertTrue(
             gate.finish_attempt(
                 attempt,
+                claim_id=transport_claim_id,
                 _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
             )
         )
@@ -854,6 +1281,7 @@ class W09AttemptGateTest(unittest.TestCase):
         original = AttemptGate._run_authority_path
         claimed: list[AttemptPermit] = []
         errors: list[BaseException] = []
+        transport_claim_id = _transport_claim_id(attempt)
 
         def paused(selected_gate, **kwargs):
             entered.set()
@@ -866,6 +1294,7 @@ class W09AttemptGateTest(unittest.TestCase):
                 claimed.append(
                     gate._claim_attempt(
                         attempt,
+                        claim_id=transport_claim_id,
                         _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
                     )
                 )
@@ -886,6 +1315,7 @@ class W09AttemptGateTest(unittest.TestCase):
             with self.assertRaises(EndpointPolicyError):
                 gate.finish_attempt(
                     attempt,
+                    claim_id=_transport_claim_id(attempt, "wrong-owner"),
                     _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
                 )
             self.assertEqual(
@@ -907,6 +1337,7 @@ class W09AttemptGateTest(unittest.TestCase):
         self.assertTrue(
             gate.finish_attempt(
                 attempt,
+                claim_id=transport_claim_id,
                 _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
             )
         )
@@ -934,12 +1365,15 @@ class W09AttemptGateTest(unittest.TestCase):
             patch.object(time, "sleep") as sleep,
         ):
             credential, attempt = _reserve(runtime, gate)
+            transport_claim_id = _transport_claim_id(attempt)
             gate._claim_attempt(
                 attempt,
+                claim_id=transport_claim_id,
                 _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
             )
             gate.finish_attempt(
                 attempt,
+                claim_id=transport_claim_id,
                 _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
             )
 
