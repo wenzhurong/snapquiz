@@ -374,6 +374,7 @@ class _HandleState:
         "handle",
         "handle_id",
         "handle_digest",
+        "publication_id",
         "permit",
         "gate",
         "secret",
@@ -384,6 +385,7 @@ class _HandleState:
         self,
         *,
         handle: CredentialHandle,
+        publication_id: UUID,
         permit: CredentialResolutionPermit,
         gate: AttemptGate,
         secret: bytearray,
@@ -391,6 +393,10 @@ class _HandleState:
         self.handle = handle
         self.handle_id = handle.handle_id
         self.handle_digest = handle.handle_digest
+        self.publication_id = require_uuid(
+            publication_id,
+            "publication_id",
+        )
         self.permit: CredentialResolutionPermit | None = permit
         self.gate: AttemptGate | None = gate
         self.secret: bytearray | None = secret
@@ -411,6 +417,7 @@ class _CredentialLedger:
     def _issue(
         self,
         *,
+        publication_id: UUID,
         permit: CredentialResolutionPermit,
         operation_id: UUID,
         credential_injection_slot: CredentialInjectionSlot,
@@ -433,6 +440,7 @@ class _CredentialLedger:
             )
             state = _HandleState(
                 handle=handle,
+                publication_id=publication_id,
                 permit=permit,
                 gate=permit._attempt_gate,
                 secret=secret,
@@ -483,6 +491,38 @@ class _CredentialLedger:
             if not self._integrity_is_valid(handle, state):
                 return True
             return state.status == "closed"
+
+    def _recover_active_for_permit(
+        self,
+        permit: CredentialResolutionPermit,
+        *,
+        publication_id: UUID,
+    ) -> CredentialHandle | None:
+        """Return one unique handle for an exact permit/publication pair."""
+
+        if type(publication_id) is not UUID:
+            return None
+
+        with self._lock:
+            matches: list[CredentialHandle] = []
+            for state in self._states.values():
+                handle = state.handle
+                if (
+                    state.status != "active"
+                    or state.publication_id != publication_id
+                    or state.permit is not permit
+                    or state.gate is not permit._attempt_gate
+                    or type(state.secret) is not bytearray
+                    or type(handle) is not CredentialHandle
+                    or handle.credential_permit_id != permit.permit_id
+                    or handle.credential_permit_digest != permit.permit_digest
+                    or not self._integrity_is_valid(handle, state)
+                ):
+                    continue
+                matches.append(handle)
+                if len(matches) > 1:
+                    return None
+            return matches[0] if len(matches) == 1 else None
 
     def _release_info(
         self,
@@ -539,6 +579,7 @@ class _CredentialLedger:
             current.secret = None
             current.permit = None
             current.gate = None
+            current.publication_id = None
             current.status = "closed"
         _best_effort_zero(secret)
         return True
@@ -561,6 +602,7 @@ class _CredentialLedger:
                     current.secret = None
                     current.permit = None
                     current.gate = None
+                    current.publication_id = None
                     current.status = "closed"
         except BaseException:
             # The Gate can no longer reserve or send.  Even if an injected
@@ -574,6 +616,7 @@ class _CredentialLedger:
                 ("secret", None),
                 ("permit", None),
                 ("gate", None),
+                ("publication_id", None),
                 ("status", "closed"),
             ):
                 try:
@@ -595,6 +638,7 @@ class _CredentialLedger:
                 state.secret = None
                 state.permit = None
                 state.gate = None
+                state.publication_id = None
                 state.status = "closed"
         _best_effort_zero(secret)
 
@@ -619,12 +663,14 @@ class _CredentialLedger:
                     current.secret = None
                     current.permit = None
                     current.gate = None
+                    current.publication_id = None
                     current.status = "closed"
                 if state is not None:
                     secret = getattr(state, "secret", None)
                     state.secret = None
                     state.permit = None
                     state.gate = None
+                    state.publication_id = None
                     state.status = "closed"
         except BaseException:
             if state is not None:
@@ -636,6 +682,7 @@ class _CredentialLedger:
                     ("secret", None),
                     ("permit", None),
                     ("gate", None),
+                    ("publication_id", None),
                     ("status", "closed"),
                 ):
                     try:
@@ -666,6 +713,7 @@ class _CredentialLedger:
                     state.secret = None
                     state.permit = None
                     state.gate = None
+                    state.publication_id = None
                     state.status = "closed"
         except BaseException:
             for state in states:
@@ -677,6 +725,7 @@ class _CredentialLedger:
                     ("secret", None),
                     ("permit", None),
                     ("gate", None),
+                    ("publication_id", None),
                     ("status", "closed"),
                 ):
                     try:
@@ -701,6 +750,7 @@ class _CredentialLedger:
                     state.secret = None
                 state.permit = None
                 state.gate = None
+                state.publication_id = None
                 state.status = "closed"
         _best_effort_zero(secret)
 
@@ -719,6 +769,7 @@ class _CredentialLedger:
                     state.secret = None
                     state.permit = None
                     state.gate = None
+                    state.publication_id = None
                     state.status = "closed"
         except BaseException:
             if state is not None:
@@ -726,6 +777,7 @@ class _CredentialLedger:
                     ("secret", None),
                     ("permit", None),
                     ("gate", None),
+                    ("publication_id", None),
                     ("status", "closed"),
                 ):
                     try:
@@ -746,6 +798,7 @@ class _CredentialLedger:
                 state.secret = None
                 state.permit = None
                 state.gate = None
+                state.publication_id = None
                 state.status = "closed"
         for secret in secrets:
             _best_effort_zero(secret)
@@ -968,9 +1021,16 @@ class CredentialResolver:
     def resolve(
         self,
         permit: CredentialResolutionPermit,
+        *,
+        publication_id: UUID | None = None,
     ) -> CredentialHandle:
         if type(permit) is not CredentialResolutionPermit:
             raise TypeError("permit must be CredentialResolutionPermit")
+        exact_publication_id = (
+            uuid4()
+            if publication_id is None
+            else require_uuid(publication_id, "publication_id")
+        )
         gate = permit._attempt_gate
         if type(gate) is not AttemptGate:
             _raise_credential_policy_error()
@@ -1019,6 +1079,7 @@ class CredentialResolver:
                 binding.credential_ref,
             )
             handle = self._ledger._issue(
+                publication_id=exact_publication_id,
                 permit=permit,
                 operation_id=operation.operation_id,
                 credential_injection_slot=binding.credential_injection_slot,
@@ -1028,6 +1089,7 @@ class CredentialResolver:
             gate._confirm_credential_resolution(
                 permit,
                 claim_id=claim_id,
+                publication_id=exact_publication_id,
                 resolved_binding_digest=binding.credential_binding_digest,
                 handle_id=handle.handle_id,
                 handle_digest=handle.handle_digest,
@@ -1132,6 +1194,65 @@ class CredentialResolver:
         assert primary is not None
         _raise_resolver_primary(primary, primary_traceback)
         raise AssertionError("unreachable")
+
+    def _recover_published_handle(
+        self,
+        permit: CredentialResolutionPermit,
+        *,
+        publication_id: UUID,
+        _authority: object | None = None,
+    ) -> CredentialHandle | None:
+        """Recover one exact handle lost after ``resolve`` returned.
+
+        The query exposes only the immutable handle proof, never the private
+        secret buffer.  It returns ``None`` for pre-confirmation, terminal,
+        mismatched, or ambiguous ledger state.
+        """
+
+        if _authority is not _TRANSPORT_ATTEMPT_AUTHORITY:
+            raise TypeError("credential publication recovery requires transport")
+        if (
+            type(permit) is not CredentialResolutionPermit
+            or type(publication_id) is not UUID
+            or permit._attempt_gate is None
+        ):
+            return None
+        gate = permit._attempt_gate
+        if type(gate) is not AttemptGate:
+            return None
+        try:
+            permit.validate_integrity()
+        except (TypeError, ValueError, AttributeError):
+            return None
+
+        handle = self._ledger._recover_active_for_permit(
+            permit,
+            publication_id=publication_id,
+        )
+        if handle is None:
+            return None
+        try:
+            published = gate._resolved_credential_handle_is_active(
+                permit,
+                publication_id=publication_id,
+                handle_id=handle.handle_id,
+                handle_digest=handle.handle_digest,
+                _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+            )
+        except BaseException:
+            return None
+        if not published:
+            return None
+        # Refuse a handle that changed while the Gate proof was observed.
+        return (
+            handle
+            if self._ledger._recover_active_for_permit(
+                permit,
+                publication_id=publication_id,
+            )
+            is handle
+            else None
+        )
 
     def close(self, handle: CredentialHandle) -> bool:
         state, permit, gate, integrity_is_valid = self._ledger._release_info(
@@ -1323,6 +1444,7 @@ class CredentialResolver:
                     state.secret = None
                     state.permit = None
                     state.gate = None
+                    state.publication_id = None
                     state.status = "closed"
                 else:
                     exact = (

@@ -789,6 +789,7 @@ class _CredentialPermitState:
         "resolved_binding",
         "credential_handle_id",
         "credential_handle_digest",
+        "resolved_publication_id",
         "resolver_claim_id",
     )
 
@@ -798,6 +799,7 @@ class _CredentialPermitState:
         self.resolved_binding: Digest256 | ContractMarker | None = None
         self.credential_handle_id: UUID | None = None
         self.credential_handle_digest: Digest256 | None = None
+        self.resolved_publication_id: UUID | None = None
         self.resolver_claim_id: UUID | None = None
 
 
@@ -1162,6 +1164,7 @@ class AttemptGate:
         permit: CredentialResolutionPermit,
         *,
         claim_id: UUID,
+        publication_id: UUID | None = None,
         resolved_binding_digest: Digest256 | ContractMarker,
         handle_id: UUID,
         handle_digest: Digest256,
@@ -1173,12 +1176,19 @@ class AttemptGate:
             raise TypeError("credential confirmation requires trusted resolver")
         if type(claim_id) is not UUID:
             raise _attempt_error("resolver claim owner 无效。")
+        effective_publication_id = (
+            claim_id if publication_id is None else publication_id
+        )
         binding_is_valid = True
         try:
             _require_credential_binding(resolved_binding_digest)
         except (TypeError, ValueError, AttributeError):
             binding_is_valid = False
-        proof_is_valid = type(handle_id) is UUID and type(handle_digest) is Digest256
+        proof_is_valid = (
+            type(effective_publication_id) is UUID
+            and type(handle_id) is UUID
+            and type(handle_digest) is Digest256
+        )
         with self._lock:
             state = self._require_credential_state_locked(permit)
             if (
@@ -1257,6 +1267,7 @@ class AttemptGate:
                 current.resolved_binding = resolved_binding_digest
                 current.credential_handle_id = handle_id
                 current.credential_handle_digest = handle_digest
+                current.resolved_publication_id = effective_publication_id
                 current.resolver_claim_id = None
                 current.status = "resolved"
 
@@ -1399,6 +1410,51 @@ class AttemptGate:
                     "confirming",
                     "failing",
                 )
+            )
+
+    def _resolved_credential_handle_is_active(
+        self,
+        permit: CredentialResolutionPermit,
+        *,
+        publication_id: UUID,
+        handle_id: UUID,
+        handle_digest: Digest256,
+        _authority: object | None = None,
+    ) -> bool:
+        """Observe one exact published resolver handle without consuming it.
+
+        This transport-only query exists for the narrow return-publication
+        window where ``CredentialResolver.resolve`` completed normally but an
+        outer caller lost the returned handle to a ``BaseException``.  A
+        pre-confirmation state, a terminal state, or a mismatched proof is
+        never recoverable.
+        """
+
+        if _authority is not _TRANSPORT_ATTEMPT_AUTHORITY:
+            raise TypeError("credential publication recovery requires transport")
+        if (
+            type(permit) is not CredentialResolutionPermit
+            or type(publication_id) is not UUID
+            or type(handle_id) is not UUID
+            or type(handle_digest) is not Digest256
+            or permit._attempt_gate is not self
+        ):
+            return False
+        with self._lock:
+            try:
+                state = self._lookup_credential_state_locked(permit)
+            except (TypeError, ValueError, AttributeError, EndpointPolicyError):
+                return False
+            return (
+                state.status == "resolved"
+                and state.resolver_claim_id is None
+                and state.resolved_binding
+                == permit.credential_binding_digest
+                and state.credential_handle_id == handle_id
+                and state.credential_handle_digest == handle_digest
+                and state.resolved_publication_id == publication_id
+                and self._active_by_session.get(permit.session_id)
+                == permit.permit_id
             )
 
     def _claim_credential_resolution(
@@ -1610,12 +1666,14 @@ class AttemptGate:
         permit_snapshot = self._snapshot_slots(permit)
         old_status = state.status
         old_claim_id = state.resolver_claim_id
+        old_publication_id = state.resolved_publication_id
         try:
             permit._release_authority_refs(
                 _authority=_PERMIT_RELEASE_AUTHORITY,
             )
             state.status = terminal_status
             state.resolver_claim_id = None
+            state.resolved_publication_id = None
             if self._active_by_session.get(permit.session_id) != permit.permit_id:
                 raise _attempt_error("凭据解析授权的 active session 绑定已经变化。")
             del self._active_by_session[permit.session_id]
@@ -1623,6 +1681,7 @@ class AttemptGate:
             self._restore_slots(permit, permit_snapshot)
             state.status = old_status
             state.resolver_claim_id = old_claim_id
+            state.resolved_publication_id = old_publication_id
             self._active_by_session[permit.session_id] = active_id
             raise
 
@@ -1649,6 +1708,9 @@ class AttemptGate:
         old_dns_start_id = state.dns_start_id
         old_credential_borrow_id = state.credential_borrow_id
         old_credential_status = credential_state.status
+        old_credential_publication_id = (
+            credential_state.resolved_publication_id
+        )
         try:
             credential._release_authority_refs(
                 _authority=_PERMIT_RELEASE_AUTHORITY,
@@ -1663,6 +1725,7 @@ class AttemptGate:
             state.dns_start_id = None
             state.credential_borrow_id = None
             credential_state.status = "finished"
+            credential_state.resolved_publication_id = None
             if (
                 self._active_by_session.get(permit.session_id)
                 != permit.credential_permit_id
@@ -1679,6 +1742,9 @@ class AttemptGate:
             state.dns_start_id = old_dns_start_id
             state.credential_borrow_id = old_credential_borrow_id
             credential_state.status = old_credential_status
+            credential_state.resolved_publication_id = (
+                old_credential_publication_id
+            )
             self._active_by_session[permit.session_id] = active_id
             raise
 
@@ -1854,6 +1920,87 @@ class AttemptGate:
             context_ledger=context_ledger,
             final_action=reserve,
         )
+
+    def _recover_published_attempt(
+        self,
+        *,
+        credential_permit: CredentialResolutionPermit,
+        credential_handle_id: UUID,
+        credential_handle_digest: Digest256,
+        _authority: object | None = None,
+    ) -> AttemptPermit | None:
+        """Recover one unique active/unclaimed attempt by exact input proof.
+
+        ``reserve_attempt`` publishes its permit before returning it.  If an
+        outer wrapper raises after that return but before caller assignment,
+        the trusted transport can use the original credential proof to regain
+        the cleanup anchor.  No partially reserved, claimed, terminal, or
+        ambiguous state is returned.
+        """
+
+        if _authority is not _TRANSPORT_ATTEMPT_AUTHORITY:
+            raise TypeError("attempt publication recovery requires transport")
+        if (
+            type(credential_permit) is not CredentialResolutionPermit
+            or type(credential_handle_id) is not UUID
+            or type(credential_handle_digest) is not Digest256
+            or credential_permit._attempt_gate is not self
+        ):
+            return None
+        try:
+            credential_permit.validate_integrity()
+        except (TypeError, ValueError, AttributeError):
+            return None
+
+        with self._lock:
+            try:
+                credential_state = self._lookup_credential_state_locked(
+                    credential_permit
+                )
+            except (TypeError, ValueError, AttributeError, EndpointPolicyError):
+                return None
+            if (
+                credential_state.status != "consumed"
+                or credential_state.credential_handle_id
+                != credential_handle_id
+                or credential_state.credential_handle_digest
+                != credential_handle_digest
+                or self._active_by_session.get(credential_permit.session_id)
+                != credential_permit.permit_id
+            ):
+                return None
+
+            matches: list[AttemptPermit] = []
+            for candidate_state in self._attempt_permits.values():
+                candidate = candidate_state.permit
+                if (
+                    candidate_state.status != "active"
+                    or candidate_state.transport_claim_id is not None
+                    or candidate_state.terminal_guard_id is not None
+                    or candidate_state.terminal_guard_digest is not None
+                    or candidate_state.dns_start_id is not None
+                    or candidate_state.credential_borrow_id is not None
+                    or type(candidate) is not AttemptPermit
+                    or candidate._attempt_gate is not self
+                    or candidate._credential_permit is not credential_permit
+                    or candidate.credential_permit_id
+                    != credential_permit.permit_id
+                    or candidate.credential_permit_digest
+                    != credential_permit.permit_digest
+                    or candidate.credential_handle_id
+                    != credential_handle_id
+                    or candidate.credential_handle_digest
+                    != credential_handle_digest
+                ):
+                    continue
+                try:
+                    candidate.validate_integrity()
+                except (TypeError, ValueError, AttributeError):
+                    continue
+                matches.append(candidate)
+                if len(matches) > 1:
+                    return None
+            return matches[0] if len(matches) == 1 else None
 
     def _lookup_attempt_state_locked(
         self,

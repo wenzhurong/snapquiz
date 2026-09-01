@@ -12,9 +12,10 @@ environment, or socket I/O.
 """
 from __future__ import annotations
 
+import hashlib
 import re
 from threading import RLock
-from typing import Callable, Protocol
+from typing import Callable, NamedTuple, Protocol
 from uuid import UUID, uuid5
 
 from snapquiz.domain._validation import (
@@ -26,20 +27,26 @@ from snapquiz.domain._validation import (
 )
 from snapquiz.domain.digest import Digest256, canonical_json_bytes, digest256
 from snapquiz.domain.errors import ConfigError, EndpointPolicyError
+from snapquiz.runtime.attempt import _TRANSPORT_ATTEMPT_AUTHORITY
 
 
-RESOLVER_HELPER_PROTOCOL_VERSION = "snapquiz.resolver-helper.v1"
-RESOLVER_HELPER_START_SCHEMA_VERSION = "snapquiz.resolver-start.v1"
+RESOLVER_HELPER_PROTOCOL_VERSION = "snapquiz.resolver-helper.v2"
+RESOLVER_HELPER_START_SCHEMA_VERSION = "snapquiz.resolver-start.v2"
 RESOLVER_TERMINAL_GUARD_SCHEMA_VERSION = "snapquiz.resolver-terminal-guard.v1"
-READY_FRAME = b"SNAPQUIZ-RESOLVER/1 READY\n"
+RESOLVER_RESULT_RECEIPT_SCHEMA_VERSION = "snapquiz.resolver-result-receipt.v1"
+READY_FRAME = b"SNAPQUIZ-RESOLVER/2 READY\n"
 MAX_READY_FRAME_BYTES = 64
 MAX_START_FRAME_BYTES = 4_096
-MAX_RESULT_FRAME_BYTES = 16_384
+MAX_RESULT_TRANSCRIPT_BYTES = 16_384
+# The protocol frame includes its terminating LF; the transcript limit does not.
+MAX_RESULT_FRAME_BYTES = MAX_RESULT_TRANSCRIPT_BYTES + 1
 MAX_RESULT_CANDIDATES = 32
 MAX_HELPER_STDERR_BYTES = 4_096
 
 _PRE_GUARD_FACTORY_AUTHORITY = object()
 _ATTEMPT_GUARD_FACTORY_AUTHORITY = object()
+_RESULT_RECEIPT_FACTORY_AUTHORITY = object()
+_READY_PUBLICATION_TICKET_AUTHORITY = object()
 _TERMINAL_GUARD_UUID_NAMESPACE = UUID(
     "4c82487b-3247-52f0-9fb9-7696da7f7471"
 )
@@ -49,6 +56,43 @@ _DNS_HOST_RE = re.compile(
 )
 
 LifecycleObserver = Callable[[str, dict[str, object]], None]
+
+
+def _exact_bytes_digest(
+    type_tag: str,
+    schema_version: str,
+    value: bytes,
+) -> Digest256:
+    if type(value) is not bytes:
+        raise TypeError("value must be immutable bytes")
+    return digest256(
+        type_tag,
+        schema_version,
+        {
+            "byte_size": len(value),
+            "sha256": hashlib.sha256(value).hexdigest(),
+        },
+    )
+
+
+def start_frame_digest(frame: bytes) -> Digest256:
+    """Return the domain-separated digest of one exact encoded START frame."""
+
+    return _exact_bytes_digest(
+        "ResolverStartFrame",
+        RESOLVER_HELPER_START_SCHEMA_VERSION,
+        frame,
+    )
+
+
+def result_transcript_digest(transcript: bytes) -> Digest256:
+    """Return the domain-separated digest of RESULT bytes without their LF."""
+
+    return _exact_bytes_digest(
+        "ResolverResultTranscript",
+        RESOLVER_RESULT_RECEIPT_SCHEMA_VERSION,
+        transcript,
+    )
 
 
 class HelperKernel(Protocol):
@@ -75,6 +119,45 @@ class HelperSpawner(Protocol):
 
     def spawn(self, request: "ResolverHelperSpawnRequest") -> HelperKernel:
         """Create one helper without receiving target or credential data."""
+
+
+class _ResultReceiptIssuanceSnapshot(NamedTuple):
+    """Ledger-owned copy of every exact RESULT receipt proof field."""
+
+    schema_version: str
+    issuer: object
+    ledger: object
+    lifecycle_id: UUID
+    attempt_permit_id: UUID
+    attempt_permit_digest: Digest256
+    transport_claim_id: UUID
+    terminal_guard_id: UUID
+    terminal_guard_digest: Digest256
+    dns_start_id: UUID
+    start_frame_digest: Digest256
+    raw_transcript_byte_size: int
+    raw_transcript_digest: Digest256
+    raw_transcript: bytes
+    receipt_digest: Digest256
+    issued_digest: Digest256
+
+
+class _ResolutionCandidatePublicationSnapshot(NamedTuple):
+    """Independent snapshot of one candidate published by a ResolutionSet."""
+
+    candidate: object
+    address_digest: Digest256
+    canonical_payload: bytes
+
+
+class _ResolutionPublicationSnapshot(NamedTuple):
+    """Single ResolutionSet publication anchored to one active receipt."""
+
+    receipt: object
+    resolution: object
+    resolution_digest: Digest256
+    canonical_payload: bytes
+    candidates: tuple[_ResolutionCandidatePublicationSnapshot, ...]
 
 
 def _lifecycle_error(message: str) -> EndpointPolicyError:
@@ -172,7 +255,7 @@ class ResolverHelperSpawnRequest:
         values = (
             ("protocol_version", RESOLVER_HELPER_PROTOCOL_VERSION),
             ("executable", checked),
-            ("argv", (checked, "--snapquiz-resolver-helper-v1")),
+            ("argv", (checked, "--snapquiz-resolver-helper-v2")),
             ("environment", (("LANG", "C"), ("LC_ALL", "C"))),
             ("shell", False),
             ("close_fds", True),
@@ -241,24 +324,37 @@ class _ResolverLifecycleLedger:
     __slots__ = (
         "lifecycle_id",
         "_lock",
+        "_pre_owner",
         "_owner",
         "_kernel",
         "_state",
         "_cleanup_claimed",
+        "_dns_start_id",
+        "_start_frame_digest",
+        "_issued_receipt",
+        "_issued_receipt_snapshot",
+        "_issued_resolution_snapshot",
     )
 
     def __init__(self, lifecycle_id: UUID) -> None:
         self.lifecycle_id = require_uuid(lifecycle_id, "lifecycle_id")
         self._lock = RLock()
+        self._pre_owner: object | None = None
         self._owner: object | None = None
         self._kernel: HelperKernel | None = None
         self._state = "created"
         self._cleanup_claimed = False
+        self._dns_start_id: UUID | None = None
+        self._start_frame_digest: Digest256 | None = None
+        self._issued_receipt: ResolverResultReceipt | None = None
+        self._issued_receipt_snapshot: _ResultReceiptIssuanceSnapshot | None = None
+        self._issued_resolution_snapshot: _ResolutionPublicationSnapshot | None = None
 
     def bind_pre_owner(self, owner: object) -> None:
         with self._lock:
             if self._owner is not None or self._state != "created":
                 raise _lifecycle_error("resolver helper owner 已绑定。")
+            self._pre_owner = owner
             self._owner = owner
 
     def attach_kernel(self, owner: object, kernel: HelperKernel) -> None:
@@ -279,13 +375,76 @@ class _ResolverLifecycleLedger:
             target="transferred",
         )
 
-    def commit_start(self, owner: object) -> None:
-        self._cas(
-            owner,
-            expected="transferred",
-            replacement=owner,
-            target="start_committed",
+    def recover_transferred_guard(
+        self,
+        pre_owner: object,
+        *,
+        attempt_permit_id: UUID,
+        attempt_permit_digest: Digest256,
+        transport_claim_id: UUID,
+    ) -> "AttemptTerminalGuard | None":
+        """Recover the exact post-transfer owner without reviving cleanup."""
+
+        expected_guard_id = uuid5(
+            _TERMINAL_GUARD_UUID_NAMESPACE,
+            str(
+                digest256(
+                    "ResolverTerminalGuardIdentifier",
+                    RESOLVER_TERMINAL_GUARD_SCHEMA_VERSION,
+                    {
+                        "lifecycle_id": self.lifecycle_id,
+                        "attempt_permit_id": attempt_permit_id,
+                        "attempt_permit_digest": attempt_permit_digest,
+                        "transport_claim_id": transport_claim_id,
+                    },
+                )
+            ),
         )
+        expected_guard_digest = _terminal_guard_digest(
+            lifecycle_id=self.lifecycle_id,
+            attempt_permit_id=attempt_permit_id,
+            attempt_permit_digest=attempt_permit_digest,
+            transport_claim_id=transport_claim_id,
+            terminal_guard_id=expected_guard_id,
+        )
+        with self._lock:
+            guard = self._owner
+            if (
+                self._pre_owner is not pre_owner
+                or self._state != "transferred"
+                or self._cleanup_claimed
+                or type(guard) is not AttemptTerminalGuard
+                or guard._ledger is not self
+                or guard.lifecycle_id != self.lifecycle_id
+                or guard.attempt_permit_id != attempt_permit_id
+                or guard.attempt_permit_digest != attempt_permit_digest
+                or guard.transport_claim_id != transport_claim_id
+                or guard.terminal_guard_id != expected_guard_id
+                or guard.terminal_guard_digest != expected_guard_digest
+            ):
+                return None
+            return guard
+
+    def commit_start(
+        self,
+        owner: object,
+        *,
+        dns_start_id: UUID,
+        exact_start_frame_digest: Digest256,
+    ) -> None:
+        checked_start_id = require_uuid(dns_start_id, "dns_start_id")
+        checked_digest = require_digest(
+            exact_start_frame_digest,
+            "exact_start_frame_digest",
+        )
+        with self._lock:
+            if self._owner is not owner or self._state != "transferred":
+                raise _lifecycle_error("resolver helper owner 或状态已经变化。")
+            if self._dns_start_id is not None or self._start_frame_digest is not None:
+                raise _lifecycle_error("resolver helper START proof 已存在。")
+            self._dns_start_id = checked_start_id
+            self._start_frame_digest = checked_digest
+            self._state = "start_committed"
 
     def mark_started(self, owner: object) -> None:
         self._cas(
@@ -303,13 +462,124 @@ class _ResolverLifecycleLedger:
             target="result_reading",
         )
 
-    def mark_result_read(self, owner: object) -> None:
-        self._cas(
-            owner,
-            expected="result_reading",
-            replacement=owner,
-            target="result_read",
+    def issue_result_receipt(
+        self,
+        owner: object,
+        receipt: "ResolverResultReceipt",
+    ) -> None:
+        snapshot = _capture_result_receipt_snapshot(receipt)
+        with self._lock:
+            if (
+                self._owner is not owner
+                or self._state != "result_reading"
+                or type(owner) is not AttemptTerminalGuard
+                or type(receipt) is not ResolverResultReceipt
+                or receipt._ledger is not self
+                or receipt._issuer is not owner
+                or self._issued_receipt is not None
+                or self._issued_receipt_snapshot is not None
+                or self._dns_start_id != receipt.dns_start_id
+                or self._start_frame_digest != receipt.start_frame_digest
+            ):
+                raise _lifecycle_error("resolver RESULT receipt 发行状态无效。")
+            self._issued_receipt = receipt
+            self._issued_receipt_snapshot = snapshot
+            self._state = "result_read"
+
+    def is_exact_receipt_issued(
+        self,
+        owner: object,
+        receipt: "ResolverResultReceipt",
+    ) -> bool:
+        with self._lock:
+            return self._is_exact_receipt_issued_locked(owner, receipt)
+
+    def publication_transcript_for(
+        self,
+        owner: object,
+        receipt: "ResolverResultReceipt",
+    ) -> bytes:
+        """Return the ledger-owned transcript, never receipt-owned mutable state."""
+
+        with self._lock:
+            if not self._is_exact_receipt_issued_locked(owner, receipt):
+                raise ValueError("resolver result receipt was not exactly issued")
+            snapshot = self._issued_receipt_snapshot
+            if snapshot is None:
+                raise ValueError("resolver result receipt snapshot is unavailable")
+            return snapshot.raw_transcript
+
+    def _is_exact_receipt_issued_locked(
+        self,
+        owner: object,
+        receipt: "ResolverResultReceipt",
+    ) -> bool:
+        snapshot = self._issued_receipt_snapshot
+        return (
+            self._state == "result_read"
+            and self._owner is owner
+            and type(owner) is AttemptTerminalGuard
+            and type(receipt) is ResolverResultReceipt
+            and receipt._ledger is self
+            and receipt._issuer is owner
+            and self._issued_receipt is receipt
+            and snapshot is not None
+            and _matches_result_receipt_snapshot(receipt, snapshot)
+            and self._dns_start_id == snapshot.dns_start_id
+            and self._start_frame_digest == snapshot.start_frame_digest
         )
+
+    def issue_resolution(
+        self,
+        owner: object,
+        receipt: "ResolverResultReceipt",
+        resolution: object,
+        *,
+        resolution_digest: Digest256,
+        canonical_payload: bytes,
+        candidates: tuple[tuple[object, Digest256, bytes], ...],
+    ) -> None:
+        """Record the only ResolutionSet publication for an active receipt."""
+
+        snapshot = _capture_resolution_publication_snapshot(
+            receipt=receipt,
+            resolution=resolution,
+            resolution_digest=resolution_digest,
+            canonical_payload=canonical_payload,
+            candidates=candidates,
+        )
+        with self._lock:
+            if (
+                not self._is_exact_receipt_issued_locked(owner, receipt)
+                or self._issued_resolution_snapshot is not None
+            ):
+                raise _lifecycle_error("resolver ResolutionSet 发行状态无效。")
+            self._issued_resolution_snapshot = snapshot
+
+    def is_exact_resolution_issued(
+        self,
+        owner: object,
+        receipt: "ResolverResultReceipt",
+        resolution: object,
+        *,
+        resolution_digest: Digest256,
+        canonical_payload: bytes,
+        candidates: tuple[tuple[object, Digest256, bytes], ...],
+    ) -> bool:
+        current = _capture_resolution_publication_snapshot(
+            receipt=receipt,
+            resolution=resolution,
+            resolution_digest=resolution_digest,
+            canonical_payload=canonical_payload,
+            candidates=candidates,
+        )
+        with self._lock:
+            issued = self._issued_resolution_snapshot
+            return (
+                self._is_exact_receipt_issued_locked(owner, receipt)
+                and issued is not None
+                and _matches_resolution_publication_snapshot(current, issued)
+            )
 
     def _cas(
         self,
@@ -344,6 +614,7 @@ class _ResolverLifecycleLedger:
             if self._owner is not owner or self._state != "cleaning":
                 raise _lifecycle_error("resolver helper cleanup 状态已经变化。")
             self._kernel = None
+            self._pre_owner = None
             self._owner = None
             self._state = "terminal"
 
@@ -363,6 +634,19 @@ class _ResolverLifecycleLedger:
                 raise _lifecycle_error("resolver helper kernel 不存在。")
             return self._kernel
 
+    def start_proof_for(
+        self,
+        owner: object,
+        *,
+        states: tuple[str, ...],
+    ) -> tuple[UUID, Digest256]:
+        with self._lock:
+            if self._owner is not owner or self._state not in states:
+                raise _lifecycle_error("resolver helper START proof owner 无效。")
+            if self._dns_start_id is None or self._start_frame_digest is None:
+                raise _lifecycle_error("resolver helper START proof 不完整。")
+            return self._dns_start_id, self._start_frame_digest
+
     def safe_metadata(self) -> dict[str, object]:
         with self._lock:
             return {
@@ -370,6 +654,8 @@ class _ResolverLifecycleLedger:
                 "lifecycle_id": str(self.lifecycle_id),
                 "state": self._state,
                 "cleanup_claimed": self._cleanup_claimed,
+                "dns_start_committed": self._dns_start_id is not None,
+                "result_receipt_issued": self._issued_receipt is not None,
             }
 
 
@@ -441,6 +727,381 @@ def _terminal_guard_digest(
             "terminal_guard_id": terminal_guard_id,
         },
     )
+
+
+def _result_receipt_payload(receipt: "ResolverResultReceipt") -> dict[str, object]:
+    return {
+        "lifecycle_id": receipt.lifecycle_id,
+        "attempt_permit_id": receipt.attempt_permit_id,
+        "attempt_permit_digest": receipt.attempt_permit_digest,
+        "transport_claim_id": receipt.transport_claim_id,
+        "terminal_guard_id": receipt.terminal_guard_id,
+        "terminal_guard_digest": receipt.terminal_guard_digest,
+        "dns_start_id": receipt.dns_start_id,
+        "start_frame_digest": receipt.start_frame_digest,
+        "raw_transcript_byte_size": receipt.raw_transcript_byte_size,
+        "raw_transcript_digest": receipt.raw_transcript_digest,
+    }
+
+
+def _capture_result_receipt_snapshot(
+    receipt: "ResolverResultReceipt",
+) -> _ResultReceiptIssuanceSnapshot:
+    if type(receipt) is not ResolverResultReceipt:
+        raise TypeError("receipt must be ResolverResultReceipt")
+    return _ResultReceiptIssuanceSnapshot(
+        schema_version=RESOLVER_RESULT_RECEIPT_SCHEMA_VERSION,
+        issuer=receipt._issuer,
+        ledger=receipt._ledger,
+        lifecycle_id=receipt.lifecycle_id,
+        attempt_permit_id=receipt.attempt_permit_id,
+        attempt_permit_digest=receipt.attempt_permit_digest,
+        transport_claim_id=receipt.transport_claim_id,
+        terminal_guard_id=receipt.terminal_guard_id,
+        terminal_guard_digest=receipt.terminal_guard_digest,
+        dns_start_id=receipt.dns_start_id,
+        start_frame_digest=receipt.start_frame_digest,
+        raw_transcript_byte_size=receipt.raw_transcript_byte_size,
+        raw_transcript_digest=receipt.raw_transcript_digest,
+        raw_transcript=receipt._raw_transcript,
+        receipt_digest=receipt.receipt_digest,
+        issued_digest=receipt._issued_digest,
+    )
+
+
+def _matches_result_receipt_snapshot(
+    receipt: "ResolverResultReceipt",
+    snapshot: _ResultReceiptIssuanceSnapshot,
+) -> bool:
+    try:
+        current = _capture_result_receipt_snapshot(receipt)
+    except Exception:
+        return False
+    return (
+        current.schema_version == snapshot.schema_version
+        and current.issuer is snapshot.issuer
+        and current.ledger is snapshot.ledger
+        and current.lifecycle_id == snapshot.lifecycle_id
+        and current.attempt_permit_id == snapshot.attempt_permit_id
+        and current.attempt_permit_digest == snapshot.attempt_permit_digest
+        and current.transport_claim_id == snapshot.transport_claim_id
+        and current.terminal_guard_id == snapshot.terminal_guard_id
+        and current.terminal_guard_digest == snapshot.terminal_guard_digest
+        and current.dns_start_id == snapshot.dns_start_id
+        and current.start_frame_digest == snapshot.start_frame_digest
+        and current.raw_transcript_byte_size
+        == snapshot.raw_transcript_byte_size
+        and current.raw_transcript_digest == snapshot.raw_transcript_digest
+        and current.raw_transcript == snapshot.raw_transcript
+        and current.receipt_digest == snapshot.receipt_digest
+        and current.issued_digest == snapshot.issued_digest
+    )
+
+
+def _capture_resolution_publication_snapshot(
+    *,
+    receipt: object,
+    resolution: object,
+    resolution_digest: Digest256,
+    canonical_payload: bytes,
+    candidates: tuple[tuple[object, Digest256, bytes], ...],
+) -> _ResolutionPublicationSnapshot:
+    checked_digest = require_digest(resolution_digest, "resolution_digest")
+    if type(canonical_payload) is not bytes:
+        raise TypeError("canonical_payload must be immutable bytes")
+    if type(candidates) is not tuple or not candidates:
+        raise TypeError("candidates must be a non-empty tuple")
+    checked_candidates: list[_ResolutionCandidatePublicationSnapshot] = []
+    for item in candidates:
+        if type(item) is not tuple or len(item) != 3:
+            raise TypeError("candidate publication snapshot is invalid")
+        candidate, address_digest, candidate_payload = item
+        checked_address_digest = require_digest(
+            address_digest,
+            "candidate address_digest",
+        )
+        if type(candidate_payload) is not bytes:
+            raise TypeError("candidate payload must be immutable bytes")
+        checked_candidates.append(
+            _ResolutionCandidatePublicationSnapshot(
+                candidate=candidate,
+                address_digest=checked_address_digest,
+                canonical_payload=candidate_payload,
+            )
+        )
+    return _ResolutionPublicationSnapshot(
+        receipt=receipt,
+        resolution=resolution,
+        resolution_digest=checked_digest,
+        canonical_payload=canonical_payload,
+        candidates=tuple(checked_candidates),
+    )
+
+
+def _matches_resolution_publication_snapshot(
+    current: _ResolutionPublicationSnapshot,
+    issued: _ResolutionPublicationSnapshot,
+) -> bool:
+    if (
+        current.receipt is not issued.receipt
+        or current.resolution is not issued.resolution
+        or current.resolution_digest != issued.resolution_digest
+        or current.canonical_payload != issued.canonical_payload
+        or len(current.candidates) != len(issued.candidates)
+    ):
+        return False
+    return all(
+        current_candidate.candidate is issued_candidate.candidate
+        and current_candidate.address_digest == issued_candidate.address_digest
+        and current_candidate.canonical_payload
+        == issued_candidate.canonical_payload
+        for current_candidate, issued_candidate in zip(
+            current.candidates,
+            issued.candidates,
+        )
+    )
+
+
+@runtime_final
+class ResolverResultReceipt:
+    """Factory-only proof that one exact helper RESULT was fully read.
+
+    The raw transcript is retained privately for the address-policy factory;
+    callers receive neither naked helper bytes nor a forgeable proof bag.
+    """
+
+    __slots__ = (
+        "lifecycle_id",
+        "attempt_permit_id",
+        "attempt_permit_digest",
+        "transport_claim_id",
+        "terminal_guard_id",
+        "terminal_guard_digest",
+        "dns_start_id",
+        "start_frame_digest",
+        "raw_transcript_byte_size",
+        "raw_transcript_digest",
+        "receipt_digest",
+        "_issued_digest",
+        "_raw_transcript",
+        "_issuer",
+        "_ledger",
+    )
+
+    def __init__(
+        self,
+        *,
+        issuer: "AttemptTerminalGuard",
+        ledger: _ResolverLifecycleLedger,
+        dns_start_id: UUID,
+        exact_start_frame_digest: Digest256,
+        raw_transcript: bytes,
+        _authority: object | None = None,
+    ) -> None:
+        if _authority is not _RESULT_RECEIPT_FACTORY_AUTHORITY:
+            raise TypeError("resolver result receipts require terminal guard issuance")
+        if type(issuer) is not AttemptTerminalGuard:
+            raise TypeError("issuer must be AttemptTerminalGuard")
+        if type(ledger) is not _ResolverLifecycleLedger or issuer._ledger is not ledger:
+            raise TypeError("receipt ledger must be the issuer ledger")
+        checked_transcript = raw_transcript
+        if (
+            type(checked_transcript) is not bytes
+            or not checked_transcript
+            or len(checked_transcript) > MAX_RESULT_TRANSCRIPT_BYTES
+            or b"\n" in checked_transcript
+            or b"\r" in checked_transcript
+        ):
+            raise _lifecycle_error("RESULT transcript 边界无效。")
+        values = (
+            ("lifecycle_id", issuer.lifecycle_id),
+            ("attempt_permit_id", issuer.attempt_permit_id),
+            ("attempt_permit_digest", issuer.attempt_permit_digest),
+            ("transport_claim_id", issuer.transport_claim_id),
+            ("terminal_guard_id", issuer.terminal_guard_id),
+            ("terminal_guard_digest", issuer.terminal_guard_digest),
+            ("dns_start_id", require_uuid(dns_start_id, "dns_start_id")),
+            (
+                "start_frame_digest",
+                require_digest(
+                    exact_start_frame_digest,
+                    "exact_start_frame_digest",
+                ),
+            ),
+            ("raw_transcript_byte_size", len(checked_transcript)),
+            (
+                "raw_transcript_digest",
+                result_transcript_digest(checked_transcript),
+            ),
+            ("_raw_transcript", checked_transcript),
+            ("_issuer", issuer),
+            ("_ledger", ledger),
+        )
+        for name, value in values:
+            object.__setattr__(self, name, value)
+        receipt_digest = digest256(
+            "ResolverResultReceipt",
+            RESOLVER_RESULT_RECEIPT_SCHEMA_VERSION,
+            _result_receipt_payload(self),
+        )
+        object.__setattr__(self, "receipt_digest", receipt_digest)
+        object.__setattr__(self, "_issued_digest", receipt_digest)
+        self.validate_integrity()
+
+    def __setattr__(self, name: str, value: object) -> None:
+        del name, value
+        raise AttributeError("ResolverResultReceipt is immutable")
+
+    def __copy__(self) -> "ResolverResultReceipt":
+        return self
+
+    def __deepcopy__(self, memo: dict[int, object]) -> "ResolverResultReceipt":
+        del memo
+        return self
+
+    def __reduce__(self) -> object:
+        raise TypeError("ResolverResultReceipt cannot be serialized")
+
+    def __reduce_ex__(self, protocol: int) -> object:
+        del protocol
+        raise TypeError("ResolverResultReceipt cannot be serialized")
+
+    def __repr__(self) -> str:
+        return (
+            "ResolverResultReceipt("
+            f"lifecycle_id={self.lifecycle_id!r}, "
+            f"attempt_permit_id={self.attempt_permit_id!r}, "
+            f"raw_transcript_byte_size={self.raw_transcript_byte_size!r})"
+        )
+
+    def validate_integrity(self) -> None:
+        for name in (
+            "lifecycle_id",
+            "attempt_permit_id",
+            "transport_claim_id",
+            "terminal_guard_id",
+            "dns_start_id",
+        ):
+            require_uuid(getattr(self, name), name)
+        for name in (
+            "attempt_permit_digest",
+            "terminal_guard_digest",
+            "start_frame_digest",
+            "raw_transcript_digest",
+            "receipt_digest",
+            "_issued_digest",
+        ):
+            require_digest(getattr(self, name), name)
+        require_plain_int(
+            self.raw_transcript_byte_size,
+            "raw_transcript_byte_size",
+            minimum=1,
+        )
+        if (
+            self.raw_transcript_byte_size > MAX_RESULT_TRANSCRIPT_BYTES
+            or type(self._raw_transcript) is not bytes
+            or len(self._raw_transcript) != self.raw_transcript_byte_size
+            or b"\n" in self._raw_transcript
+            or b"\r" in self._raw_transcript
+            or result_transcript_digest(self._raw_transcript)
+            != self.raw_transcript_digest
+        ):
+            raise ValueError("resolver result transcript integrity mismatch")
+        if (
+            type(self._issuer) is not AttemptTerminalGuard
+            or type(self._ledger) is not _ResolverLifecycleLedger
+            or self._issuer._ledger is not self._ledger
+            or self.lifecycle_id != self._issuer.lifecycle_id
+            or self.attempt_permit_id != self._issuer.attempt_permit_id
+            or self.attempt_permit_digest != self._issuer.attempt_permit_digest
+            or self.transport_claim_id != self._issuer.transport_claim_id
+            or self.terminal_guard_id != self._issuer.terminal_guard_id
+            or self.terminal_guard_digest != self._issuer.terminal_guard_digest
+        ):
+            raise ValueError("resolver result receipt issuer changed")
+        recomputed = digest256(
+            "ResolverResultReceipt",
+            RESOLVER_RESULT_RECEIPT_SCHEMA_VERSION,
+            _result_receipt_payload(self),
+        )
+        if recomputed != self.receipt_digest or recomputed != self._issued_digest:
+            raise ValueError("resolver result receipt integrity mismatch")
+
+    def _validate_exact_issuance(
+        self,
+        *,
+        _authority: object | None = None,
+    ) -> None:
+        if _authority is not _TRANSPORT_ATTEMPT_AUTHORITY:
+            raise TypeError("resolver result receipt verification requires transport")
+        self.validate_integrity()
+        if not self._ledger.is_exact_receipt_issued(self._issuer, self):
+            raise ValueError("resolver result receipt was not exactly issued")
+
+    def _publication_transcript(
+        self,
+        *,
+        _authority: object | None = None,
+    ) -> bytes:
+        if _authority is not _TRANSPORT_ATTEMPT_AUTHORITY:
+            raise TypeError("resolver result receipt verification requires transport")
+        self.validate_integrity()
+        return self._ledger.publication_transcript_for(self._issuer, self)
+
+    def _publish_resolution(
+        self,
+        resolution: object,
+        *,
+        resolution_digest: Digest256,
+        canonical_payload: bytes,
+        candidates: tuple[tuple[object, Digest256, bytes], ...],
+        _authority: object | None = None,
+    ) -> None:
+        if _authority is not _TRANSPORT_ATTEMPT_AUTHORITY:
+            raise TypeError("resolution publication requires transport")
+        self._ledger.issue_resolution(
+            self._issuer,
+            self,
+            resolution,
+            resolution_digest=resolution_digest,
+            canonical_payload=canonical_payload,
+            candidates=candidates,
+        )
+
+    def _validate_resolution_publication(
+        self,
+        resolution: object,
+        *,
+        resolution_digest: Digest256,
+        canonical_payload: bytes,
+        candidates: tuple[tuple[object, Digest256, bytes], ...],
+        _authority: object | None = None,
+    ) -> None:
+        if _authority is not _TRANSPORT_ATTEMPT_AUTHORITY:
+            raise TypeError("resolution verification requires transport")
+        if not self._ledger.is_exact_resolution_issued(
+            self._issuer,
+            self,
+            resolution,
+            resolution_digest=resolution_digest,
+            canonical_payload=canonical_payload,
+            candidates=candidates,
+        ):
+            raise ValueError("resolution was not exactly published")
+
+    def safe_metadata(self) -> dict[str, object]:
+        return {
+            "schema_version": RESOLVER_RESULT_RECEIPT_SCHEMA_VERSION,
+            "lifecycle_id": str(self.lifecycle_id),
+            "attempt_permit_id": str(self.attempt_permit_id),
+            "transport_claim_id": str(self.transport_claim_id),
+            "terminal_guard_id": str(self.terminal_guard_id),
+            "dns_start_id": str(self.dns_start_id),
+            "start_frame_digest_prefix": str(self.start_frame_digest)[:12],
+            "raw_transcript_byte_size": self.raw_transcript_byte_size,
+            "raw_transcript_digest_prefix": str(self.raw_transcript_digest)[:12],
+            "receipt_digest_prefix": str(self.receipt_digest)[:12],
+        }
 
 
 @runtime_final
@@ -550,6 +1211,31 @@ class PreAttemptResolverGuard:
             )
             raise
         return replacement
+
+    def _recover_transferred_guard(
+        self,
+        *,
+        attempt_permit_id: UUID,
+        attempt_permit_digest: Digest256,
+        transport_claim_id: UUID,
+        _authority: object | None = None,
+    ) -> "AttemptTerminalGuard | None":
+        """Recover one exact owner lost after ``transfer`` returned."""
+
+        if _authority is not _TRANSPORT_ATTEMPT_AUTHORITY:
+            raise TypeError("resolver publication recovery requires transport")
+        if (
+            type(attempt_permit_id) is not UUID
+            or type(attempt_permit_digest) is not Digest256
+            or type(transport_claim_id) is not UUID
+        ):
+            return None
+        return self._ledger.recover_transferred_guard(
+            self,
+            attempt_permit_id=attempt_permit_id,
+            attempt_permit_digest=attempt_permit_digest,
+            transport_claim_id=transport_claim_id,
+        )
 
     def cleanup(self, *, observer: LifecycleObserver | None = None) -> bool:
         return _cleanup_guard(
@@ -672,7 +1358,12 @@ class AttemptTerminalGuard:
                 terminal_guard_digest=self.terminal_guard_digest,
                 dns_start_id=dns_start_id,
             )
-            self._ledger.commit_start(self)
+            exact_start_digest = start_frame_digest(frame)
+            self._ledger.commit_start(
+                self,
+                dns_start_id=dns_start_id,
+                exact_start_frame_digest=exact_start_digest,
+            )
             kernel = self._ledger.kernel_for(self, states=("start_committed",))
             kernel.write_stdin(frame)
             self._ledger.mark_started(self)
@@ -686,12 +1377,12 @@ class AttemptTerminalGuard:
             )
             raise
 
-    def read_result_frame(
+    def read_result_receipt(
         self,
         *,
         observer: LifecycleObserver | None = None,
-    ) -> bytes:
-        """Read the helper's one bounded result frame, excluding newline."""
+    ) -> ResolverResultReceipt:
+        """Read one bounded RESULT and issue its exact non-byte receipt."""
 
         try:
             self._ledger.commit_result_read(self)
@@ -701,9 +1392,24 @@ class AttemptTerminalGuard:
                 maximum=MAX_RESULT_FRAME_BYTES,
                 label="RESULT",
             )
-            self._ledger.mark_result_read(self)
+            transcript = frame[:-1]
+            if not transcript or len(transcript) > MAX_RESULT_TRANSCRIPT_BYTES:
+                raise _lifecycle_error("RESULT transcript 超过上限。")
+            dns_start_id, exact_start_digest = self._ledger.start_proof_for(
+                self,
+                states=("result_reading",),
+            )
+            receipt = ResolverResultReceipt(
+                issuer=self,
+                ledger=self._ledger,
+                dns_start_id=dns_start_id,
+                exact_start_frame_digest=exact_start_digest,
+                raw_transcript=transcript,
+                _authority=_RESULT_RECEIPT_FACTORY_AUTHORITY,
+            )
+            self._ledger.issue_result_receipt(self, receipt)
             _notify(observer, "result_read", self.safe_metadata())
-            return frame[:-1]
+            return receipt
         except BaseException:
             _cleanup_guard(
                 self,
@@ -723,10 +1429,73 @@ class AttemptTerminalGuard:
 
 
 @runtime_final
+class _ReadyPublicationTicket:
+    """Launcher-issued identity for one caller-generated publication ID."""
+
+    __slots__ = (
+        "publication_id",
+        "lifecycle_id",
+        "spawn_request_digest",
+        "_launcher",
+        "_reservation_owner",
+    )
+
+    def __init__(
+        self,
+        *,
+        publication_id: UUID,
+        lifecycle_id: UUID,
+        spawn_request_digest: Digest256,
+        launcher: object,
+        reservation_owner: object,
+        _authority: object | None = None,
+    ) -> None:
+        if _authority is not _READY_PUBLICATION_TICKET_AUTHORITY:
+            raise TypeError("READY publication tickets require launcher")
+        if reservation_owner is None:
+            raise TypeError("reservation_owner must be an identity object")
+        object.__setattr__(
+            self,
+            "publication_id",
+            require_uuid(publication_id, "publication_id"),
+        )
+        object.__setattr__(
+            self,
+            "lifecycle_id",
+            require_uuid(lifecycle_id, "lifecycle_id"),
+        )
+        object.__setattr__(
+            self,
+            "spawn_request_digest",
+            require_digest(spawn_request_digest, "spawn_request_digest"),
+        )
+        object.__setattr__(self, "_launcher", launcher)
+        object.__setattr__(self, "_reservation_owner", reservation_owner)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        del name, value
+        raise AttributeError("READY publication ticket is immutable")
+
+
+class _ReadyPublicationState:
+    __slots__ = ("ticket", "guard", "status")
+
+    def __init__(self, ticket: _ReadyPublicationTicket) -> None:
+        self.ticket = ticket
+        self.guard: PreAttemptResolverGuard | None = None
+        self.status = "reserved"
+
+
+@runtime_final
 class ResolverHelperLauncher:
     """Construct-only configuration plus one explicit spawn/READY method."""
 
-    __slots__ = ("_spawner", "_request")
+    __slots__ = (
+        "_spawner",
+        "_request",
+        "_publication_lock",
+        "_ready_publications",
+    )
 
     def __init__(self, spawner: HelperSpawner, *, executable: str) -> None:
         if spawner is None or not callable(getattr(spawner, "spawn", None)):
@@ -737,6 +1506,8 @@ class ResolverHelperLauncher:
             "_request",
             ResolverHelperSpawnRequest(executable=executable),
         )
+        object.__setattr__(self, "_publication_lock", RLock())
+        object.__setattr__(self, "_ready_publications", {})
 
     def __setattr__(self, name: str, value: object) -> None:
         del name, value
@@ -751,15 +1522,217 @@ class ResolverHelperLauncher:
     def safe_metadata(self) -> dict[str, object]:
         return self._request.safe_metadata()
 
+    def _reserve_ready_publication(
+        self,
+        *,
+        publication_id: UUID,
+        lifecycle_id: UUID,
+        reservation_owner: object,
+        _authority: object | None = None,
+    ) -> _ReadyPublicationTicket:
+        """Atomically reserve an exact ticket before any helper can spawn."""
+
+        if _authority is not _TRANSPORT_ATTEMPT_AUTHORITY:
+            raise TypeError("READY publication reservation requires transport")
+        checked_publication_id = require_uuid(
+            publication_id,
+            "publication_id",
+        )
+        checked_lifecycle_id = require_uuid(lifecycle_id, "lifecycle_id")
+        if reservation_owner is None:
+            raise TypeError("reservation_owner must be an identity object")
+        ticket = _ReadyPublicationTicket(
+            publication_id=checked_publication_id,
+            lifecycle_id=checked_lifecycle_id,
+            spawn_request_digest=self._request.request_digest,
+            launcher=self,
+            reservation_owner=reservation_owner,
+            _authority=_READY_PUBLICATION_TICKET_AUTHORITY,
+        )
+        state = _ReadyPublicationState(ticket)
+        with self._publication_lock:
+            if checked_publication_id in self._ready_publications:
+                raise _lifecycle_error("resolver READY publication id 已使用。")
+            self._ready_publications[checked_publication_id] = state
+        return ticket
+
+    def _recover_ready_reservation(
+        self,
+        *,
+        publication_id: UUID,
+        lifecycle_id: UUID,
+        reservation_owner: object,
+        _authority: object | None = None,
+    ) -> bool:
+        """Remove only this caller-owned reservation after a lost return."""
+
+        if _authority is not _TRANSPORT_ATTEMPT_AUTHORITY:
+            raise TypeError("READY reservation recovery requires transport")
+        if (
+            type(publication_id) is not UUID
+            or type(lifecycle_id) is not UUID
+            or reservation_owner is None
+        ):
+            return False
+        with self._publication_lock:
+            state = self._ready_publications.get(publication_id)
+            ticket = None if state is None else state.ticket
+            if (
+                state is None
+                or type(ticket) is not _ReadyPublicationTicket
+                or ticket._launcher is not self
+                or ticket._reservation_owner is not reservation_owner
+                or ticket.lifecycle_id != lifecycle_id
+                or ticket.spawn_request_digest != self._request.request_digest
+                or state.status != "reserved"
+                or state.guard is not None
+            ):
+                return False
+            del self._ready_publications[publication_id]
+            return True
+
+    def _cancel_ready_reservation(
+        self,
+        ticket: _ReadyPublicationTicket,
+    ) -> None:
+        """Drop only this still-reserved ticket after an internal failure."""
+
+        with self._publication_lock:
+            state = self._ready_publications.get(ticket.publication_id)
+            if (
+                state is not None
+                and state.ticket is ticket
+                and state.status == "reserved"
+                and state.guard is None
+            ):
+                del self._ready_publications[ticket.publication_id]
+
+    def _publish_ready_guard(
+        self,
+        ticket: _ReadyPublicationTicket,
+        guard: PreAttemptResolverGuard,
+    ) -> None:
+        """Publish the exact READY owner as the final pre-return action."""
+
+        if (
+            type(ticket) is not _ReadyPublicationTicket
+            or ticket._launcher is not self
+            or type(guard) is not PreAttemptResolverGuard
+            or guard.lifecycle_id != ticket.lifecycle_id
+            or guard.spawn_request_digest != ticket.spawn_request_digest
+        ):
+            raise _lifecycle_error("resolver READY publication proof 无效。")
+        with self._publication_lock:
+            state = self._ready_publications.get(ticket.publication_id)
+            if (
+                state is None
+                or state.ticket is not ticket
+                or state.status != "reserved"
+                or state.guard is not None
+            ):
+                raise _lifecycle_error("resolver READY publication reservation 已变化。")
+            state.guard = guard
+            state.status = "published"
+
+    def _consume_ready_publication(
+        self,
+        ticket: _ReadyPublicationTicket,
+        guard: PreAttemptResolverGuard,
+        *,
+        _authority: object | None = None,
+    ) -> bool:
+        """Consume only the normally assigned exact guard identity."""
+
+        if _authority is not _TRANSPORT_ATTEMPT_AUTHORITY:
+            raise TypeError("READY publication consumption requires transport")
+        if (
+            type(ticket) is not _ReadyPublicationTicket
+            or ticket._launcher is not self
+            or type(guard) is not PreAttemptResolverGuard
+        ):
+            return False
+        with self._publication_lock:
+            state = self._ready_publications.get(ticket.publication_id)
+            if (
+                state is None
+                or state.ticket is not ticket
+                or state.status != "published"
+                or state.guard is not guard
+            ):
+                return False
+            state.guard = None
+            state.status = "consumed"
+            del self._ready_publications[ticket.publication_id]
+            return True
+
+    def _recover_ready_publication(
+        self,
+        ticket: _ReadyPublicationTicket,
+        *,
+        _authority: object | None = None,
+    ) -> PreAttemptResolverGuard | None:
+        """Consume a reserved/published ticket after an outer exception."""
+
+        if _authority is not _TRANSPORT_ATTEMPT_AUTHORITY:
+            raise TypeError("READY publication recovery requires transport")
+        if (
+            type(ticket) is not _ReadyPublicationTicket
+            or ticket._launcher is not self
+        ):
+            return None
+        with self._publication_lock:
+            state = self._ready_publications.get(ticket.publication_id)
+            if state is None or state.ticket is not ticket:
+                return None
+            if state.status == "reserved" and state.guard is None:
+                state.status = "consumed"
+                del self._ready_publications[ticket.publication_id]
+                return None
+            guard = state.guard
+            if (
+                state.status != "published"
+                or type(guard) is not PreAttemptResolverGuard
+                or guard.lifecycle_id != ticket.lifecycle_id
+                or guard.spawn_request_digest != ticket.spawn_request_digest
+            ):
+                return None
+            state.guard = None
+            state.status = "consumed"
+            del self._ready_publications[ticket.publication_id]
+            return guard
+
     def launch_ready(
         self,
         *,
         lifecycle_id: UUID,
         observer: LifecycleObserver | None = None,
+        publication_ticket: _ReadyPublicationTicket | None = None,
     ) -> PreAttemptResolverGuard:
         """Spawn with fixed metadata, then accept only the fixed READY frame."""
 
-        require_uuid(lifecycle_id, "lifecycle_id")
+        checked_lifecycle_id = require_uuid(lifecycle_id, "lifecycle_id")
+        if publication_ticket is not None:
+            if (
+                type(publication_ticket) is not _ReadyPublicationTicket
+                or publication_ticket._launcher is not self
+                or publication_ticket.lifecycle_id != checked_lifecycle_id
+                or publication_ticket.spawn_request_digest
+                != self._request.request_digest
+            ):
+                raise _lifecycle_error("resolver READY publication ticket 无效。")
+            with self._publication_lock:
+                publication_state = self._ready_publications.get(
+                    publication_ticket.publication_id
+                )
+                if (
+                    publication_state is None
+                    or publication_state.ticket is not publication_ticket
+                    or publication_state.status != "reserved"
+                    or publication_state.guard is not None
+                ):
+                    raise _lifecycle_error(
+                        "resolver READY publication reservation 不可用。"
+                    )
         ledger = _ResolverLifecycleLedger(lifecycle_id)
         guard = PreAttemptResolverGuard(
             lifecycle_id=lifecycle_id,
@@ -780,8 +1753,12 @@ class ResolverHelperLauncher:
                 raise _lifecycle_error("resolver helper READY frame 无效。")
             ledger.mark_ready(guard)
             _notify(observer, "ready_committed", guard.safe_metadata())
+            if publication_ticket is not None:
+                self._publish_ready_guard(publication_ticket, guard)
             return guard
         except BaseException:
+            if publication_ticket is not None:
+                self._cancel_ready_reservation(publication_ticket)
             _cleanup_guard(
                 guard,
                 ledger,

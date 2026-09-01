@@ -2,24 +2,32 @@
 from __future__ import annotations
 
 import builtins
+import copy
 import json
 import os
+import pickle
 import socket
 import subprocess
 import unittest
 from unittest.mock import patch
 from uuid import UUID
 
-from snapquiz.domain.digest import Digest256
+from snapquiz.domain.digest import Digest256, digest256
 from snapquiz.domain.errors import ConfigError, EndpointPolicyError
+from snapquiz.runtime.attempt import _TRANSPORT_ATTEMPT_AUTHORITY
 import snapquiz.transport.resolver as resolver_module
 from snapquiz.transport.resolver import (
     MAX_READY_FRAME_BYTES,
     MAX_RESULT_FRAME_BYTES,
+    MAX_RESULT_TRANSCRIPT_BYTES,
     READY_FRAME,
+    RESOLVER_HELPER_PROTOCOL_VERSION,
+    RESOLVER_HELPER_START_SCHEMA_VERSION,
     AttemptTerminalGuard,
     PreAttemptResolverGuard,
     ResolverHelperLauncher,
+    ResolverResultReceipt,
+    start_frame_digest,
 )
 
 
@@ -34,7 +42,7 @@ SECRET = "synthetic-secret-must-not-spawn"
 EXECUTABLE = "/opt/snapquiz/libexec/resolver-helper"
 RESULT = (
     b'{"candidates":[],"schema_version":'
-    b'"snapquiz.raw-resolution-transcript.v1"}'
+    b'"snapquiz.raw-resolution-transcript.v2"}'
 )
 
 
@@ -156,12 +164,46 @@ class W09ResolverLifecycleTest(unittest.TestCase):
         self.assertEqual(attempt.safe_metadata()["state"], "transferred")
         _start(attempt)
         self.assertEqual(attempt.safe_metadata()["state"], "started")
-        self.assertEqual(attempt.read_result_frame(), RESULT)
+        receipt = attempt.read_result_receipt()
+        self.assertIs(type(receipt), ResolverResultReceipt)
+        self.assertEqual(receipt.lifecycle_id, LIFECYCLE_ID)
+        self.assertEqual(receipt.attempt_permit_id, ATTEMPT_ID)
+        self.assertEqual(receipt.transport_claim_id, CLAIM_ID)
+        self.assertEqual(receipt.dns_start_id, DNS_START_ID)
+        self.assertEqual(receipt.raw_transcript_byte_size, len(RESULT))
+        self.assertEqual(receipt.start_frame_digest, start_frame_digest(kernel.writes[0]))
+        receipt.validate_integrity()
+        self.assertIs(copy.copy(receipt), receipt)
+        self.assertIs(copy.deepcopy(receipt), receipt)
+        with self.assertRaises(TypeError):
+            pickle.dumps(receipt)
+        with self.assertRaisesRegex(TypeError, "require terminal guard issuance"):
+            ResolverResultReceipt(
+                issuer=attempt,
+                ledger=attempt._ledger,
+                dns_start_id=DNS_START_ID,
+                exact_start_frame_digest=receipt.start_frame_digest,
+                raw_transcript=RESULT,
+            )
+        forged = object.__new__(ResolverResultReceipt)
+        for name in ResolverResultReceipt.__slots__:
+            object.__setattr__(forged, name, getattr(receipt, name))
+        with self.assertRaisesRegex(ValueError, "exactly issued"):
+            forged._validate_exact_issuance(
+                _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+            )
         self.assertEqual(attempt.safe_metadata()["state"], "result_read")
         self.assertTrue(attempt.cleanup())
         self.assertFalse(attempt.cleanup())
 
         self.assertEqual(len(spawner.requests), 1)
+        self.assertEqual(RESOLVER_HELPER_PROTOCOL_VERSION, "snapquiz.resolver-helper.v2")
+        self.assertEqual(RESOLVER_HELPER_START_SCHEMA_VERSION, "snapquiz.resolver-start.v2")
+        self.assertEqual(READY_FRAME, b"SNAPQUIZ-RESOLVER/2 READY\n")
+        self.assertEqual(
+            spawner.requests[0].argv[-1],
+            "--snapquiz-resolver-helper-v2",
+        )
         self.assertEqual(len(kernel.writes), 1)
         frame = json.loads(kernel.writes[0])
         self.assertEqual(frame["kind"], "START")
@@ -321,8 +363,72 @@ class W09ResolverLifecycleTest(unittest.TestCase):
                 attempt = _transfer(pre)
                 _start(attempt)
                 with self.assertRaises(EndpointPolicyError):
-                    attempt.read_result_frame()
+                    attempt.read_result_receipt()
                 self.assertEqual(_cleanup_counts(kernel), (1, 1, 1))
+
+    def test_result_limit_excludes_lf_and_exact_limit_receives_a_receipt(self):
+        transcript = b"x" * MAX_RESULT_TRANSCRIPT_BYTES
+        pre, _, kernel = _ready([READY_FRAME, transcript + b"\n"])
+        attempt = _transfer(pre)
+        _start(attempt)
+
+        receipt = attempt.read_result_receipt()
+
+        self.assertEqual(receipt.raw_transcript_byte_size, 16 * 1024)
+        self.assertEqual(MAX_RESULT_FRAME_BYTES, MAX_RESULT_TRANSCRIPT_BYTES + 1)
+        attempt.cleanup()
+        self.assertEqual(_cleanup_counts(kernel), (1, 1, 1))
+
+    def test_receipt_recomputed_after_raw_tamper_cannot_replace_ledger_snapshot(self):
+        pre, _, kernel = _ready([READY_FRAME, RESULT + b"\n"])
+        attempt = _transfer(pre)
+        _start(attempt)
+        receipt = attempt.read_result_receipt()
+        altered = b'{"altered":true}'
+        altered_digest = resolver_module.result_transcript_digest(altered)
+        object.__setattr__(receipt, "_raw_transcript", altered)
+        object.__setattr__(receipt, "raw_transcript_byte_size", len(altered))
+        object.__setattr__(receipt, "raw_transcript_digest", altered_digest)
+        recomputed = digest256(
+            "ResolverResultReceipt",
+            resolver_module.RESOLVER_RESULT_RECEIPT_SCHEMA_VERSION,
+            resolver_module._result_receipt_payload(receipt),
+        )
+        object.__setattr__(receipt, "receipt_digest", recomputed)
+        object.__setattr__(receipt, "_issued_digest", recomputed)
+
+        receipt.validate_integrity()
+        with self.assertRaisesRegex(ValueError, "exactly issued"):
+            receipt._validate_exact_issuance(
+                _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+            )
+
+        self.assertTrue(attempt.cleanup())
+        self.assertEqual(_cleanup_counts(kernel), (1, 1, 1))
+
+    def test_result_observer_fault_returns_no_receipt_and_cleans_owner(self):
+        pre, _, kernel = _ready([READY_FRAME, RESULT + b"\n"])
+        attempt = _transfer(pre)
+        _start(attempt)
+        returned = []
+
+        def fail_after_commit(event, metadata):
+            self.assertEqual(event, "result_read")
+            self.assertEqual(metadata["state"], "result_read")
+            raise RuntimeError("result observer fault")
+
+        with self.assertRaisesRegex(RuntimeError, "result observer fault"):
+            returned.append(attempt.read_result_receipt(observer=fail_after_commit))
+
+        self.assertEqual(returned, [])
+        self.assertEqual(attempt.safe_metadata()["state"], "terminal")
+        self.assertEqual(_cleanup_counts(kernel), (1, 1, 1))
+        terminal_receipt = attempt._ledger._issued_receipt
+        self.assertIs(type(terminal_receipt), ResolverResultReceipt)
+        with self.assertRaisesRegex(ValueError, "exactly issued"):
+            terminal_receipt._validate_exact_issuance(
+                _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+            )
 
     def test_cleanup_observer_raises_only_after_commit_and_resources_close(self):
         pre, _, kernel = _ready()

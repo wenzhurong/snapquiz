@@ -8,7 +8,6 @@ to one exact :class:`~snapquiz.runtime.attempt.AttemptPermit`.
 from __future__ import annotations
 
 from enum import Enum
-import hashlib
 from ipaddress import IPv4Address, IPv4Network, IPv6Address, IPv6Network
 import json
 import re
@@ -33,8 +32,18 @@ from snapquiz.domain.digest import (
 )
 from snapquiz.domain.errors import EndpointPolicyError
 from snapquiz.domain.plan import NetworkScope
-from snapquiz.runtime.attempt import AttemptPermit, CredentialResolutionPermit
+from snapquiz.runtime.attempt import (
+    AttemptPermit,
+    CredentialResolutionPermit,
+    _TRANSPORT_ATTEMPT_AUTHORITY,
+)
 from snapquiz.transport.credentials import _frozen_glm_binding
+from snapquiz.transport.resolver import (
+    ResolverResultReceipt,
+    encode_start_frame,
+    result_transcript_digest,
+    start_frame_digest,
+)
 
 
 INTERNET_PUBLIC_ADDRESS_POLICY_SCHEMA_VERSION = (
@@ -44,18 +53,26 @@ INTERNET_PUBLIC_ADDRESS_POLICY_REF = (
     "snapquiz.internet-public-address-policy.iana-2025-10-09.v1"
 )
 RAW_RESOLUTION_TRANSCRIPT_SCHEMA_VERSION = (
-    "snapquiz.raw-resolution-transcript.v1"
+    "snapquiz.raw-resolution-transcript.v2"
 )
 RESOLVED_ADDRESS_SCHEMA_VERSION = "snapquiz.resolved-address.v1"
-RESOLUTION_SET_SCHEMA_VERSION = "snapquiz.resolution-set.v1"
+NORMALIZED_RESOLUTION_TRANSCRIPT_SCHEMA_VERSION = (
+    "snapquiz.normalized-resolution-transcript.v1"
+)
+RESOLUTION_SET_SCHEMA_VERSION = "snapquiz.resolution-set.v2"
 
 MAX_RAW_RESOLUTION_BYTES = 16 * 1024
 MAX_RAW_RESOLUTION_CANDIDATES = 32
 
 _RESOLUTION_UUID_NAMESPACE = UUID("5f7eb2d6-f155-55dc-a6bb-59e573788524")
 _ADDRESS_FACTORY_AUTHORITY = object()
+_NORMALIZED_TRANSCRIPT_FACTORY_AUTHORITY = object()
 _RESOLUTION_FACTORY_AUTHORITY = object()
 _LOWER_HEX_RE = re.compile(r"^[0-9a-f]+$")
+_CANONICAL_DNS_RE = re.compile(
+    r"(?=.{1,253}\Z)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*"
+    r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z"
+)
 
 _IPV4_REJECT_CIDRS = (
     "0.0.0.0/8",
@@ -300,6 +317,10 @@ def _resolution_payload(resolution: "ResolutionSet") -> dict[str, object]:
         "resolution_id": resolution.resolution_id,
         "attempt_permit_id": resolution.attempt_permit_id,
         "attempt_permit_digest": resolution.attempt_permit_digest,
+        "transport_claim_id": resolution.transport_claim_id,
+        "terminal_guard_id": resolution.terminal_guard_id,
+        "terminal_guard_digest": resolution.terminal_guard_digest,
+        "dns_start_id": resolution.dns_start_id,
         "context_id": resolution.context_id,
         "context_digest": resolution.context_digest,
         "session_id": resolution.session_id,
@@ -312,6 +333,7 @@ def _resolution_payload(resolution: "ResolutionSet") -> dict[str, object]:
         "network_policy_version": resolution.network_policy_version,
         "address_policy_ref": resolution.address_policy_ref,
         "address_policy_digest": resolution.address_policy_digest,
+        "receipt_digest": resolution.receipt_digest,
         "raw_transcript_digest": resolution.raw_transcript_digest,
         "raw_transcript_byte_size": resolution.raw_transcript_byte_size,
         "raw_candidate_count": resolution.raw_candidate_count,
@@ -320,10 +342,32 @@ def _resolution_payload(resolution: "ResolutionSet") -> dict[str, object]:
     }
 
 
+def _resolution_canonical_payload(resolution: "ResolutionSet") -> bytes:
+    return canonical_json_bytes(_resolution_payload(resolution))
+
+
+def _resolution_candidate_publication_snapshots(
+    resolution: "ResolutionSet",
+) -> tuple[tuple[object, Digest256, bytes], ...]:
+    return tuple(
+        (
+            candidate,
+            candidate.address_digest,
+            canonical_json_bytes(_address_payload(candidate)),
+        )
+        for candidate in resolution.candidates
+    )
+
+
 def _resolution_identifier(
     *,
     attempt_permit_id: UUID,
     attempt_permit_digest: Digest256,
+    transport_claim_id: UUID,
+    terminal_guard_id: UUID,
+    terminal_guard_digest: Digest256,
+    dns_start_id: UUID,
+    receipt_digest: Digest256,
     raw_transcript_digest: Digest256,
 ) -> UUID:
     seed = digest256(
@@ -332,6 +376,11 @@ def _resolution_identifier(
         {
             "attempt_permit_id": attempt_permit_id,
             "attempt_permit_digest": attempt_permit_digest,
+            "transport_claim_id": transport_claim_id,
+            "terminal_guard_id": terminal_guard_id,
+            "terminal_guard_digest": terminal_guard_digest,
+            "dns_start_id": dns_start_id,
+            "receipt_digest": receipt_digest,
             "raw_transcript_digest": raw_transcript_digest,
             "address_policy_ref": INTERNET_PUBLIC_ADDRESS_POLICY_REF,
             "address_policy_digest": INTERNET_PUBLIC_ADDRESS_POLICY_DIGEST,
@@ -348,6 +397,10 @@ class ResolutionSet:
         "resolution_id",
         "attempt_permit_id",
         "attempt_permit_digest",
+        "transport_claim_id",
+        "terminal_guard_id",
+        "terminal_guard_digest",
+        "dns_start_id",
         "context_id",
         "context_digest",
         "session_id",
@@ -360,6 +413,7 @@ class ResolutionSet:
         "network_policy_version",
         "address_policy_ref",
         "address_policy_digest",
+        "receipt_digest",
         "raw_transcript_digest",
         "raw_transcript_byte_size",
         "raw_candidate_count",
@@ -367,12 +421,18 @@ class ResolutionSet:
         "selected_candidate_digest",
         "resolution_digest",
         "_issued_digest",
+        "_result_receipt",
     )
 
     def __init__(
         self,
         *,
         attempt_permit: AttemptPermit,
+        transport_claim_id: UUID,
+        terminal_guard_id: UUID,
+        terminal_guard_digest: Digest256,
+        dns_start_id: UUID,
+        result_receipt: ResolverResultReceipt,
         canonical_hostname: str,
         port: int,
         network_policy_version: str,
@@ -384,15 +444,26 @@ class ResolutionSet:
     ) -> None:
         if _authority is not _RESOLUTION_FACTORY_AUTHORITY:
             raise TypeError("resolution sets require the address-policy factory")
+        if type(result_receipt) is not ResolverResultReceipt:
+            raise TypeError("result_receipt must be ResolverResultReceipt")
         resolution_id = _resolution_identifier(
             attempt_permit_id=attempt_permit.attempt_permit_id,
             attempt_permit_digest=attempt_permit.attempt_permit_digest,
+            transport_claim_id=transport_claim_id,
+            terminal_guard_id=terminal_guard_id,
+            terminal_guard_digest=terminal_guard_digest,
+            dns_start_id=dns_start_id,
+            receipt_digest=result_receipt.receipt_digest,
             raw_transcript_digest=raw_transcript_digest,
         )
         values = (
             ("resolution_id", resolution_id),
             ("attempt_permit_id", attempt_permit.attempt_permit_id),
             ("attempt_permit_digest", attempt_permit.attempt_permit_digest),
+            ("transport_claim_id", transport_claim_id),
+            ("terminal_guard_id", terminal_guard_id),
+            ("terminal_guard_digest", terminal_guard_digest),
+            ("dns_start_id", dns_start_id),
             ("context_id", attempt_permit.context_id),
             ("context_digest", attempt_permit.context_digest),
             ("session_id", attempt_permit.session_id),
@@ -408,11 +479,13 @@ class ResolutionSet:
             ("network_policy_version", network_policy_version),
             ("address_policy_ref", INTERNET_PUBLIC_ADDRESS_POLICY_REF),
             ("address_policy_digest", INTERNET_PUBLIC_ADDRESS_POLICY_DIGEST),
+            ("receipt_digest", result_receipt.receipt_digest),
             ("raw_transcript_digest", raw_transcript_digest),
             ("raw_transcript_byte_size", raw_transcript_byte_size),
             ("raw_candidate_count", raw_candidate_count),
             ("candidates", candidates),
             ("selected_candidate_digest", candidates[0].address_digest),
+            ("_result_receipt", result_receipt),
         )
         for name, value in values:
             object.__setattr__(self, name, value)
@@ -423,7 +496,7 @@ class ResolutionSet:
         )
         object.__setattr__(self, "resolution_digest", resolution_digest)
         object.__setattr__(self, "_issued_digest", resolution_digest)
-        self.validate_integrity()
+        self._validate_intrinsic_integrity()
 
     def __setattr__(self, name: str, value: object) -> None:
         del name, value
@@ -453,12 +526,26 @@ class ResolutionSet:
 
     @property
     def selected(self) -> ResolvedAddress:
+        self.validate_integrity()
         return self.candidates[0]
 
     def validate_integrity(self) -> None:
+        self._validate_intrinsic_integrity()
+        self._result_receipt._validate_resolution_publication(
+            self,
+            resolution_digest=self.resolution_digest,
+            canonical_payload=_resolution_canonical_payload(self),
+            candidates=_resolution_candidate_publication_snapshots(self),
+            _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+        )
+
+    def _validate_intrinsic_integrity(self) -> None:
         for name in (
             "resolution_id",
             "attempt_permit_id",
+            "transport_claim_id",
+            "terminal_guard_id",
+            "dns_start_id",
             "context_id",
             "session_id",
             "operation_id",
@@ -466,10 +553,12 @@ class ResolutionSet:
             require_uuid(getattr(self, name), name)
         for name in (
             "attempt_permit_digest",
+            "terminal_guard_digest",
             "context_digest",
             "session_terms_digest",
             "request_envelope_digest",
             "address_policy_digest",
+            "receipt_digest",
             "raw_transcript_digest",
             "selected_candidate_digest",
             "resolution_digest",
@@ -490,6 +579,11 @@ class ResolutionSet:
             != INTERNET_PUBLIC_ADDRESS_POLICY_DIGEST
         ):
             raise ValueError("resolution address policy changed")
+        if (
+            type(self._result_receipt) is not ResolverResultReceipt
+            or self.receipt_digest != self._result_receipt.receipt_digest
+        ):
+            raise ValueError("resolution receipt binding changed")
         require_plain_int(
             self.raw_transcript_byte_size,
             "raw_transcript_byte_size",
@@ -524,6 +618,11 @@ class ResolutionSet:
         expected_id = _resolution_identifier(
             attempt_permit_id=self.attempt_permit_id,
             attempt_permit_digest=self.attempt_permit_digest,
+            transport_claim_id=self.transport_claim_id,
+            terminal_guard_id=self.terminal_guard_id,
+            terminal_guard_digest=self.terminal_guard_digest,
+            dns_start_id=self.dns_start_id,
+            receipt_digest=self.receipt_digest,
             raw_transcript_digest=self.raw_transcript_digest,
         )
         if self.resolution_id != expected_id:
@@ -536,13 +635,33 @@ class ResolutionSet:
         if recomputed != self.resolution_digest or recomputed != self._issued_digest:
             raise ValueError("resolution set integrity mismatch")
 
-    def validate_binding(self, attempt_permit: AttemptPermit) -> None:
+    def validate_binding(
+        self,
+        attempt_permit: AttemptPermit,
+        result_receipt: ResolverResultReceipt,
+    ) -> None:
+        if type(result_receipt) is not ResolverResultReceipt:
+            raise TypeError("result_receipt must be ResolverResultReceipt")
+        result_receipt._validate_exact_issuance(
+            _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+        )
         hostname, port, network_policy_version = _frozen_attempt_network_binding(
             attempt_permit
         )
         exact = (
+            self._result_receipt is result_receipt,
             self.attempt_permit_id == attempt_permit.attempt_permit_id,
             self.attempt_permit_digest == attempt_permit.attempt_permit_digest,
+            self.attempt_permit_id == result_receipt.attempt_permit_id,
+            self.attempt_permit_digest == result_receipt.attempt_permit_digest,
+            self.transport_claim_id == result_receipt.transport_claim_id,
+            self.terminal_guard_id == result_receipt.terminal_guard_id,
+            self.terminal_guard_digest == result_receipt.terminal_guard_digest,
+            self.dns_start_id == result_receipt.dns_start_id,
+            self.receipt_digest == result_receipt.receipt_digest,
+            self.raw_transcript_digest == result_receipt.raw_transcript_digest,
+            self.raw_transcript_byte_size
+            == result_receipt.raw_transcript_byte_size,
             self.context_id == attempt_permit.context_id,
             self.context_digest == attempt_permit.context_digest,
             self.session_id == attempt_permit.session_id,
@@ -555,13 +674,25 @@ class ResolutionSet:
             self.network_policy_version == network_policy_version,
         )
         self.validate_integrity()
-        if not all(exact):
+        if not all(exact) or not attempt_permit._attempt_gate._dns_start_is_committed(
+            attempt_permit,
+            claim_id=result_receipt.transport_claim_id,
+            guard_id=result_receipt.terminal_guard_id,
+            guard_digest=result_receipt.terminal_guard_digest,
+            start_id=result_receipt.dns_start_id,
+            _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+        ):
             raise ValueError("resolution set is bound to another attempt")
 
     def safe_metadata(self) -> dict[str, object]:
         return {
             "resolution_id": str(self.resolution_id),
             "attempt_permit_id": str(self.attempt_permit_id),
+            "transport_claim_id": str(self.transport_claim_id),
+            "terminal_guard_id": str(self.terminal_guard_id),
+            "terminal_guard_digest_prefix": str(self.terminal_guard_digest)[:12],
+            "dns_start_id": str(self.dns_start_id),
+            "receipt_digest_prefix": str(self.receipt_digest)[:12],
             "candidate_count": len(self.candidates),
             "raw_candidate_count": self.raw_candidate_count,
             "address_policy_ref": self.address_policy_ref,
@@ -587,9 +718,9 @@ def _reject_json_number(value: str) -> object:
     raise _TranscriptRejected("unsupported JSON number")
 
 
-def _parse_transcript(transcript: bytes) -> tuple[
-    tuple[dict[str, object], ...], Digest256
-]:
+def _parse_transcript(
+    transcript: bytes,
+) -> tuple[dict[str, object], tuple[dict[str, object], ...], Digest256]:
     if type(transcript) is not bytes:
         raise _TranscriptRejected("transcript must be immutable bytes")
     if not transcript or len(transcript) > MAX_RAW_RESOLUTION_BYTES:
@@ -606,10 +737,60 @@ def _parse_transcript(transcript: bytes) -> tuple[
             raise _TranscriptRejected("transcript is not canonical JSON")
     except Exception as error:
         raise _TranscriptRejected("invalid transcript") from error
-    if type(parsed) is not dict or set(parsed) != {"candidates", "schema_version"}:
+    fixed = {
+        "address_policy_digest": str(INTERNET_PUBLIC_ADDRESS_POLICY_DIGEST),
+        "address_policy_ref": INTERNET_PUBLIC_ADDRESS_POLICY_REF,
+        "kind": "RESULT",
+        "network_policy_version": GLM_NETWORK_POLICY_VERSION,
+        "schema_version": RAW_RESOLUTION_TRANSCRIPT_SCHEMA_VERSION,
+        "status": "ok",
+    }
+    proof_names = {
+        "attempt_permit_digest",
+        "attempt_permit_id",
+        "canonical_hostname",
+        "dns_start_id",
+        "port",
+        "start_frame_digest",
+        "terminal_guard_digest",
+        "terminal_guard_id",
+        "transport_claim_id",
+    }
+    if (
+        type(parsed) is not dict
+        or set(parsed) != set(fixed) | proof_names | {"candidates"}
+    ):
         raise _TranscriptRejected("invalid transcript object")
-    if parsed["schema_version"] != RAW_RESOLUTION_TRANSCRIPT_SCHEMA_VERSION:
-        raise _TranscriptRejected("unsupported transcript schema")
+    if any(parsed[name] != value for name, value in fixed.items()):
+        raise _TranscriptRejected("transcript policy fields are invalid")
+    try:
+        for name in (
+            "attempt_permit_id",
+            "transport_claim_id",
+            "terminal_guard_id",
+            "dns_start_id",
+        ):
+            value = parsed[name]
+            if type(value) is not str or str(UUID(value)) != value:
+                raise ValueError("invalid UUID proof")
+        for name in (
+            "attempt_permit_digest",
+            "terminal_guard_digest",
+            "start_frame_digest",
+        ):
+            Digest256(parsed[name])
+        hostname = parsed["canonical_hostname"]
+        if (
+            type(hostname) is not str
+            or hostname != hostname.lower()
+            or _CANONICAL_DNS_RE.fullmatch(hostname) is None
+        ):
+            raise ValueError("invalid hostname proof")
+        port = parsed["port"]
+        if type(port) is not int or not 1 <= port <= 65_535:
+            raise ValueError("invalid port proof")
+    except (TypeError, ValueError) as error:
+        raise _TranscriptRejected("invalid transcript proof shape") from error
     candidates = parsed["candidates"]
     if type(candidates) is not list or not (
         1 <= len(candidates) <= MAX_RAW_RESOLUTION_CANDIDATES
@@ -617,15 +798,7 @@ def _parse_transcript(transcript: bytes) -> tuple[
         raise _TranscriptRejected("invalid candidate count")
     if not all(type(candidate) is dict for candidate in candidates):
         raise _TranscriptRejected("invalid candidate object")
-    digest = digest256(
-        "RawResolutionTranscript",
-        RAW_RESOLUTION_TRANSCRIPT_SCHEMA_VERSION,
-        {
-            "byte_size": len(transcript),
-            "sha256": hashlib.sha256(transcript).hexdigest(),
-        },
-    )
-    return tuple(candidates), digest
+    return parsed, tuple(candidates), result_transcript_digest(transcript)
 
 
 def _is_ipv4_allowed(address: IPv4Address) -> bool:
@@ -720,6 +893,253 @@ def _candidate_sort_key(address: ResolvedAddress) -> tuple[int, bytes, int]:
     return family_rank, address.packed, address.port
 
 
+def _normalized_transcript_payload(
+    normalized: "NormalizedResolutionTranscript",
+) -> dict[str, object]:
+    return {
+        "attempt_permit_id": normalized.attempt_permit_id,
+        "attempt_permit_digest": normalized.attempt_permit_digest,
+        "transport_claim_id": normalized.transport_claim_id,
+        "terminal_guard_id": normalized.terminal_guard_id,
+        "terminal_guard_digest": normalized.terminal_guard_digest,
+        "dns_start_id": normalized.dns_start_id,
+        "start_frame_digest": normalized.start_frame_digest,
+        "canonical_hostname": normalized.canonical_hostname,
+        "port": normalized.port,
+        "network_policy_version": normalized.network_policy_version,
+        "address_policy_ref": normalized.address_policy_ref,
+        "address_policy_digest": normalized.address_policy_digest,
+        "raw_transcript_digest": normalized.raw_transcript_digest,
+        "raw_transcript_byte_size": normalized.raw_transcript_byte_size,
+        "raw_candidate_count": normalized.raw_candidate_count,
+        "candidates": tuple(_address_payload(item) for item in normalized.candidates),
+    }
+
+
+@runtime_final
+class NormalizedResolutionTranscript:
+    """Pure, factory-only normalized RESULT data with no publish authority."""
+
+    __slots__ = (
+        "attempt_permit_id",
+        "attempt_permit_digest",
+        "transport_claim_id",
+        "terminal_guard_id",
+        "terminal_guard_digest",
+        "dns_start_id",
+        "start_frame_digest",
+        "canonical_hostname",
+        "port",
+        "network_policy_version",
+        "address_policy_ref",
+        "address_policy_digest",
+        "raw_transcript_digest",
+        "raw_transcript_byte_size",
+        "raw_candidate_count",
+        "candidates",
+        "normalization_digest",
+        "_issued_digest",
+    )
+
+    def __init__(
+        self,
+        *,
+        parsed: dict[str, object],
+        raw_transcript_digest: Digest256,
+        raw_transcript_byte_size: int,
+        raw_candidate_count: int,
+        candidates: tuple[ResolvedAddress, ...],
+        _authority: object | None = None,
+    ) -> None:
+        if _authority is not _NORMALIZED_TRANSCRIPT_FACTORY_AUTHORITY:
+            raise TypeError("normalized transcripts require the policy factory")
+        values = (
+            ("attempt_permit_id", UUID(parsed["attempt_permit_id"])),
+            (
+                "attempt_permit_digest",
+                Digest256(parsed["attempt_permit_digest"]),
+            ),
+            ("transport_claim_id", UUID(parsed["transport_claim_id"])),
+            ("terminal_guard_id", UUID(parsed["terminal_guard_id"])),
+            (
+                "terminal_guard_digest",
+                Digest256(parsed["terminal_guard_digest"]),
+            ),
+            ("dns_start_id", UUID(parsed["dns_start_id"])),
+            ("start_frame_digest", Digest256(parsed["start_frame_digest"])),
+            ("canonical_hostname", parsed["canonical_hostname"]),
+            ("port", parsed["port"]),
+            ("network_policy_version", parsed["network_policy_version"]),
+            ("address_policy_ref", parsed["address_policy_ref"]),
+            ("address_policy_digest", Digest256(parsed["address_policy_digest"])),
+            ("raw_transcript_digest", raw_transcript_digest),
+            ("raw_transcript_byte_size", raw_transcript_byte_size),
+            ("raw_candidate_count", raw_candidate_count),
+            ("candidates", candidates),
+        )
+        for name, value in values:
+            object.__setattr__(self, name, value)
+        normalization_digest = digest256(
+            "NormalizedResolutionTranscript",
+            NORMALIZED_RESOLUTION_TRANSCRIPT_SCHEMA_VERSION,
+            _normalized_transcript_payload(self),
+        )
+        object.__setattr__(self, "normalization_digest", normalization_digest)
+        object.__setattr__(self, "_issued_digest", normalization_digest)
+        self.validate_integrity()
+
+    def __setattr__(self, name: str, value: object) -> None:
+        del name, value
+        raise AttributeError("NormalizedResolutionTranscript is immutable")
+
+    def __copy__(self) -> "NormalizedResolutionTranscript":
+        return self
+
+    def __deepcopy__(
+        self,
+        memo: dict[int, object],
+    ) -> "NormalizedResolutionTranscript":
+        del memo
+        return self
+
+    def __reduce__(self) -> object:
+        raise TypeError("NormalizedResolutionTranscript cannot be serialized")
+
+    def __reduce_ex__(self, protocol: int) -> object:
+        del protocol
+        raise TypeError("NormalizedResolutionTranscript cannot be serialized")
+
+    def __repr__(self) -> str:
+        return (
+            "NormalizedResolutionTranscript("
+            f"raw_candidate_count={self.raw_candidate_count!r}, "
+            f"candidate_count={len(self.candidates)!r}, port={self.port!r})"
+        )
+
+    def validate_integrity(self) -> None:
+        for name in (
+            "attempt_permit_id",
+            "transport_claim_id",
+            "terminal_guard_id",
+            "dns_start_id",
+        ):
+            require_uuid(getattr(self, name), name)
+        for name in (
+            "attempt_permit_digest",
+            "terminal_guard_digest",
+            "start_frame_digest",
+            "address_policy_digest",
+            "raw_transcript_digest",
+            "normalization_digest",
+            "_issued_digest",
+        ):
+            require_digest(getattr(self, name), name)
+        if (
+            type(self.canonical_hostname) is not str
+            or self.canonical_hostname != self.canonical_hostname.lower()
+            or _CANONICAL_DNS_RE.fullmatch(self.canonical_hostname) is None
+        ):
+            raise ValueError("normalized hostname changed")
+        require_plain_int(self.port, "port", minimum=1)
+        if self.port > 65_535:
+            raise ValueError("normalized port changed")
+        if self.network_policy_version != GLM_NETWORK_POLICY_VERSION:
+            raise ValueError("normalized network policy changed")
+        if (
+            self.address_policy_ref != INTERNET_PUBLIC_ADDRESS_POLICY_REF
+            or self.address_policy_digest != INTERNET_PUBLIC_ADDRESS_POLICY_DIGEST
+        ):
+            raise ValueError("normalized address policy changed")
+        require_plain_int(
+            self.raw_transcript_byte_size,
+            "raw_transcript_byte_size",
+            minimum=1,
+        )
+        if self.raw_transcript_byte_size > MAX_RAW_RESOLUTION_BYTES:
+            raise ValueError("normalized transcript size changed")
+        require_plain_int(
+            self.raw_candidate_count,
+            "raw_candidate_count",
+            minimum=1,
+        )
+        if self.raw_candidate_count > MAX_RAW_RESOLUTION_CANDIDATES:
+            raise ValueError("normalized candidate count changed")
+        if (
+            type(self.candidates) is not tuple
+            or not self.candidates
+            or not all(type(item) is ResolvedAddress for item in self.candidates)
+            or len(self.candidates) > self.raw_candidate_count
+        ):
+            raise ValueError("normalized candidates changed")
+        for candidate in self.candidates:
+            candidate.validate_integrity()
+            if candidate.port != self.port:
+                raise ValueError("normalized candidate port changed")
+        keys = tuple(_candidate_sort_key(item) for item in self.candidates)
+        if keys != tuple(sorted(keys)) or len(set(keys)) != len(keys):
+            raise ValueError("normalized candidates are not canonical")
+        recomputed = digest256(
+            "NormalizedResolutionTranscript",
+            NORMALIZED_RESOLUTION_TRANSCRIPT_SCHEMA_VERSION,
+            _normalized_transcript_payload(self),
+        )
+        if (
+            recomputed != self.normalization_digest
+            or recomputed != self._issued_digest
+        ):
+            raise ValueError("normalized transcript integrity mismatch")
+
+    def safe_metadata(self) -> dict[str, object]:
+        return {
+            "schema_version": NORMALIZED_RESOLUTION_TRANSCRIPT_SCHEMA_VERSION,
+            "port": self.port,
+            "raw_candidate_count": self.raw_candidate_count,
+            "candidate_count": len(self.candidates),
+            "raw_transcript_digest_prefix": str(self.raw_transcript_digest)[:12],
+            "normalization_digest_prefix": str(self.normalization_digest)[:12],
+        }
+
+
+def normalize_resolution_transcript(
+    transcript: bytes,
+    *,
+    expected_port: int,
+) -> NormalizedResolutionTranscript:
+    """Purely parse and normalize RESULT; this cannot publish a ResolutionSet."""
+
+    result: NormalizedResolutionTranscript | None = None
+    try:
+        checked_port = require_plain_int(expected_port, "expected_port", minimum=1)
+        if checked_port > 65_535:
+            raise _TranscriptRejected("expected port is out of range")
+        parsed, raw_candidates, transcript_digest = _parse_transcript(transcript)
+        if parsed["port"] != checked_port:
+            raise _TranscriptRejected("transcript port changed")
+        normalized = tuple(
+            _normalized_raw_address(record, expected_port=checked_port)
+            for record in raw_candidates
+        )
+        unique_by_key = {
+            _candidate_sort_key(candidate): candidate for candidate in normalized
+        }
+        candidates = tuple(unique_by_key[key] for key in sorted(unique_by_key))
+        if not candidates:
+            raise _TranscriptRejected("resolution set is empty")
+        result = NormalizedResolutionTranscript(
+            parsed=parsed,
+            raw_transcript_digest=transcript_digest,
+            raw_transcript_byte_size=len(transcript),
+            raw_candidate_count=len(raw_candidates),
+            candidates=candidates,
+            _authority=_NORMALIZED_TRANSCRIPT_FACTORY_AUTHORITY,
+        )
+    except Exception:
+        _raise_address_error()
+    if result is None:
+        _raise_address_error()
+    return result
+
+
 def _frozen_attempt_network_binding(
     attempt_permit: AttemptPermit,
 ) -> tuple[str, int, str]:
@@ -763,43 +1183,101 @@ def _frozen_attempt_network_binding(
 
 def build_resolution_set(
     attempt_permit: AttemptPermit,
-    transcript: bytes,
+    result_receipt: ResolverResultReceipt,
 ) -> ResolutionSet:
-    """Validate one raw helper transcript and bind it to ``attempt_permit``."""
+    """Publish only from one exact, ledger-issued helper RESULT receipt."""
 
     if type(attempt_permit) is not AttemptPermit:
         raise TypeError("attempt_permit must be AttemptPermit")
+    if type(result_receipt) is not ResolverResultReceipt:
+        raise TypeError("result_receipt must be ResolverResultReceipt")
     failed = False
     result: ResolutionSet | None = None
     try:
+        transcript = result_receipt._publication_transcript(
+            _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+        )
         hostname, port, network_policy_version = _frozen_attempt_network_binding(
             attempt_permit
         )
-        raw_candidates, transcript_digest = _parse_transcript(transcript)
-        normalized = tuple(
-            _normalized_raw_address(record, expected_port=port)
-            for record in raw_candidates
+        exact_start_frame = encode_start_frame(
+            hostname=hostname,
+            port=port,
+            network_policy_ref=INTERNET_PUBLIC_ADDRESS_POLICY_REF,
+            network_policy_digest=INTERNET_PUBLIC_ADDRESS_POLICY_DIGEST,
+            attempt_permit_id=result_receipt.attempt_permit_id,
+            attempt_permit_digest=result_receipt.attempt_permit_digest,
+            transport_claim_id=result_receipt.transport_claim_id,
+            terminal_guard_id=result_receipt.terminal_guard_id,
+            terminal_guard_digest=result_receipt.terminal_guard_digest,
+            dns_start_id=result_receipt.dns_start_id,
         )
-        unique_by_key = {
-            _candidate_sort_key(candidate): candidate for candidate in normalized
-        }
-        candidates = tuple(
-            unique_by_key[key] for key in sorted(unique_by_key)
+        if start_frame_digest(exact_start_frame) != result_receipt.start_frame_digest:
+            raise _TranscriptRejected("receipt START frame digest changed")
+        gate = attempt_permit._attempt_gate
+        if not gate._dns_start_is_committed(
+            attempt_permit,
+            claim_id=result_receipt.transport_claim_id,
+            guard_id=result_receipt.terminal_guard_id,
+            guard_digest=result_receipt.terminal_guard_digest,
+            start_id=result_receipt.dns_start_id,
+            _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+        ):
+            raise _TranscriptRejected("DNS START proof is not committed")
+        normalized = normalize_resolution_transcript(
+            transcript,
+            expected_port=port,
         )
-        if not candidates:
-            raise _TranscriptRejected("resolution set is empty")
+        exact_echo = (
+            normalized.attempt_permit_id == attempt_permit.attempt_permit_id,
+            normalized.attempt_permit_digest
+            == attempt_permit.attempt_permit_digest,
+            normalized.attempt_permit_id == result_receipt.attempt_permit_id,
+            normalized.attempt_permit_digest
+            == result_receipt.attempt_permit_digest,
+            normalized.transport_claim_id == result_receipt.transport_claim_id,
+            normalized.terminal_guard_id == result_receipt.terminal_guard_id,
+            normalized.terminal_guard_digest
+            == result_receipt.terminal_guard_digest,
+            normalized.dns_start_id == result_receipt.dns_start_id,
+            normalized.start_frame_digest == result_receipt.start_frame_digest,
+            normalized.canonical_hostname == hostname,
+            normalized.port == port,
+            normalized.network_policy_version == network_policy_version,
+            normalized.address_policy_ref == INTERNET_PUBLIC_ADDRESS_POLICY_REF,
+            normalized.address_policy_digest
+            == INTERNET_PUBLIC_ADDRESS_POLICY_DIGEST,
+            normalized.raw_transcript_digest
+            == result_receipt.raw_transcript_digest,
+            normalized.raw_transcript_byte_size
+            == result_receipt.raw_transcript_byte_size,
+        )
+        if not all(exact_echo):
+            raise _TranscriptRejected("RESULT proof does not match receipt")
         result = ResolutionSet(
             attempt_permit=attempt_permit,
+            transport_claim_id=result_receipt.transport_claim_id,
+            terminal_guard_id=result_receipt.terminal_guard_id,
+            terminal_guard_digest=result_receipt.terminal_guard_digest,
+            dns_start_id=result_receipt.dns_start_id,
+            result_receipt=result_receipt,
             canonical_hostname=hostname,
             port=port,
             network_policy_version=network_policy_version,
-            raw_transcript_digest=transcript_digest,
-            raw_transcript_byte_size=len(transcript),
-            raw_candidate_count=len(raw_candidates),
-            candidates=candidates,
+            raw_transcript_digest=normalized.raw_transcript_digest,
+            raw_transcript_byte_size=normalized.raw_transcript_byte_size,
+            raw_candidate_count=normalized.raw_candidate_count,
+            candidates=normalized.candidates,
             _authority=_RESOLUTION_FACTORY_AUTHORITY,
         )
-        result.validate_binding(attempt_permit)
+        result_receipt._publish_resolution(
+            result,
+            resolution_digest=result.resolution_digest,
+            canonical_payload=_resolution_canonical_payload(result),
+            candidates=_resolution_candidate_publication_snapshots(result),
+            _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+        )
+        result.validate_binding(attempt_permit, result_receipt)
     except Exception:
         failed = True
     if failed or result is None:
@@ -873,12 +1351,15 @@ __all__ = [
     "INTERNET_PUBLIC_ADDRESS_POLICY_SCHEMA_VERSION",
     "MAX_RAW_RESOLUTION_BYTES",
     "MAX_RAW_RESOLUTION_CANDIDATES",
+    "NORMALIZED_RESOLUTION_TRANSCRIPT_SCHEMA_VERSION",
     "RAW_RESOLUTION_TRANSCRIPT_SCHEMA_VERSION",
     "RESOLVED_ADDRESS_SCHEMA_VERSION",
     "RESOLUTION_SET_SCHEMA_VERSION",
     "AddressFamily",
+    "NormalizedResolutionTranscript",
     "ResolvedAddress",
     "ResolutionSet",
     "build_resolution_set",
     "match_exact_peer",
+    "normalize_resolution_transcript",
 ]
