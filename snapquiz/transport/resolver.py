@@ -19,6 +19,8 @@ from threading import RLock
 from typing import Callable, NamedTuple, Protocol
 from uuid import UUID, uuid4, uuid5
 
+import snapquiz.runtime.attempt as attempt_module
+
 from snapquiz.domain._validation import (
     require_digest,
     require_plain_int,
@@ -46,6 +48,16 @@ MAX_RESULT_TRANSCRIPT_BYTES = 16_384
 MAX_RESULT_FRAME_BYTES = MAX_RESULT_TRANSCRIPT_BYTES + 1
 MAX_RESULT_CANDIDATES = 32
 MAX_HELPER_STDERR_BYTES = 4_096
+HELPER_CLEANUP_POLL_QUANTUM_NS = 50_000_000
+MAX_HELPER_CLEANUP_POLL_STEPS = 8
+
+HELPER_PHASE_SPAWN = "resolver_helper.spawn"
+HELPER_PHASE_READY = "resolver_helper.ready"
+HELPER_PHASE_START = "resolver_helper.start"
+HELPER_PHASE_RESULT = "resolver_helper.result"
+HELPER_PHASE_RESULT_EOF = "resolver_helper.result_eof"
+HELPER_PHASE_RESULT_REAP = "resolver_helper.result_reap"
+HELPER_PHASE_RESULT_CLOSE = "resolver_helper.result_close"
 
 _PRE_GUARD_FACTORY_AUTHORITY = object()
 _ATTEMPT_GUARD_FACTORY_AUTHORITY = object()
@@ -61,7 +73,34 @@ _DNS_HOST_RE = re.compile(
     r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z"
 )
 
-LifecycleObserver = Callable[[str, dict[str, object]], None]
+@runtime_final
+class _HelperPollSentinel:
+    """Immutable identity result for one bounded helper poll."""
+
+    __slots__ = ("_name",)
+
+    def __init__(self, name: str) -> None:
+        object.__setattr__(self, "_name", name)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        del name, value
+        raise AttributeError("helper poll sentinels are immutable")
+
+    def __copy__(self) -> "_HelperPollSentinel":
+        return self
+
+    def __deepcopy__(self, memo: dict[int, object]) -> "_HelperPollSentinel":
+        del memo
+        return self
+
+    def __repr__(self) -> str:
+        return self._name
+
+
+# ``b""`` is exclusively stdout EOF.  These identity values are therefore
+# deliberately not bytes and cannot be confused with either data or EOF.
+PENDING = _HelperPollSentinel("PENDING")
+COMPLETE = _HelperPollSentinel("COMPLETE")
 
 
 def _exact_bytes_digest(
@@ -104,20 +143,20 @@ def result_transcript_digest(transcript: bytes) -> Digest256:
 class HelperKernel(Protocol):
     """The smallest injectable owner of one already-created helper."""
 
-    def read_stdout(self, max_bytes: int) -> bytes:
-        """Read at most ``max_bytes`` bytes from the helper stdout pipe."""
+    def read_stdout(self, max_bytes: int, *, max_wait_ns: int) -> object:
+        """Return non-empty bytes, exact EOF ``b""``, or ``PENDING``."""
 
-    def write_stdin(self, frame: bytes) -> None:
-        """Write one complete, already-bounded protocol frame."""
+    def write_stdin(self, frame: bytes, *, max_wait_ns: int) -> object:
+        """Atomically return ``COMPLETE`` or ``PENDING`` for one frame."""
 
-    def terminate(self) -> None:
-        """Best-effort stop of the helper, whether it is alive or exited."""
+    def terminate(self, *, max_wait_ns: int) -> object:
+        """Return ``COMPLETE`` or ``PENDING`` without exceeding the slice."""
 
-    def reap(self) -> int:
-        """Reap the helper exactly once and return its plain exit status."""
+    def reap(self, *, max_wait_ns: int) -> object:
+        """Return a plain exit status or ``PENDING`` within the slice."""
 
-    def close_pipes(self) -> None:
-        """Close every helper-owned parent-side pipe exactly once."""
+    def close_pipes(self, *, max_wait_ns: int) -> object:
+        """Return ``COMPLETE`` or ``PENDING`` without exceeding the slice."""
 
 
 class HelperSpawner(Protocol):
@@ -128,8 +167,9 @@ class HelperSpawner(Protocol):
         request: "ResolverHelperSpawnRequest",
         *,
         publication: "_KernelPublication",
-    ) -> HelperKernel:
-        """Create and publish one helper before returning from the spawn call."""
+        max_wait_ns: int,
+    ) -> object:
+        """Return the published kernel or ``PENDING`` within the slice."""
 
 
 class _ResultReceiptIssuanceSnapshot(NamedTuple):
@@ -194,6 +234,8 @@ class _LifecycleCapabilitySnapshot(NamedTuple):
     transport_claim_id: UUID
     dns_start_id: UUID
     spawn_request_digest: Digest256
+    stop_authority_id: UUID
+    stop_authority_digest: Digest256
     capability_digest: Digest256
     launcher: object
     reservation_owner: object
@@ -225,6 +267,8 @@ def _lifecycle_capability_digest(
     transport_claim_id: UUID,
     dns_start_id: UUID,
     spawn_request_digest: Digest256,
+    stop_authority_id: UUID,
+    stop_authority_digest: Digest256,
 ) -> Digest256:
     """Bind every generated role ID to the exact helper spawn contract."""
 
@@ -243,8 +287,37 @@ def _lifecycle_capability_digest(
                 spawn_request_digest,
                 "spawn_request_digest",
             ),
+            "stop_authority_id": require_uuid(
+                stop_authority_id,
+                "stop_authority_id",
+            ),
+            "stop_authority_digest": require_digest(
+                stop_authority_digest,
+                "stop_authority_digest",
+            ),
         },
     )
+
+
+def _validated_stop_authority(stop_authority: object) -> tuple[UUID, Digest256]:
+    """Validate the exact AttemptGate-issued helper stop authority."""
+
+    authority_type = getattr(attempt_module, "HelperStopAuthority", None)
+    if authority_type is None or type(stop_authority) is not authority_type:
+        raise _lifecycle_error("resolver helper stop authority 类型无效。")
+    try:
+        stop_authority.validate_integrity()
+        authority_id = require_uuid(
+            stop_authority.authority_id,
+            "stop_authority_id",
+        )
+        authority_digest = require_digest(
+            stop_authority.authority_digest,
+            "stop_authority_digest",
+        )
+    except (AttributeError, TypeError, ValueError):
+        raise _lifecycle_error("resolver helper stop authority proof 无效。") from None
+    return authority_id, authority_digest
 
 
 def _validated_lifecycle_capability_snapshot(
@@ -282,6 +355,22 @@ def _validated_lifecycle_capability_snapshot(
         capability.spawn_request_digest,
         "spawn_request_digest",
     )
+    stop_authority = capability._stop_authority
+    if stop_authority is not capability._issued_stop_authority:
+        raise _lifecycle_error("resolver helper stop authority owner 无效。")
+    stop_authority_id, stop_authority_digest = _validated_stop_authority(
+        stop_authority
+    )
+    if (
+        require_uuid(capability.stop_authority_id, "stop_authority_id")
+        != stop_authority_id
+        or require_digest(
+            capability.stop_authority_digest,
+            "stop_authority_digest",
+        )
+        != stop_authority_digest
+    ):
+        raise _lifecycle_error("resolver helper stop authority binding 无效。")
     capability_digest = require_digest(
         capability.capability_digest,
         "capability_digest",
@@ -292,6 +381,8 @@ def _validated_lifecycle_capability_snapshot(
         transport_claim_id=transport_claim_id,
         dns_start_id=dns_start_id,
         spawn_request_digest=spawn_request_digest,
+        stop_authority_id=stop_authority_id,
+        stop_authority_digest=stop_authority_digest,
     )
     if capability_digest != expected_digest:
         raise _lifecycle_error("resolver lifecycle capability digest 无效。")
@@ -301,6 +392,8 @@ def _validated_lifecycle_capability_snapshot(
         transport_claim_id=transport_claim_id,
         dns_start_id=dns_start_id,
         spawn_request_digest=spawn_request_digest,
+        stop_authority_id=stop_authority_id,
+        stop_authority_digest=stop_authority_digest,
         capability_digest=capability_digest,
         launcher=bound_launcher,
         reservation_owner=reservation_owner,
@@ -343,32 +436,35 @@ def _require_hostname(value: object) -> str:
     return hostname
 
 
-def _notify(
-    observer: LifecycleObserver | None,
-    event: str,
-    metadata: dict[str, object],
-) -> None:
-    if observer is not None:
-        observer(event, dict(metadata))
-
-
 def _read_bounded_frame(
     kernel: HelperKernel,
     *,
+    ledger: "_ResolverLifecycleLedger",
+    owner: object,
+    phase: str,
     maximum: int,
     label: str,
 ) -> bytes:
-    """Read exactly one newline-terminated frame without over-read."""
+    """Poll exactly one newline-terminated frame without blocking or over-read."""
 
     require_plain_int(maximum, "maximum", minimum=1)
+    checked_phase = require_text(phase, "phase", max_length=64)
     buffer = bytearray()
     while True:
         allowance = maximum - len(buffer)
         if allowance <= 0:
             raise _lifecycle_error(f"{label} frame 超过上限。")
-        chunk = kernel.read_stdout(allowance)
+        wait_slice = ledger.business_wait_slice(owner, checked_phase)
+        chunk = kernel.read_stdout(
+            allowance,
+            max_wait_ns=wait_slice.max_wait_ns,
+        )
+        if chunk is PENDING:
+            ledger.business_wait_slice(owner, checked_phase)
+            continue
         if type(chunk) is not bytes or len(chunk) > allowance:
             raise _lifecycle_error(f"{label} frame 读取合同无效。")
+        ledger.business_wait_slice(owner, checked_phase)
         if not chunk:
             raise _lifecycle_error(f"{label} frame 不完整。")
         newline = chunk.find(b"\n")
@@ -498,11 +594,13 @@ class FailClosedProductionHelperSpawner:
         request: ResolverHelperSpawnRequest,
         *,
         publication: "_KernelPublication",
-    ) -> HelperKernel:
+        max_wait_ns: int,
+    ) -> object:
         if type(request) is not ResolverHelperSpawnRequest:
             raise TypeError("request must be ResolverHelperSpawnRequest")
         if type(publication) is not _KernelPublication:
             raise TypeError("publication must be _KernelPublication")
+        require_plain_int(max_wait_ns, "max_wait_ns", minimum=1)
         raise _production_unavailable() from None
 
 
@@ -521,13 +619,16 @@ class _ResolverLifecycleLedger:
         "_state",
         "_cleanup_claimed",
         "_terminate_claimed",
+        "_terminate_pending",
         "_terminated",
         "_eof_probe_claimed",
         "_stdout_eof",
         "_reap_claimed",
+        "_reap_pending",
         "_child_reaped",
         "_child_exit_status",
         "_pipes_close_claimed",
+        "_pipes_close_pending",
         "_helper_pipes_closed",
         "_dns_start_id",
         "_start_frame_digest",
@@ -535,6 +636,7 @@ class _ResolverLifecycleLedger:
         "_issued_receipt_snapshot",
         "_issued_resolution_snapshot",
         "_launch_owner_snapshot",
+        "_stop_authority",
         "_on_terminal",
     )
 
@@ -558,13 +660,16 @@ class _ResolverLifecycleLedger:
         self._state = "created"
         self._cleanup_claimed = False
         self._terminate_claimed = False
+        self._terminate_pending = False
         self._terminated = False
         self._eof_probe_claimed = False
         self._stdout_eof = False
         self._reap_claimed = False
+        self._reap_pending = False
         self._child_reaped = False
         self._child_exit_status: int | None = None
         self._pipes_close_claimed = False
+        self._pipes_close_pending = False
         self._helper_pipes_closed = False
         self._dns_start_id: UUID | None = None
         self._start_frame_digest: Digest256 | None = None
@@ -572,6 +677,7 @@ class _ResolverLifecycleLedger:
         self._issued_receipt_snapshot: _ResultReceiptIssuanceSnapshot | None = None
         self._issued_resolution_snapshot: _ResolutionPublicationSnapshot | None = None
         self._launch_owner_snapshot: object | None = None
+        self._stop_authority: object | None = capability._stop_authority
         self._on_terminal = on_terminal
 
     def bind_launch_owner(
@@ -610,6 +716,88 @@ class _ResolverLifecycleLedger:
             if snapshot != self._capability_snapshot:
                 raise _lifecycle_error("resolver lifecycle capability 已变化。")
             return snapshot
+
+    def business_wait_slice(self, owner: object, phase: str) -> object:
+        """Issue one exact bounded wait slice before or after a business poll."""
+
+        checked_phase = require_text(phase, "phase", max_length=64)
+        with self._lock:
+            snapshot = self._capability_snapshot
+            stop_authority = self._stop_authority
+            if (
+                self._owner is not owner
+                or self._state in ("cleaning", "cleanup_failed", "terminal")
+                or stop_authority is None
+                or self._capability is None
+                or stop_authority is not self._capability._stop_authority
+                or _validated_lifecycle_capability_snapshot(self._capability)
+                != snapshot
+            ):
+                raise _lifecycle_error("resolver helper stop authority owner 无效。")
+        authority_id, authority_digest = _validated_stop_authority(stop_authority)
+        if (
+            authority_id != snapshot.stop_authority_id
+            or authority_digest != snapshot.stop_authority_digest
+        ):
+            raise _lifecycle_error("resolver helper stop authority 已变化。")
+
+        wait_slice = stop_authority._checkpoint(
+            checked_phase,
+            _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+        )
+        wait_slice_type = getattr(attempt_module, "HelperWaitSlice", None)
+        if wait_slice_type is None or type(wait_slice) is not wait_slice_type:
+            raise _lifecycle_error("resolver helper wait slice 类型无效。")
+        try:
+            wait_slice.validate_integrity()
+            wait_authority_id = require_uuid(
+                wait_slice.authority_id,
+                "wait_authority_id",
+            )
+            wait_authority_digest = require_digest(
+                wait_slice.authority_digest,
+                "wait_authority_digest",
+            )
+            max_wait_ns = require_plain_int(
+                wait_slice.max_wait_ns,
+                "max_wait_ns",
+                minimum=1,
+            )
+            observed_ns = require_plain_int(
+                wait_slice.observed_monotonic_ns,
+                "observed_monotonic_ns",
+            )
+            deadline_ns = require_plain_int(
+                wait_slice.effective_deadline_ns,
+                "effective_deadline_ns",
+            )
+            wait_phase = require_text(
+                wait_slice.phase,
+                "phase",
+                max_length=64,
+            )
+        except (AttributeError, TypeError, ValueError):
+            raise _lifecycle_error("resolver helper wait slice proof 无效。") from None
+        if (
+            wait_phase != checked_phase
+            or wait_authority_id != snapshot.stop_authority_id
+            or wait_authority_digest != snapshot.stop_authority_digest
+            or deadline_ns != stop_authority.effective_deadline_ns
+            or observed_ns >= deadline_ns
+            or max_wait_ns > deadline_ns - observed_ns
+        ):
+            raise _lifecycle_error("resolver helper wait slice binding 无效。")
+
+        # Recheck identity after the authority call so a tampered or aliased
+        # capability cannot supply a slice and then win the poll boundary.
+        with self._lock:
+            if (
+                self._owner is not owner
+                or self._stop_authority is not stop_authority
+                or self._capability_snapshot != snapshot
+            ):
+                raise _lifecycle_error("resolver helper stop authority 已变化。")
+        return wait_slice
 
     def bind_pre_owner(self, owner: object) -> None:
         with self._lock:
@@ -803,7 +991,6 @@ class _ResolverLifecycleLedger:
         _cleanup_guard(
             guard,
             self,
-            observer=None,
             suppress_errors=True,
         )
         return self.is_terminal()
@@ -929,8 +1116,33 @@ class _ResolverLifecycleLedger:
             ):
                 raise _lifecycle_error("resolver child reap 状态无效。")
             self._reap_claimed = True
+            self._reap_pending = False
             self._state = "result_reaping"
             return self._kernel
+
+    def begin_result_reap_poll(self, owner: object) -> None:
+        """Forget a prior explicit PENDING immediately before the next poll."""
+
+        with self._lock:
+            if (
+                self._owner is not owner
+                or self._state != "result_reaping"
+                or not self._reap_claimed
+                or self._child_reaped
+            ):
+                raise _lifecycle_error("resolver child reap poll 状态无效。")
+            self._reap_pending = False
+
+    def mark_result_reap_pending(self, owner: object) -> None:
+        with self._lock:
+            if (
+                self._owner is not owner
+                or self._state != "result_reaping"
+                or not self._reap_claimed
+                or self._child_reaped
+            ):
+                raise _lifecycle_error("resolver child reap pending 状态无效。")
+            self._reap_pending = True
 
     def commit_result_reap(self, owner: object, exit_status: object) -> None:
         """Commit one exact plain exit status; only zero may publish RESULT."""
@@ -952,11 +1164,10 @@ class _ResolverLifecycleLedger:
                 raise _lifecycle_error("resolver child reap proof 状态无效。")
             self._child_reaped = True
             self._child_exit_status = checked_status
+            self._reap_pending = False
             self._state = (
                 "result_reaped" if checked_status == 0 else "result_exit_rejected"
             )
-        if checked_status != 0:
-            raise _lifecycle_error("resolver child 退出状态不是 0。")
 
     def claim_result_pipe_close(self, owner: object) -> HelperKernel:
         """Claim parent-side pipe closure after an exact successful reap."""
@@ -974,8 +1185,31 @@ class _ResolverLifecycleLedger:
             ):
                 raise _lifecycle_error("resolver helper pipe close 状态无效。")
             self._pipes_close_claimed = True
+            self._pipes_close_pending = False
             self._state = "result_pipes_closing"
             return self._kernel
+
+    def begin_result_pipe_close_poll(self, owner: object) -> None:
+        with self._lock:
+            if (
+                self._owner is not owner
+                or self._state != "result_pipes_closing"
+                or not self._pipes_close_claimed
+                or self._helper_pipes_closed
+            ):
+                raise _lifecycle_error("resolver helper pipe close poll 状态无效。")
+            self._pipes_close_pending = False
+
+    def mark_result_pipe_close_pending(self, owner: object) -> None:
+        with self._lock:
+            if (
+                self._owner is not owner
+                or self._state != "result_pipes_closing"
+                or not self._pipes_close_claimed
+                or self._helper_pipes_closed
+            ):
+                raise _lifecycle_error("resolver helper pipe close pending 状态无效。")
+            self._pipes_close_pending = True
 
     def commit_result_pipe_close(self, owner: object) -> None:
         with self._lock:
@@ -987,6 +1221,7 @@ class _ResolverLifecycleLedger:
             ):
                 raise _lifecycle_error("resolver helper pipe proof 状态无效。")
             self._helper_pipes_closed = True
+            self._pipes_close_pending = False
             self._state = "result_resources_closed"
 
     def result_attestation_for(
@@ -1177,36 +1412,50 @@ class _ResolverLifecycleLedger:
 
             kernel = self._kernel
             inherited_failure = (
-                (self._reap_claimed and not self._child_reaped)
+                (
+                    self._reap_claimed
+                    and not self._child_reaped
+                    and not self._reap_pending
+                )
                 or (
                     self._pipes_close_claimed
                     and not self._helper_pipes_closed
+                    and not self._pipes_close_pending
                 )
-                or (self._terminate_claimed and not self._terminated)
+                or (
+                    self._terminate_claimed
+                    and not self._terminated
+                    and not self._terminate_pending
+                )
             )
             terminate = (
                 kernel is not None
                 and not self._child_reaped
                 and not self._reap_claimed
-                and not self._terminate_claimed
+                and (not self._terminate_claimed or self._terminate_pending)
             )
             reap = (
                 kernel is not None
                 and not self._child_reaped
-                and not self._reap_claimed
+                and (not self._reap_claimed or self._reap_pending)
             )
             close_pipes = (
                 kernel is not None
                 and not self._helper_pipes_closed
-                and not self._pipes_close_claimed
+                and (
+                    not self._pipes_close_claimed
+                    or self._pipes_close_pending
+                )
             )
 
             # Claim each selected external action before exposing the plan.
             # A return-then-raise fault must never permit a second reap/close.
             if terminate:
                 self._terminate_claimed = True
+                self._terminate_pending = False
             if reap:
                 self._reap_claimed = True
+                # Preserve explicit PENDING until the cleanup poll begins.
             if close_pipes:
                 self._pipes_close_claimed = True
             self._cleanup_claimed = True
@@ -1219,6 +1468,58 @@ class _ResolverLifecycleLedger:
                 close_pipes,
                 inherited_failure,
             )
+
+    def begin_cleanup_action_poll(
+        self,
+        owner: object,
+        action_name: str,
+    ) -> None:
+        """Turn an explicit retry-safe PENDING into an in-flight poll."""
+
+        with self._lock:
+            if self._owner is not owner or self._state != "cleaning":
+                raise _lifecycle_error("resolver helper cleanup 状态已经变化。")
+            if action_name == "terminate":
+                if not self._terminate_claimed or self._terminated:
+                    raise _lifecycle_error("resolver helper terminate poll 无效。")
+                self._terminate_pending = False
+                return
+            if action_name == "reap":
+                if not self._reap_claimed or self._child_reaped:
+                    raise _lifecycle_error("resolver helper reap poll 无效。")
+                self._reap_pending = False
+                return
+            if action_name == "close_pipes":
+                if not self._pipes_close_claimed or self._helper_pipes_closed:
+                    raise _lifecycle_error("resolver helper pipe poll 无效。")
+                self._pipes_close_pending = False
+                return
+            raise ValueError("unknown resolver helper cleanup action")
+
+    def mark_cleanup_action_pending(
+        self,
+        owner: object,
+        action_name: str,
+    ) -> None:
+        with self._lock:
+            if self._owner is not owner or self._state != "cleaning":
+                raise _lifecycle_error("resolver helper cleanup 状态已经变化。")
+            if action_name == "terminate":
+                if not self._terminate_claimed or self._terminated:
+                    raise _lifecycle_error("resolver helper terminate pending 无效。")
+                self._terminate_pending = True
+                return
+            if action_name == "reap":
+                if not self._reap_claimed or self._child_reaped:
+                    raise _lifecycle_error("resolver helper reap pending 无效。")
+                self._reap_pending = True
+                return
+            if action_name == "close_pipes":
+                if not self._pipes_close_claimed or self._helper_pipes_closed:
+                    raise _lifecycle_error("resolver helper pipe pending 无效。")
+                self._pipes_close_pending = True
+                return
+            raise ValueError("unknown resolver helper cleanup action")
 
     def commit_cleanup_action(
         self,
@@ -1233,6 +1534,7 @@ class _ResolverLifecycleLedger:
                 if not self._terminate_claimed or self._terminated:
                     raise _lifecycle_error("resolver helper terminate proof 无效。")
                 self._terminated = True
+                self._terminate_pending = False
                 return
             if action_name == "reap":
                 if not self._reap_claimed or self._child_reaped:
@@ -1243,11 +1545,13 @@ class _ResolverLifecycleLedger:
                 )
                 self._child_reaped = True
                 self._child_exit_status = checked_status
+                self._reap_pending = False
                 return
             if action_name == "close_pipes":
                 if not self._pipes_close_claimed or self._helper_pipes_closed:
                     raise _lifecycle_error("resolver helper pipe proof 无效。")
                 self._helper_pipes_closed = True
+                self._pipes_close_pending = False
                 return
             raise ValueError("unknown resolver helper cleanup action")
 
@@ -1261,6 +1565,7 @@ class _ResolverLifecycleLedger:
             ):
                 raise _lifecycle_error("resolver helper 资源终结证明不完整。")
             self._kernel = None
+            self._stop_authority = None
             self._pre_owner = None
             self._owner = None
             self._state = "terminal"
@@ -1323,7 +1628,6 @@ class _ResolverLifecycleLedger:
         _cleanup_guard(
             owner,
             self,
-            observer=None,
             suppress_errors=True,
         )
         return self.is_terminal()
@@ -1468,7 +1772,6 @@ def _cleanup_guard(
     guard: object,
     ledger: _ResolverLifecycleLedger,
     *,
-    observer: LifecycleObserver | None,
     suppress_errors: bool,
 ) -> bool:
     try:
@@ -1482,12 +1785,6 @@ def _cleanup_guard(
             return False
         return ledger.retry_finish_cleanup(guard)
 
-    observer_error: BaseException | None = None
-    try:
-        _notify(observer, "cleanup_committed", ledger.safe_metadata())
-    except BaseException as error:
-        observer_error = error
-
     cleanup_failed = plan.inherited_failure
     if plan.kernel is not None:
         actions = (
@@ -1498,11 +1795,40 @@ def _cleanup_guard(
         for action_name, selected in actions:
             if not selected:
                 continue
-            try:
-                action = getattr(plan.kernel, action_name)
-                result = action()
-                ledger.commit_cleanup_action(guard, action_name, result)
-            except BaseException:
+            completed = False
+            for _ in range(MAX_HELPER_CLEANUP_POLL_STEPS):
+                try:
+                    ledger.begin_cleanup_action_poll(guard, action_name)
+                    action = getattr(plan.kernel, action_name)
+                    result = action(
+                        max_wait_ns=HELPER_CLEANUP_POLL_QUANTUM_NS,
+                    )
+                    if result is PENDING:
+                        ledger.mark_cleanup_action_pending(
+                            guard,
+                            action_name,
+                        )
+                        continue
+                    if action_name in ("terminate", "close_pipes"):
+                        if result is not COMPLETE:
+                            raise _lifecycle_error(
+                                "resolver helper cleanup poll 合同无效。"
+                            )
+                        result = None
+                    elif type(result) is not int:
+                        raise _lifecycle_error(
+                            "resolver helper cleanup reap 合同无效。"
+                        )
+                    ledger.commit_cleanup_action(
+                        guard,
+                        action_name,
+                        result,
+                    )
+                    completed = True
+                    break
+                except BaseException:
+                    break
+            if not completed:
                 cleanup_failed = True
     if cleanup_failed:
         try:
@@ -1524,8 +1850,6 @@ def _cleanup_guard(
                 except BaseException:
                     pass
 
-    if observer_error is not None and not suppress_errors:
-        raise observer_error
     if cleanup_failed and not suppress_errors:
         error = _lifecycle_error("resolver helper cleanup 失败。")
         error.__cause__ = None
@@ -2045,7 +2369,6 @@ class PreAttemptResolverGuard:
         *,
         attempt_permit_id: UUID,
         attempt_permit_digest: Digest256,
-        observer: LifecycleObserver | None = None,
         _authority: object | None = None,
     ) -> "AttemptTerminalGuard":
         """Transfer READY ownership after the coordinator proves ``io_claimed``."""
@@ -2096,19 +2419,16 @@ class PreAttemptResolverGuard:
                 _authority=_ATTEMPT_GUARD_FACTORY_AUTHORITY,
             )
             self._ledger.transfer(self, replacement)
-            _notify(observer, "ownership_transferred", replacement.safe_metadata())
         except BaseException:
             if replacement is not None:
                 _cleanup_guard(
                     replacement,
                     self._ledger,
-                    observer=None,
                     suppress_errors=True,
                 )
             _cleanup_guard(
                 self,
                 self._ledger,
-                observer=None,
                 suppress_errors=True,
             )
             raise
@@ -2136,11 +2456,10 @@ class PreAttemptResolverGuard:
             attempt_permit_digest=attempt_permit_digest,
         )
 
-    def cleanup(self, *, observer: LifecycleObserver | None = None) -> bool:
+    def cleanup(self) -> bool:
         return _cleanup_guard(
             self,
             self._ledger,
-            observer=observer,
             suppress_errors=False,
         )
 
@@ -2262,7 +2581,6 @@ class AttemptTerminalGuard:
         port: int,
         network_policy_ref: str,
         network_policy_digest: Digest256,
-        observer: LifecycleObserver | None = None,
         _authority: object | None = None,
     ) -> None:
         """Write the sole START after the coordinator commits DNS authority."""
@@ -2295,14 +2613,28 @@ class AttemptTerminalGuard:
                 exact_start_frame_digest=exact_start_digest,
             )
             kernel = self._ledger.kernel_for(self, states=("start_committed",))
-            kernel.write_stdin(frame)
-            self._ledger.mark_started(self)
-            _notify(observer, "start_committed", self.safe_metadata())
+            while True:
+                wait_slice = self._ledger.business_wait_slice(
+                    self,
+                    HELPER_PHASE_START,
+                )
+                write_result = kernel.write_stdin(
+                    frame,
+                    max_wait_ns=wait_slice.max_wait_ns,
+                )
+                if write_result is COMPLETE:
+                    self._ledger.mark_started(self)
+                elif write_result is not PENDING:
+                    raise _lifecycle_error(
+                        "resolver helper START write 合同无效。"
+                    )
+                self._ledger.business_wait_slice(self, HELPER_PHASE_START)
+                if write_result is COMPLETE:
+                    break
         except BaseException:
             _cleanup_guard(
                 self,
                 self._ledger,
-                observer=None,
                 suppress_errors=True,
             )
             raise
@@ -2310,7 +2642,6 @@ class AttemptTerminalGuard:
     def _read_result_receipt(
         self,
         *,
-        observer: LifecycleObserver | None = None,
         _authority: object | None = None,
     ) -> ResolverResultReceipt:
         """Attest one RESULT, EOF, exit-zero, reap, and closed pipes."""
@@ -2324,6 +2655,9 @@ class AttemptTerminalGuard:
             kernel = self._ledger.kernel_for(self, states=("result_reading",))
             frame = _read_bounded_frame(
                 kernel,
+                ledger=self._ledger,
+                owner=self,
+                phase=HELPER_PHASE_RESULT,
                 maximum=MAX_RESULT_FRAME_BYTES,
                 label="RESULT",
             )
@@ -2332,20 +2666,83 @@ class AttemptTerminalGuard:
                 raise _lifecycle_error("RESULT transcript 超过上限。")
 
             eof_kernel = self._ledger.claim_stdout_eof_probe(self)
-            trailing = eof_kernel.read_stdout(1)
-            if type(trailing) is not bytes or len(trailing) > 1:
-                raise _lifecycle_error("RESULT EOF probe 读取合同无效。")
-            if trailing:
-                raise _lifecycle_error("RESULT 后存在第二帧或尾随输出。")
-            self._ledger.commit_stdout_eof(self)
+            while True:
+                wait_slice = self._ledger.business_wait_slice(
+                    self,
+                    HELPER_PHASE_RESULT_EOF,
+                )
+                trailing = eof_kernel.read_stdout(
+                    1,
+                    max_wait_ns=wait_slice.max_wait_ns,
+                )
+                if trailing is PENDING:
+                    self._ledger.business_wait_slice(
+                        self,
+                        HELPER_PHASE_RESULT_EOF,
+                    )
+                    continue
+                if type(trailing) is not bytes or len(trailing) > 1:
+                    raise _lifecycle_error("RESULT EOF probe 读取合同无效。")
+                if not trailing:
+                    self._ledger.commit_stdout_eof(self)
+                self._ledger.business_wait_slice(
+                    self,
+                    HELPER_PHASE_RESULT_EOF,
+                )
+                if trailing:
+                    raise _lifecycle_error("RESULT 后存在第二帧或尾随输出。")
+                break
 
             reap_kernel = self._ledger.claim_result_reap(self)
-            exit_status = reap_kernel.reap()
-            self._ledger.commit_result_reap(self, exit_status)
+            while True:
+                wait_slice = self._ledger.business_wait_slice(
+                    self,
+                    HELPER_PHASE_RESULT_REAP,
+                )
+                self._ledger.begin_result_reap_poll(self)
+                exit_status = reap_kernel.reap(
+                    max_wait_ns=wait_slice.max_wait_ns,
+                )
+                if exit_status is PENDING:
+                    self._ledger.mark_result_reap_pending(self)
+                elif type(exit_status) is int:
+                    self._ledger.commit_result_reap(self, exit_status)
+                else:
+                    raise _lifecycle_error("resolver child reap 合同无效。")
+                self._ledger.business_wait_slice(
+                    self,
+                    HELPER_PHASE_RESULT_REAP,
+                )
+                if exit_status is PENDING:
+                    continue
+                if exit_status != 0:
+                    raise _lifecycle_error("resolver child 退出状态不是 0。")
+                break
 
             close_kernel = self._ledger.claim_result_pipe_close(self)
-            close_kernel.close_pipes()
-            self._ledger.commit_result_pipe_close(self)
+            while True:
+                wait_slice = self._ledger.business_wait_slice(
+                    self,
+                    HELPER_PHASE_RESULT_CLOSE,
+                )
+                self._ledger.begin_result_pipe_close_poll(self)
+                close_result = close_kernel.close_pipes(
+                    max_wait_ns=wait_slice.max_wait_ns,
+                )
+                if close_result is PENDING:
+                    self._ledger.mark_result_pipe_close_pending(self)
+                elif close_result is COMPLETE:
+                    self._ledger.commit_result_pipe_close(self)
+                else:
+                    raise _lifecycle_error(
+                        "resolver helper pipe close 合同无效。"
+                    )
+                self._ledger.business_wait_slice(
+                    self,
+                    HELPER_PHASE_RESULT_CLOSE,
+                )
+                if close_result is COMPLETE:
+                    break
 
             dns_start_id, exact_start_digest = self._ledger.start_proof_for(
                 self,
@@ -2370,22 +2767,19 @@ class AttemptTerminalGuard:
                 _authority=_RESULT_RECEIPT_FACTORY_AUTHORITY,
             )
             self._ledger.issue_result_receipt(self, receipt)
-            _notify(observer, "result_attested", self.safe_metadata())
             return receipt
         except BaseException:
             _cleanup_guard(
                 self,
                 self._ledger,
-                observer=None,
                 suppress_errors=True,
             )
             raise
 
-    def cleanup(self, *, observer: LifecycleObserver | None = None) -> bool:
+    def cleanup(self) -> bool:
         return _cleanup_guard(
             self,
             self._ledger,
-            observer=observer,
             suppress_errors=False,
         )
 
@@ -2400,7 +2794,11 @@ class _ReadyPublicationTicket:
         "transport_claim_id",
         "dns_start_id",
         "spawn_request_digest",
+        "stop_authority_id",
+        "stop_authority_digest",
         "capability_digest",
+        "_stop_authority",
+        "_issued_stop_authority",
         "_launcher",
         "_reservation_owner",
         "_launch_owner_snapshot",
@@ -2415,6 +2813,9 @@ class _ReadyPublicationTicket:
         transport_claim_id: UUID,
         dns_start_id: UUID,
         spawn_request_digest: Digest256,
+        stop_authority: object,
+        stop_authority_id: UUID,
+        stop_authority_digest: Digest256,
         capability_digest: Digest256,
         launcher: object,
         reservation_owner: object,
@@ -2449,11 +2850,32 @@ class _ReadyPublicationTicket:
             "spawn_request_digest",
             require_digest(spawn_request_digest, "spawn_request_digest"),
         )
+        checked_authority_id, checked_authority_digest = (
+            _validated_stop_authority(stop_authority)
+        )
+        if (
+            require_uuid(stop_authority_id, "stop_authority_id")
+            != checked_authority_id
+            or require_digest(
+                stop_authority_digest,
+                "stop_authority_digest",
+            )
+            != checked_authority_digest
+        ):
+            raise _lifecycle_error("resolver helper stop authority binding 无效。")
+        object.__setattr__(self, "stop_authority_id", checked_authority_id)
+        object.__setattr__(
+            self,
+            "stop_authority_digest",
+            checked_authority_digest,
+        )
         object.__setattr__(
             self,
             "capability_digest",
             require_digest(capability_digest, "capability_digest"),
         )
+        object.__setattr__(self, "_stop_authority", stop_authority)
+        object.__setattr__(self, "_issued_stop_authority", stop_authority)
         object.__setattr__(self, "_launcher", launcher)
         object.__setattr__(self, "_reservation_owner", reservation_owner)
         object.__setattr__(self, "_launch_owner_snapshot", None)
@@ -2558,6 +2980,7 @@ class ResolverHelperLauncher:
         self,
         *,
         reservation_owner: object,
+        stop_authority: object | None = None,
         _authority: object | None = None,
     ) -> _ReadyPublicationTicket:
         """Generate and reserve every role ID before any helper can spawn."""
@@ -2566,6 +2989,9 @@ class ResolverHelperLauncher:
             raise TypeError("resolver capability reservation requires coordinator")
         if reservation_owner is None:
             raise TypeError("reservation_owner must be an identity object")
+        stop_authority_id, stop_authority_digest = _validated_stop_authority(
+            stop_authority
+        )
         spawn_snapshot = self._validated_spawn_configuration()
         publication_id = require_uuid(uuid4(), "publication_id")
         lifecycle_id = require_uuid(uuid4(), "lifecycle_id")
@@ -2586,6 +3012,8 @@ class ResolverHelperLauncher:
             transport_claim_id=transport_claim_id,
             dns_start_id=dns_start_id,
             spawn_request_digest=spawn_snapshot.request_digest,
+            stop_authority_id=stop_authority_id,
+            stop_authority_digest=stop_authority_digest,
         )
         ticket = _ReadyPublicationTicket(
             publication_id=publication_id,
@@ -2593,6 +3021,9 @@ class ResolverHelperLauncher:
             transport_claim_id=transport_claim_id,
             dns_start_id=dns_start_id,
             spawn_request_digest=spawn_snapshot.request_digest,
+            stop_authority=stop_authority,
+            stop_authority_id=stop_authority_id,
+            stop_authority_digest=stop_authority_digest,
             capability_digest=capability_digest,
             launcher=self,
             reservation_owner=reservation_owner,
@@ -3267,7 +3698,6 @@ class ResolverHelperLauncher:
         *,
         capability: _ReadyPublicationTicket,
         launch_owner: object | None = None,
-        observer: LifecycleObserver | None = None,
         _authority: object | None = None,
     ) -> PreAttemptResolverGuard:
         """Spawn with fixed metadata, then accept only the fixed READY frame."""
@@ -3310,26 +3740,40 @@ class ResolverHelperLauncher:
                 owner=guard,
                 _authority=_KERNEL_PUBLICATION_AUTHORITY,
             )
-            kernel = spawn_snapshot.spawner.spawn(
-                spawn_snapshot.request,
-                publication=publication,
-            )
-            publication.confirm_returned(kernel)
+            while True:
+                wait_slice = ledger.business_wait_slice(
+                    guard,
+                    HELPER_PHASE_SPAWN,
+                )
+                kernel = spawn_snapshot.spawner.spawn(
+                    spawn_snapshot.request,
+                    publication=publication,
+                    max_wait_ns=wait_slice.max_wait_ns,
+                )
+                if kernel is not PENDING:
+                    publication.confirm_returned(kernel)
+                ledger.business_wait_slice(guard, HELPER_PHASE_SPAWN)
+                if kernel is not PENDING:
+                    break
             frame = _read_bounded_frame(
                 kernel,
+                ledger=ledger,
+                owner=guard,
+                phase=HELPER_PHASE_READY,
                 maximum=MAX_READY_FRAME_BYTES,
                 label="READY",
             )
             if frame != READY_FRAME:
                 raise _lifecycle_error("resolver helper READY frame 无效。")
             ledger.mark_ready(guard)
-            _notify(observer, "ready_committed", guard.safe_metadata())
+            ledger.business_wait_slice(guard, HELPER_PHASE_READY)
             self._publish_ready_guard(
                 capability,
                 guard,
                 launch_owner=launch_owner,
                 _authority=_RESOLVER_LIFECYCLE_AUTHORITY,
             )
+            ledger.business_wait_slice(guard, HELPER_PHASE_READY)
             return guard
         except BaseException:
             try:
@@ -3349,7 +3793,6 @@ class ResolverHelperLauncher:
                 _cleanup_guard(
                     guard,
                     guard._ledger,
-                    observer=None,
                     suppress_errors=True,
                 )
             raise

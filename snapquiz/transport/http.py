@@ -18,6 +18,7 @@ from snapquiz.runtime.attempt import (
     AttemptGate,
     AttemptPermit,
     CredentialResolutionPermit,
+    HelperStopAuthority,
     _CREDENTIAL_RESOLVER_AUTHORITY,
     _TRANSPORT_ATTEMPT_AUTHORITY,
 )
@@ -34,7 +35,6 @@ from snapquiz.transport.credentials import (
 )
 from snapquiz.transport.resolver import (
     AttemptTerminalGuard,
-    LifecycleObserver,
     PreAttemptResolverGuard,
     ResolverHelperLauncher,
     ResolverResultReceipt,
@@ -1157,7 +1157,6 @@ def coordinate_resolver_attempt(
     gate: AttemptGate,
     credential_permit: CredentialResolutionPermit,
     cleanup_ticket: ResolverCleanupTicket,
-    observer: LifecycleObserver | None = None,
 ) -> PreparedResolverAttempt:
     """Resolve exactly once through READY -> secret -> claim -> DNS START.
 
@@ -1225,9 +1224,18 @@ def coordinate_resolver_attempt(
     ready_ledger_snapshot: _ResolverLifecycleLedger | None = None
     attempt_permit_id: UUID | None = None
     attempt_permit_digest: Digest256 | None = None
+    stop_authority: HelperStopAuthority | None = None
     try:
+        # The exact Gate-issued authority is created before even reserving a
+        # helper lifecycle.  Callers cannot inject a clock, deadline, token,
+        # duration, or precomputed proof into this path.
+        stop_authority = gate._issue_helper_stop_authority(
+            credential_permit,
+            _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+        )
         ready_publication_ticket = launcher._reserve_lifecycle_capability(
             reservation_owner=ready_reservation_owner,
+            stop_authority=stop_authority,
             _authority=_RESOLVER_LIFECYCLE_AUTHORITY,
         )
         # Keep even normal-return aliases inside the reservation recovery
@@ -1266,7 +1274,6 @@ def coordinate_resolver_attempt(
             candidate_pre_guard = launcher._launch_ready(
                 capability=ready_publication_ticket,
                 launch_owner=ready_launch_owner,
-                observer=observer,
                 _authority=_RESOLVER_LIFECYCLE_AUTHORITY,
             )
             if not launcher._consume_ready_publication(
@@ -1446,7 +1453,6 @@ def coordinate_resolver_attempt(
             candidate_terminal_guard = pre_guard._transfer(
                 attempt_permit_id=attempt_permit_id,
                 attempt_permit_digest=attempt_permit_digest,
-                observer=observer,
                 _authority=_RESOLVER_LIFECYCLE_AUTHORITY,
             )
             if ready_ledger_snapshot is None:
@@ -1566,11 +1572,9 @@ def coordinate_resolver_attempt(
             port=port,
             network_policy_ref=INTERNET_PUBLIC_ADDRESS_POLICY_REF,
             network_policy_digest=INTERNET_PUBLIC_ADDRESS_POLICY_DIGEST,
-            observer=observer,
             _authority=_RESOLVER_LIFECYCLE_AUTHORITY,
         )
         result_receipt = terminal_guard._read_result_receipt(
-            observer=observer,
             _authority=_RESOLVER_LIFECYCLE_AUTHORITY,
         )
         if not gate._dns_start_is_committed(
@@ -1582,6 +1586,33 @@ def coordinate_resolver_attempt(
             _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
         ):
             raise _coordinator_error("resolver RESULT 的 START proof 已变化。")
+        gate._commit_resolver_completion(
+            stop_authority,
+            attempt,
+            claim_id=transport_claim_id,
+            guard_id=terminal_guard_id,
+            guard_digest=terminal_guard_digest,
+            start_id=dns_start_id,
+            result_receipt_digest=result_receipt.receipt_digest,
+            _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+        )
+        if not gate._resolver_completion_is_committed(
+            stop_authority,
+            attempt,
+            claim_id=transport_claim_id,
+            guard_id=terminal_guard_id,
+            guard_digest=terminal_guard_digest,
+            start_id=dns_start_id,
+            result_receipt_digest=result_receipt.receipt_digest,
+            _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+        ):
+            raise _coordinator_error(
+                "resolver completion claim 未能精确提交。"
+            )
+        # ResolutionSet publication is an irreversible lifecycle-ledger
+        # transition.  It must happen only after the exact Gate completion
+        # claim wins over cancellation/deadline and its independent observer
+        # confirms the commit.
         resolution = _build_started_resolution(
             attempt,
             result_receipt,

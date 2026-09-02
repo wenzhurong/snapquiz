@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import builtins
 import copy
+from datetime import timedelta
 import gc
+import inspect
 import json
 import os
 import pickle
@@ -15,13 +17,26 @@ from uuid import UUID
 import weakref
 
 from snapquiz.domain.digest import Digest256, digest256
-from snapquiz.domain.errors import ConfigError, EndpointPolicyError
-from snapquiz.runtime.attempt import _TRANSPORT_ATTEMPT_AUTHORITY
+from snapquiz.domain.errors import CancelledError, ConfigError, EndpointPolicyError
+from snapquiz.privacy.egress import EgressApprovalLedger, EgressGate
+from snapquiz.runtime.attempt import AttemptGate, _TRANSPORT_ATTEMPT_AUTHORITY
+from snapquiz.runtime.context import CancellationReason
+from snapquiz.transport.session import SendSessionFactory, SendSessionLedger
 import snapquiz.transport.resolver as resolver_module
 from snapquiz.transport.resolver import (
+    COMPLETE,
+    HELPER_CLEANUP_POLL_QUANTUM_NS,
+    HELPER_PHASE_READY,
+    HELPER_PHASE_RESULT_CLOSE,
+    HELPER_PHASE_RESULT_EOF,
+    HELPER_PHASE_RESULT_REAP,
+    HELPER_PHASE_SPAWN,
+    HELPER_PHASE_START,
     MAX_READY_FRAME_BYTES,
+    MAX_HELPER_CLEANUP_POLL_STEPS,
     MAX_RESULT_FRAME_BYTES,
     MAX_RESULT_TRANSCRIPT_BYTES,
+    PENDING,
     READY_FRAME,
     RESOLVER_HELPER_PROTOCOL_VERSION,
     RESOLVER_HELPER_START_SCHEMA_VERSION,
@@ -32,6 +47,10 @@ from snapquiz.transport.resolver import (
     _RESOLVER_LIFECYCLE_AUTHORITY,
     start_frame_digest,
 )
+
+from tests.w06_helpers import NOW
+from tests.w08_helpers import FixedPreviewController
+from tests.w09_helpers import make_w09_runtime
 
 
 LIFECYCLE_ID = UUID("70000000-0000-0000-0000-000000000001")
@@ -50,12 +69,78 @@ RESULT = (
 )
 
 
+def _make_stop_authority():
+    runtime = make_w09_runtime()
+    approval_ledger = EgressApprovalLedger()
+    approval = EgressGate().approve(
+        planned=runtime.planned,
+        invocation=runtime.invocation,
+        prepared=runtime.prepared,
+        authorization=runtime.runtime_authorization,
+        consent_ledger=runtime.consent_ledger,
+        approval_ledger=approval_ledger,
+        preview_controller=FixedPreviewController(),
+    )
+    runtime.clock.advance(milliseconds=5_000)
+    session_ledger = SendSessionLedger()
+    session = SendSessionFactory.create(
+        planned=runtime.planned,
+        invocation=runtime.invocation,
+        prepared=runtime.prepared,
+        authorization=runtime.runtime_authorization,
+        consent_ledger=runtime.consent_ledger,
+        approval=approval,
+        approval_ledger=approval_ledger,
+        session_ledger=session_ledger,
+        now=NOW + timedelta(seconds=5),
+    )
+    gate = AttemptGate()
+    credential_permit = gate.authorize_credential_resolution(
+        planned=runtime.planned,
+        invocation=runtime.invocation,
+        prepared=runtime.prepared,
+        authorization=runtime.runtime_authorization,
+        consent_ledger=runtime.consent_ledger,
+        session=session,
+        approval_ledger=approval_ledger,
+        session_ledger=session_ledger,
+        authority_ledger=runtime.authority_ledger,
+        context=runtime.call_context,
+        context_ledger=runtime.context_ledger,
+    )
+    stop_authority = gate._issue_helper_stop_authority(
+        credential_permit,
+        _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+    )
+    return runtime, gate, credential_permit, stop_authority
+
+
+_STOP_RUNTIME, _STOP_GATE, _STOP_PERMIT, _STOP_AUTHORITY = (
+    _make_stop_authority()
+)
+
+
 class _FakeKernel:
-    def __init__(self, chunks, *, faults=None, exit_status: object = 0) -> None:
+    def __init__(
+        self,
+        chunks,
+        *,
+        faults=None,
+        exit_status: object = 0,
+        poll_results=None,
+        poll_hooks=None,
+    ) -> None:
         self.chunks = list(chunks)
         self.faults = {} if faults is None else dict(faults)
+        self.poll_results = (
+            {} if poll_results is None else {
+                name: list(values) for name, values in poll_results.items()
+            }
+        )
+        self.poll_hooks = {} if poll_hooks is None else dict(poll_hooks)
         self.exit_status = exit_status
         self.read_limits: list[int] = []
+        self.wait_limits: dict[str, list[int]] = {}
         self.writes: list[bytes] = []
         self.events: list[str] = []
 
@@ -64,51 +149,122 @@ class _FakeKernel:
         if selected is not None:
             raise selected
 
-    def read_stdout(self, max_bytes: int) -> bytes:
+    def _poll(self, name: str, default: object) -> object:
+        hook = self.poll_hooks.get(name)
+        if hook is not None:
+            hook()
+        scripted = self.poll_results.get(name)
+        if scripted:
+            selected = scripted.pop(0)
+            if isinstance(selected, BaseException):
+                raise selected
+            return selected
+        return default
+
+    def _record_wait(self, name: str, max_wait_ns: int) -> None:
+        self.wait_limits.setdefault(name, []).append(max_wait_ns)
+
+    def read_stdout(self, max_bytes: int, *, max_wait_ns: int) -> object:
         self.events.append("read")
         self.read_limits.append(max_bytes)
+        self._record_wait("read", max_wait_ns)
+        hook = self.poll_hooks.get("read")
+        if hook is not None:
+            hook()
         self._fault("read")
         if not self.chunks:
             return b""
         selected = self.chunks.pop(0)
+        if selected is PENDING:
+            return PENDING
         if len(selected) <= max_bytes:
             return selected
         self.chunks.insert(0, selected[max_bytes:])
         return selected[:max_bytes]
 
-    def write_stdin(self, frame: bytes) -> None:
+    def write_stdin(self, frame: bytes, *, max_wait_ns: int) -> object:
         self.events.append("write")
-        self.writes.append(frame)
+        self._record_wait("write", max_wait_ns)
+        if self.faults.get("write") is not None:
+            # An exception is intentionally outcome-unknown.
+            self.writes.append(frame)
         self._fault("write")
+        result = self._poll("write", COMPLETE)
+        if result is COMPLETE:
+            self.writes.append(frame)
+        return result
 
-    def terminate(self) -> None:
+    def terminate(self, *, max_wait_ns: int) -> object:
         self.events.append("terminate")
+        self._record_wait("terminate", max_wait_ns)
         self._fault("terminate")
+        return self._poll("terminate", COMPLETE)
 
-    def reap(self) -> int:
+    def reap(self, *, max_wait_ns: int) -> object:
         self.events.append("reap")
+        self._record_wait("reap", max_wait_ns)
         self._fault("reap")
-        return self.exit_status  # type: ignore[return-value]
+        return self._poll("reap", self.exit_status)
 
-    def close_pipes(self) -> None:
+    def close_pipes(self, *, max_wait_ns: int) -> object:
         self.events.append("close_pipes")
+        self._record_wait("close_pipes", max_wait_ns)
         self._fault("close_pipes")
+        return self._poll("close_pipes", COMPLETE)
 
 
 class _FakeSpawner:
-    def __init__(self, kernel: _FakeKernel) -> None:
+    def __init__(
+        self,
+        kernel: _FakeKernel,
+        *,
+        spawn_results=None,
+        publish_on_pending: bool = False,
+    ) -> None:
         self.kernel = kernel
         self.requests = []
+        self.wait_limits: list[int] = []
+        self.spawn_results = (
+            [] if spawn_results is None else list(spawn_results)
+        )
+        self.publish_on_pending = publish_on_pending
+        self._published = False
 
-    def spawn(self, request, *, publication):
+    def spawn(self, request, *, publication, max_wait_ns):
         self.requests.append(request)
-        publication.publish(self.kernel)
-        return self.kernel
+        self.wait_limits.append(max_wait_ns)
+        result = self.spawn_results.pop(0) if self.spawn_results else self.kernel
+        if isinstance(result, BaseException):
+            raise result
+        if result is self.kernel or (result is PENDING and self.publish_on_pending):
+            if not self._published:
+                publication.publish(self.kernel)
+                self._published = True
+        return result
 
 
-def _launcher(chunks, *, faults=None, exit_status: object = 0):
-    kernel = _FakeKernel(chunks, faults=faults, exit_status=exit_status)
-    spawner = _FakeSpawner(kernel)
+def _launcher(
+    chunks,
+    *,
+    faults=None,
+    exit_status: object = 0,
+    poll_results=None,
+    poll_hooks=None,
+    spawn_results=None,
+    publish_on_pending: bool = False,
+):
+    kernel = _FakeKernel(
+        chunks,
+        faults=faults,
+        exit_status=exit_status,
+        poll_results=poll_results,
+        poll_hooks=poll_hooks,
+    )
+    spawner = _FakeSpawner(
+        kernel,
+        spawn_results=spawn_results,
+        publish_on_pending=publish_on_pending,
+    )
     return (
         ResolverHelperLauncher(spawner, executable=EXECUTABLE),
         spawner,
@@ -116,7 +272,11 @@ def _launcher(chunks, *, faults=None, exit_status: object = 0):
     )
 
 
-def _reserve_lifecycle_capability(launcher):
+def _reserve_lifecycle_capability(
+    launcher,
+    *,
+    stop_authority=_STOP_AUTHORITY,
+):
     reservation_owner = object()
     with patch(
         "snapquiz.transport.resolver.uuid4",
@@ -129,6 +289,7 @@ def _reserve_lifecycle_capability(launcher):
     ):
         return launcher._reserve_lifecycle_capability(
             reservation_owner=reservation_owner,
+            stop_authority=stop_authority,
             _authority=_RESOLVER_LIFECYCLE_AUTHORITY,
         )
 
@@ -138,17 +299,27 @@ def _ready(
     *,
     faults=None,
     exit_status: object = 0,
-    observer=None,
+    poll_results=None,
+    poll_hooks=None,
+    spawn_results=None,
+    publish_on_pending: bool = False,
+    stop_authority=_STOP_AUTHORITY,
 ):
     launcher, spawner, kernel = _launcher(
         [READY_FRAME] if chunks is None else chunks,
         faults=faults,
         exit_status=exit_status,
+        poll_results=poll_results,
+        poll_hooks=poll_hooks,
+        spawn_results=spawn_results,
+        publish_on_pending=publish_on_pending,
     )
-    capability = _reserve_lifecycle_capability(launcher)
+    capability = _reserve_lifecycle_capability(
+        launcher,
+        stop_authority=stop_authority,
+    )
     guard = launcher._launch_ready(
         capability=capability,
-        observer=observer,
         _authority=_RESOLVER_LIFECYCLE_AUTHORITY,
     )
     if not launcher._consume_ready_publication(
@@ -160,29 +331,26 @@ def _ready(
     return guard, spawner, kernel
 
 
-def _transfer(guard, *, observer=None):
+def _transfer(guard):
     return guard._transfer(
         attempt_permit_id=ATTEMPT_ID,
         attempt_permit_digest=ATTEMPT_DIGEST,
-        observer=observer,
         _authority=_RESOLVER_LIFECYCLE_AUTHORITY,
     )
 
 
-def _start(guard, *, observer=None):
+def _start(guard):
     guard._start(
         hostname=TARGET,
         port=443,
         network_policy_ref="snapquiz.internet-public-address-policy.v1",
         network_policy_digest=POLICY_DIGEST,
-        observer=observer,
         _authority=_RESOLVER_LIFECYCLE_AUTHORITY,
     )
 
 
-def _read_result_receipt(guard, *, observer=None):
+def _read_result_receipt(guard):
     return guard._read_result_receipt(
-        observer=observer,
         _authority=_RESOLVER_LIFECYCLE_AUTHORITY,
     )
 
@@ -207,6 +375,228 @@ def _external_counts(spawner: _FakeSpawner, kernel: _FakeKernel):
 
 
 class W09ResolverLifecycleTest(unittest.TestCase):
+    def test_every_business_poll_has_fixed_pre_and_post_checkpoint_phase(self):
+        phases = []
+        authority_type = type(_STOP_AUTHORITY)
+        original_checkpoint = authority_type._checkpoint
+
+        def record_checkpoint(instance, phase, *, _authority=None):
+            phases.append(phase)
+            return original_checkpoint(
+                instance,
+                phase,
+                _authority=_authority,
+            )
+
+        with patch.object(
+            authority_type,
+            "_checkpoint",
+            new=record_checkpoint,
+        ):
+            pre, spawner, kernel = _ready([READY_FRAME, RESULT + b"\n"])
+            attempt = _transfer(pre)
+            _start(attempt)
+            _read_result_receipt(attempt)
+            self.assertTrue(attempt.cleanup())
+
+        self.assertEqual(
+            phases,
+            [
+                HELPER_PHASE_SPAWN,
+                HELPER_PHASE_SPAWN,
+                HELPER_PHASE_READY,
+                HELPER_PHASE_READY,
+                HELPER_PHASE_READY,
+                HELPER_PHASE_READY,
+                HELPER_PHASE_START,
+                HELPER_PHASE_START,
+                resolver_module.HELPER_PHASE_RESULT,
+                resolver_module.HELPER_PHASE_RESULT,
+                HELPER_PHASE_RESULT_EOF,
+                HELPER_PHASE_RESULT_EOF,
+                HELPER_PHASE_RESULT_REAP,
+                HELPER_PHASE_RESULT_REAP,
+                HELPER_PHASE_RESULT_CLOSE,
+                HELPER_PHASE_RESULT_CLOSE,
+            ],
+        )
+        self.assertEqual(len(spawner.wait_limits), 1)
+        self.assertTrue(all(value > 0 for value in spawner.wait_limits))
+        self.assertTrue(
+            all(
+                value > 0
+                for values in kernel.wait_limits.values()
+                for value in values
+            )
+        )
+
+    def test_pending_is_distinct_from_eof_and_retries_every_business_poll(self):
+        self.assertIsNot(PENDING, COMPLETE)
+        self.assertIsNot(PENDING, b"")
+        self.assertIs(copy.copy(PENDING), PENDING)
+        self.assertIs(copy.deepcopy(PENDING), PENDING)
+
+        for publish_on_pending in (False, True):
+            with self.subTest(publish_on_pending=publish_on_pending):
+                pre, spawner, kernel = _ready(
+                    [
+                        PENDING,
+                        READY_FRAME,
+                        PENDING,
+                        RESULT + b"\n",
+                        PENDING,
+                    ],
+                    poll_results={
+                        "write": [PENDING, COMPLETE],
+                        "reap": [PENDING, 0],
+                        "close_pipes": [PENDING, COMPLETE],
+                    },
+                    spawn_results=[PENDING],
+                    publish_on_pending=publish_on_pending,
+                )
+                attempt = _transfer(pre)
+                _start(attempt)
+                receipt = _read_result_receipt(attempt)
+
+                self.assertIs(type(receipt), ResolverResultReceipt)
+                self.assertEqual(len(spawner.requests), 2)
+                self.assertEqual(len(kernel.writes), 1)
+                self.assertEqual(kernel.events.count("write"), 2)
+                self.assertEqual(kernel.events.count("read"), 6)
+                self.assertEqual(_cleanup_counts(kernel), (0, 2, 2))
+                self.assertTrue(attempt.cleanup())
+
+    def test_cancel_after_pending_spawn_cleans_only_a_published_kernel(self):
+        for publish_on_pending, expected_cleanup in (
+            (False, (0, 0, 0)),
+            (True, (1, 1, 1)),
+        ):
+            with self.subTest(publish_on_pending=publish_on_pending):
+                runtime, _, _, stop_authority = _make_stop_authority()
+                launcher, spawner, kernel = _launcher(
+                    [READY_FRAME],
+                    spawn_results=[PENDING],
+                    publish_on_pending=publish_on_pending,
+                )
+                capability = _reserve_lifecycle_capability(
+                    launcher,
+                    stop_authority=stop_authority,
+                )
+                original_spawn = spawner.spawn
+
+                def cancel_after_poll(*args, **kwargs):
+                    result = original_spawn(*args, **kwargs)
+                    runtime.cancellation_source.cancel(
+                        reason=CancellationReason.USER_REQUEST
+                    )
+                    return result
+
+                with patch.object(
+                    spawner,
+                    "spawn",
+                    side_effect=cancel_after_poll,
+                ):
+                    with self.assertRaises(CancelledError):
+                        launcher._launch_ready(
+                            capability=capability,
+                            _authority=_RESOLVER_LIFECYCLE_AUTHORITY,
+                        )
+
+                self.assertEqual(len(spawner.requests), 1)
+                self.assertEqual(kernel.events.count("read"), 0)
+                self.assertEqual(_cleanup_counts(kernel), expected_cleanup)
+                self.assertEqual(launcher._ready_publications, {})
+                self.assertEqual(launcher._lifecycle_recovery, {})
+
+    def test_stop_after_success_reap_or_close_pending_continues_in_cleanup(self):
+        for action_name, expected_cleanup in (
+            ("reap", (0, 2, 1)),
+            ("close_pipes", (0, 1, 2)),
+        ):
+            with self.subTest(action_name=action_name):
+                runtime, _, _, stop_authority = _make_stop_authority()
+                fired = False
+
+                def cancel_once():
+                    nonlocal fired
+                    if not fired:
+                        fired = True
+                        runtime.cancellation_source.cancel(
+                            reason=CancellationReason.USER_REQUEST
+                        )
+
+                pre, _, kernel = _ready(
+                    [READY_FRAME, RESULT + b"\n"],
+                    poll_results={action_name: [PENDING]},
+                    poll_hooks={action_name: cancel_once},
+                    stop_authority=stop_authority,
+                )
+                attempt = _transfer(pre)
+                _start(attempt)
+
+                with self.assertRaises(CancelledError):
+                    _read_result_receipt(attempt)
+
+                self.assertEqual(_cleanup_counts(kernel), expected_cleanup)
+                self.assertEqual(attempt.safe_metadata()["state"], "terminal")
+
+    def test_pending_then_unknown_reap_or_close_is_never_replayed(self):
+        for action_name, expected_cleanup in (
+            ("reap", (0, 2, 1)),
+            ("close_pipes", (0, 1, 2)),
+        ):
+            with self.subTest(action_name=action_name):
+                pre, _, kernel = _ready(
+                    [READY_FRAME, RESULT + b"\n"],
+                    poll_results={
+                        action_name: [
+                            PENDING,
+                            RuntimeError("synthetic unknown outcome"),
+                        ]
+                    },
+                )
+                attempt = _transfer(pre)
+                _start(attempt)
+
+                with self.assertRaisesRegex(RuntimeError, "unknown outcome"):
+                    _read_result_receipt(attempt)
+
+                self.assertEqual(_cleanup_counts(kernel), expected_cleanup)
+                self.assertEqual(
+                    attempt.safe_metadata()["state"],
+                    "cleanup_failed",
+                )
+                counts = _cleanup_counts(kernel)
+                with self.assertRaises(EndpointPolicyError):
+                    attempt.cleanup()
+                self.assertEqual(_cleanup_counts(kernel), counts)
+
+    def test_cleanup_pending_exhaustion_is_bounded_without_business_checkpoint(self):
+        pre, _, kernel = _ready(
+            poll_results={
+                "terminate": [PENDING] * MAX_HELPER_CLEANUP_POLL_STEPS,
+            }
+        )
+        stop_state = _STOP_GATE._helper_stop_authorities[
+            _STOP_AUTHORITY.authority_id
+        ]
+        checkpoint_sequence = stop_state.sequence
+
+        with self.assertRaisesRegex(EndpointPolicyError, "cleanup 失败"):
+            pre.cleanup()
+
+        self.assertEqual(stop_state.sequence, checkpoint_sequence)
+        self.assertEqual(
+            kernel.wait_limits["terminate"],
+            [HELPER_CLEANUP_POLL_QUANTUM_NS]
+            * MAX_HELPER_CLEANUP_POLL_STEPS,
+        )
+        self.assertEqual(
+            _cleanup_counts(kernel),
+            (MAX_HELPER_CLEANUP_POLL_STEPS, 1, 1),
+        )
+        self.assertEqual(pre.safe_metadata()["state"], "cleanup_failed")
+
     def test_ready_transfer_single_start_result_and_exact_cleanup(self):
         ready_chunks = [
             READY_FRAME[:5],
@@ -302,7 +692,8 @@ class W09ResolverLifecycleTest(unittest.TestCase):
         launcher, spawner, kernel = _launcher([READY_FRAME])
         capability = _reserve_lifecycle_capability(launcher)
 
-        def publish_then_raise(request, *, publication):
+        def publish_then_raise(request, *, publication, max_wait_ns):
+            self.assertGreater(max_wait_ns, 0)
             spawner.requests.append(request)
             publication.publish(kernel)
             raise RuntimeError("synthetic spawn post-publication")
@@ -327,8 +718,9 @@ class W09ResolverLifecycleTest(unittest.TestCase):
         launcher, spawner, kernel = _launcher([READY_FRAME])
         capability = _reserve_lifecycle_capability(launcher)
 
-        def return_without_publication(request, *, publication):
+        def return_without_publication(request, *, publication, max_wait_ns):
             del publication
+            self.assertGreater(max_wait_ns, 0)
             spawner.requests.append(request)
             return kernel
 
@@ -607,18 +999,15 @@ class W09ResolverLifecycleTest(unittest.TestCase):
         self.assertEqual(_cleanup_counts(kernel), (1, 1, 1))
         self.assertEqual(pre.safe_metadata()["state"], "terminal")
 
-    def test_transfer_observer_sees_commit_then_raise_cleans_new_owner(self):
+    def test_transfer_exposes_no_synchronous_observer_hook(self):
         pre, _, kernel = _ready()
-        observations = []
-
-        def fail_after_commit(event, metadata):
-            observations.append((event, metadata["state"]))
-            raise RuntimeError("transfer observer fault")
-
-        with self.assertRaisesRegex(RuntimeError, "transfer observer"):
-            _transfer(pre, observer=fail_after_commit)
-        self.assertEqual(observations, [("ownership_transferred", "transferred")])
-        self.assertEqual(pre.safe_metadata()["state"], "terminal")
+        self.assertNotIn(
+            "observer",
+            inspect.signature(PreAttemptResolverGuard._transfer).parameters,
+        )
+        attempt = _transfer(pre)
+        self.assertEqual(attempt.safe_metadata()["state"], "transferred")
+        self.assertTrue(attempt.cleanup())
         self.assertEqual(_cleanup_counts(kernel), (1, 1, 1))
 
     def test_write_fault_after_transfer_cleans_attempt_owner(self):
@@ -630,19 +1019,17 @@ class W09ResolverLifecycleTest(unittest.TestCase):
         self.assertEqual(attempt.safe_metadata()["state"], "terminal")
         self.assertEqual(_cleanup_counts(kernel), (1, 1, 1))
 
-    def test_start_observer_sees_committed_start_before_fault_cleanup(self):
+    def test_start_exposes_no_synchronous_observer_hook(self):
         pre, _, kernel = _ready()
         attempt = _transfer(pre)
-        observations = []
-
-        def fail_after_commit(event, metadata):
-            observations.append((event, metadata["state"]))
-            raise KeyboardInterrupt("observer fault")
-
-        with self.assertRaisesRegex(KeyboardInterrupt, "observer fault"):
-            _start(attempt, observer=fail_after_commit)
-        self.assertEqual(observations, [("start_committed", "started")])
+        self.assertNotIn(
+            "observer",
+            inspect.signature(AttemptTerminalGuard._start).parameters,
+        )
+        _start(attempt)
+        self.assertEqual(attempt.safe_metadata()["state"], "started")
         self.assertEqual(len(kernel.writes), 1)
+        self.assertTrue(attempt.cleanup())
         self.assertEqual(_cleanup_counts(kernel), (1, 1, 1))
 
     def test_result_partial_eof_and_oversize_fail_closed(self):
@@ -704,12 +1091,16 @@ class W09ResolverLifecycleTest(unittest.TestCase):
                 original_read = kernel.read_stdout
                 eof_calls = 0
 
-                def invalid_eof_read(max_bytes):
+                def invalid_eof_read(max_bytes, *, max_wait_ns):
                     nonlocal eof_calls
+                    self.assertGreater(max_wait_ns, 0)
                     if max_bytes == 1:
                         eof_calls += 1
                         return invalid
-                    return original_read(max_bytes)
+                    return original_read(
+                        max_bytes,
+                        max_wait_ns=max_wait_ns,
+                    )
 
                 with patch.object(
                     kernel,
@@ -731,12 +1122,13 @@ class W09ResolverLifecycleTest(unittest.TestCase):
         original_read = kernel.read_stdout
         eof_calls = 0
 
-        def fail_eof_read(max_bytes):
+        def fail_eof_read(max_bytes, *, max_wait_ns):
             nonlocal eof_calls
+            self.assertGreater(max_wait_ns, 0)
             if max_bytes == 1:
                 eof_calls += 1
                 raise KeyboardInterrupt("raw EOF read")
-            return original_read(max_bytes)
+            return original_read(max_bytes, max_wait_ns=max_wait_ns)
 
         with patch.object(kernel, "read_stdout", side_effect=fail_eof_read):
             with self.assertRaisesRegex(KeyboardInterrupt, "raw EOF"):
@@ -876,47 +1268,38 @@ class W09ResolverLifecycleTest(unittest.TestCase):
         self.assertTrue(attempt.cleanup())
         self.assertEqual(_cleanup_counts(kernel), (0, 1, 1))
 
-    def test_result_observer_fault_returns_no_receipt_and_cleans_owner(self):
+    def test_result_exposes_no_synchronous_observer_hook(self):
         pre, _, kernel = _ready([READY_FRAME, RESULT + b"\n"])
         attempt = _transfer(pre)
         _start(attempt)
-        returned = []
-
-        def fail_after_commit(event, metadata):
-            self.assertEqual(event, "result_attested")
-            self.assertEqual(metadata["state"], "result_attested")
-            raise RuntimeError("result observer fault")
-
-        with self.assertRaisesRegex(RuntimeError, "result observer fault"):
-            returned.append(
-                _read_result_receipt(attempt, observer=fail_after_commit)
-            )
-
-        self.assertEqual(returned, [])
-        self.assertEqual(attempt.safe_metadata()["state"], "terminal")
+        self.assertNotIn(
+            "observer",
+            inspect.signature(
+                AttemptTerminalGuard._read_result_receipt
+            ).parameters,
+        )
+        receipt = _read_result_receipt(attempt)
+        self.assertEqual(attempt.safe_metadata()["state"], "result_attested")
         self.assertEqual(_cleanup_counts(kernel), (0, 1, 1))
-        terminal_receipt = attempt._ledger._issued_receipt
-        self.assertIs(type(terminal_receipt), ResolverResultReceipt)
-        self.assertIs(terminal_receipt.stdout_eof, True)
-        self.assertIs(terminal_receipt.child_reaped, True)
-        self.assertEqual(terminal_receipt.child_exit_status, 0)
-        self.assertIs(terminal_receipt.helper_pipes_closed, True)
+        self.assertTrue(attempt.cleanup())
+        self.assertEqual(attempt.safe_metadata()["state"], "terminal")
         with self.assertRaisesRegex(ValueError, "exactly issued"):
-            terminal_receipt._validate_exact_issuance(
+            receipt._validate_exact_issuance(
                 _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
             )
 
-    def test_cleanup_observer_raises_only_after_commit_and_resources_close(self):
+    def test_cleanup_exposes_no_synchronous_observer_hook(self):
         pre, _, kernel = _ready()
-        observations = []
-
-        def fail_after_commit(event, metadata):
-            observations.append((event, metadata["state"]))
-            raise RuntimeError("cleanup observer fault")
-
-        with self.assertRaisesRegex(RuntimeError, "cleanup observer"):
-            pre.cleanup(observer=fail_after_commit)
-        self.assertEqual(observations, [("cleanup_committed", "cleaning")])
+        for method in (
+            ResolverHelperLauncher._launch_ready,
+            PreAttemptResolverGuard.cleanup,
+            AttemptTerminalGuard.cleanup,
+        ):
+            self.assertNotIn(
+                "observer",
+                inspect.signature(method).parameters,
+            )
+        self.assertTrue(pre.cleanup())
         self.assertEqual(pre.safe_metadata()["state"], "terminal")
         self.assertEqual(_cleanup_counts(kernel), (1, 1, 1))
         self.assertFalse(pre.cleanup())

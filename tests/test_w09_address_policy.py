@@ -36,6 +36,7 @@ from snapquiz.transport.address_policy import (
     normalize_resolution_transcript,
 )
 from snapquiz.transport.resolver import (
+    COMPLETE,
     READY_FRAME,
     ResolverHelperLauncher,
     ResolverResultReceipt,
@@ -163,6 +164,10 @@ def _make_attempt():
         context=runtime.call_context,
         context_ledger=runtime.context_ledger,
     )
+    stop_authority = gate._issue_helper_stop_authority(
+        credential,
+        _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+    )
     credential_claim = uuid5(_CREDENTIAL_CLAIM_NAMESPACE, str(credential.permit_id))
     gate._claim_credential_resolution(
         credential,
@@ -189,7 +194,7 @@ def _make_attempt():
         credential_handle_digest=handle_digest,
     )
     claim_id = uuid5(_TRANSPORT_CLAIM_NAMESPACE, str(attempt.attempt_permit_id))
-    return runtime, gate, attempt, claim_id
+    return runtime, gate, attempt, claim_id, stop_authority
 
 
 def _result_from_start(
@@ -229,7 +234,8 @@ class _Kernel:
         self.writes: list[bytes] = []
         self.events: list[str] = []
 
-    def read_stdout(self, maximum: int) -> bytes:
+    def read_stdout(self, maximum: int, *, max_wait_ns: int) -> bytes:
+        del max_wait_ns
         self.events.append("read")
         if not self.chunks:
             return b""
@@ -239,34 +245,46 @@ class _Kernel:
         self.chunks.insert(0, selected[maximum:])
         return selected[:maximum]
 
-    def write_stdin(self, frame: bytes) -> None:
+    def write_stdin(self, frame: bytes, *, max_wait_ns: int):
+        del max_wait_ns
         self.events.append("write")
         self.writes.append(frame)
         self.chunks.append(_result_from_start(frame, self.records, self.overrides) + b"\n")
+        return COMPLETE
 
-    def terminate(self) -> None:
+    def terminate(self, *, max_wait_ns: int):
+        del max_wait_ns
         self.events.append("terminate")
+        return COMPLETE
 
-    def reap(self) -> int:
+    def reap(self, *, max_wait_ns: int) -> int:
+        del max_wait_ns
         self.events.append("reap")
         return 0
 
-    def close_pipes(self) -> None:
+    def close_pipes(self, *, max_wait_ns: int):
+        del max_wait_ns
         self.events.append("close_pipes")
+        return COMPLETE
 
 
 class _Spawner:
     def __init__(self, kernel: _Kernel) -> None:
         self.kernel = kernel
 
-    def spawn(self, request, *, publication):
-        del request
+    def spawn(self, request, *, publication, max_wait_ns: int):
+        del request, max_wait_ns
         publication.publish(self.kernel)
         return self.kernel
 
 
-def _issue(*records, overrides=None, read_result: bool = True):
-    runtime, gate, attempt, claim_id = _make_attempt()
+def _issue(
+    *records,
+    overrides=None,
+    read_result: bool = True,
+    commit_completion: bool = True,
+):
+    runtime, gate, attempt, claim_id, stop_authority = _make_attempt()
     start_id = uuid5(LIFECYCLE_ID, str(attempt.attempt_permit_id))
     kernel = _Kernel(tuple(records), overrides)
     launcher = ResolverHelperLauncher(_Spawner(kernel), executable=EXECUTABLE)
@@ -278,6 +296,7 @@ def _issue(*records, overrides=None, read_result: bool = True):
     ) as generate_role_id:
         capability = launcher._reserve_lifecycle_capability(
             reservation_owner=reservation_owner,
+            stop_authority=stop_authority,
             _authority=resolver_module._RESOLVER_LIFECYCLE_AUTHORITY,
         )
     if generate_role_id.call_count != 4:
@@ -331,6 +350,27 @@ def _issue(*records, overrides=None, read_result: bool = True):
         if read_result
         else None
     )
+    if receipt is not None and commit_completion:
+        gate._commit_resolver_completion(
+            stop_authority,
+            attempt,
+            claim_id=claim_id,
+            guard_id=guard.terminal_guard_id,
+            guard_digest=guard.terminal_guard_digest,
+            start_id=start_id,
+            result_receipt_digest=receipt.receipt_digest,
+            _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+        )
+        if not gate._resolver_completion_is_committed_for_publication(
+            attempt,
+            claim_id=claim_id,
+            guard_id=guard.terminal_guard_id,
+            guard_digest=guard.terminal_guard_digest,
+            start_id=start_id,
+            result_receipt_digest=receipt.receipt_digest,
+            _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+        ):
+            raise AssertionError("resolver completion was not committed")
     return runtime, gate, attempt, claim_id, guard, receipt, kernel
 
 
@@ -455,6 +495,20 @@ class W09AddressNormalizationTest(unittest.TestCase):
 
 
 class W09ResolutionPublicationTest(unittest.TestCase):
+    def test_resolution_publication_requires_prior_completion_claim(self):
+        publication = _issue(
+            _record4("8.8.8.8"),
+            commit_completion=False,
+        )
+        _, _, attempt, _, guard, receipt, _ = publication
+        try:
+            self.assertIsNone(guard._ledger._issued_resolution_snapshot)
+            with self.assertRaises(EndpointPolicyError):
+                build_resolution_set(attempt, receipt)
+            self.assertIsNone(guard._ledger._issued_resolution_snapshot)
+        finally:
+            _close(publication)
+
     def test_gate_only_start_without_result_read_has_no_publication_receipt(self):
         publication = _issue(_record4("8.8.8.8"), read_result=False)
         _, _, attempt, _, guard, receipt, _ = publication
@@ -553,23 +607,15 @@ class W09ResolutionPublicationTest(unittest.TestCase):
         finally:
             _close(publication)
 
-    def test_observer_fault_terminal_receipt_cannot_publish(self):
+    def test_terminal_receipt_cannot_publish_after_explicit_cleanup(self):
         publication = _issue(_record4("8.8.8.8"), read_result=False)
         _, _, attempt, _, guard, _, _ = publication
-
-        def fail_after_issue(event, metadata):
-            self.assertEqual(event, "result_attested")
-            self.assertEqual(metadata["state"], "result_attested")
-            raise RuntimeError("observer after RESULT issue")
-
         try:
-            with self.assertRaisesRegex(RuntimeError, "after RESULT"):
-                guard._read_result_receipt(
-                    observer=fail_after_issue,
-                    _authority=resolver_module._RESOLVER_LIFECYCLE_AUTHORITY,
-                )
-            terminal_receipt = guard._ledger._issued_receipt
+            terminal_receipt = guard._read_result_receipt(
+                _authority=resolver_module._RESOLVER_LIFECYCLE_AUTHORITY,
+            )
             self.assertIs(type(terminal_receipt), ResolverResultReceipt)
+            self.assertTrue(guard.cleanup())
             self.assertEqual(guard.safe_metadata()["state"], "terminal")
             with self.assertRaises(EndpointPolicyError):
                 build_resolution_set(attempt, terminal_receipt)

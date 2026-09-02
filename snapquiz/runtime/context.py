@@ -1200,6 +1200,60 @@ class CallContextLedger:
             )
             return action(sample)
 
+    def _run_active_helper_action(
+        self,
+        *,
+        context: CallContext,
+        attempt_gate: object,
+        session_id: UUID,
+        session_valid_until: datetime,
+        action: Callable[[ClockSample, int], _T],
+        _authority: object | None = None,
+    ) -> _T:
+        """Run one helper stop decision under the exact Context authority.
+
+        This is the deadline-bearing sibling of ``_run_active_action``.  It
+        deliberately returns the already-cached session monotonic deadline to
+        the trusted Gate callback while the Context lock is still held.  A
+        caller can therefore neither supply a clock sample nor remap the wall
+        expiry into a later monotonic deadline.
+        """
+
+        if _authority is not _ATTEMPT_BUDGET_AUTHORITY:
+            raise TypeError("helper context checks require AttemptGate")
+        if attempt_gate is None:
+            raise TypeError("attempt_gate must be an exact object")
+        require_uuid(session_id, "session_id")
+        require_aware_datetime(session_valid_until, "session_valid_until")
+        if not callable(action):
+            raise TypeError("action must be callable")
+        with self._lock:
+            state = self._require_context_locked(context)
+            self._require_attempt_gate_locked(
+                state=state,
+                attempt_gate=attempt_gate,
+            )
+            sample = self._sample_locked()
+            if state.closed:
+                raise _runtime_error("CallContext 已经终结。")
+            # Cancellation intentionally wins when the same trusted sample
+            # also reaches either half-open deadline boundary.
+            if state.cancelled_reason is not None:
+                raise _cancelled_error()
+            if (
+                sample.monotonic_after_ns
+                >= context.runtime_deadline.deadline_monotonic_ns
+            ):
+                raise _timeout_error()
+            effective_deadline_ns = self._require_session_deadline_locked(
+                state=state,
+                context=context,
+                sample=sample,
+                session_id=session_id,
+                session_valid_until=session_valid_until,
+            )
+            return action(sample, effective_deadline_ns)
+
     def _sample_for_attempt(
         self,
         *,

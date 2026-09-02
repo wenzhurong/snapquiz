@@ -23,6 +23,7 @@ from snapquiz.domain._validation import (
     require_aware_datetime,
     require_digest,
     require_plain_int,
+    require_text,
     require_uuid,
     runtime_final,
 )
@@ -50,11 +51,12 @@ from snapquiz.runtime.authority import (
     RegistryPolicyAuthorityLedger,
     _ATTEMPT_AUTHORITY,
 )
-from snapquiz.runtime.clock import ClockSample
+from snapquiz.runtime.clock import ClockSample, MonotonicDeadline
 from snapquiz.runtime.context import (
     AttemptBudgetReservation,
     CallContext,
     CallContextLedger,
+    CancellationToken,
     _ATTEMPT_BUDGET_AUTHORITY,
 )
 from snapquiz.transport.session import (
@@ -68,16 +70,27 @@ CREDENTIAL_RESOLUTION_PERMIT_SCHEMA_VERSION = (
     "snapquiz.credential-resolution-permit.v1"
 )
 ATTEMPT_PERMIT_SCHEMA_VERSION = "snapquiz.attempt-permit.v2"
+HELPER_STOP_AUTHORITY_SCHEMA_VERSION = "snapquiz.helper-stop-authority.v1"
+HELPER_WAIT_SLICE_SCHEMA_VERSION = "snapquiz.helper-wait-slice.v1"
+HELPER_WAIT_QUANTUM_NS = 50_000_000
 
 _PERMIT_FACTORY_AUTHORITY = object()
 _PERMIT_RELEASE_AUTHORITY = object()
 _CREDENTIAL_RESOLVER_AUTHORITY = object()
 _TRANSPORT_ATTEMPT_AUTHORITY = object()
+_HELPER_STOP_FACTORY_AUTHORITY = object()
+_HELPER_WAIT_SLICE_FACTORY_AUTHORITY = object()
 _CREDENTIAL_PERMIT_UUID_NAMESPACE = UUID(
     "f1112d3e-51ad-53f4-b70f-c05a8a3cd5c6"
 )
 _ATTEMPT_PERMIT_UUID_NAMESPACE = UUID(
     "fc6dc07a-2dcb-509f-8ca4-52fcbd77d07b"
+)
+_HELPER_STOP_UUID_NAMESPACE = UUID(
+    "2c12c850-3e72-52b3-b5fa-83efacebfb63"
+)
+_HELPER_WAIT_SLICE_UUID_NAMESPACE = UUID(
+    "4ee0cb29-f86b-58cf-bf84-fd8c8d1b69e7"
 )
 _T = TypeVar("_T")
 
@@ -782,6 +795,656 @@ class AttemptPermit:
         }
 
 
+def _helper_stop_authority_payload(
+    value: "HelperStopAuthority",
+) -> dict[str, object]:
+    return {
+        "authority_id": value.authority_id,
+        "gate_id": value.gate_id,
+        "credential_permit_id": value.credential_permit_id,
+        "credential_permit_digest": value.credential_permit_digest,
+        "context_id": value.context_id,
+        "context_digest": value.context_digest,
+        "session_id": value.session_id,
+        "session_terms_digest": value.session_terms_digest,
+        "runtime_deadline_digest": value.runtime_deadline_digest,
+        "cancellation_token_id": value.cancellation_token_id,
+        "cancellation_token_digest": value.cancellation_token_digest,
+        "effective_deadline_ns": value.effective_deadline_ns,
+    }
+
+
+@runtime_final
+class HelperStopAuthority:
+    """Exact live cancellation/deadline authority for one helper lifecycle."""
+
+    __slots__ = (
+        "authority_id",
+        "authority_digest",
+        "gate_id",
+        "credential_permit_id",
+        "credential_permit_digest",
+        "context_id",
+        "context_digest",
+        "session_id",
+        "session_terms_digest",
+        "runtime_deadline_digest",
+        "cancellation_token_id",
+        "cancellation_token_digest",
+        "effective_deadline_ns",
+        "_issued_digest",
+        "_attempt_gate",
+        "_credential_permit",
+        "_context",
+        "_context_ledger",
+        "_session",
+        "_runtime_deadline",
+        "_cancellation_token",
+        "_released",
+    )
+
+    def __init__(
+        self,
+        *,
+        credential_permit: CredentialResolutionPermit,
+        context: CallContext,
+        context_ledger: CallContextLedger,
+        session: AuthorizedSendSession,
+        effective_deadline_ns: int,
+        attempt_gate: "AttemptGate",
+        _authority: object | None = None,
+    ) -> None:
+        if _authority is not _HELPER_STOP_FACTORY_AUTHORITY:
+            raise TypeError("helper stop authority requires AttemptGate")
+        if type(credential_permit) is not CredentialResolutionPermit:
+            raise TypeError("credential_permit must be CredentialResolutionPermit")
+        if type(context) is not CallContext:
+            raise TypeError("context must be CallContext")
+        if type(context_ledger) is not CallContextLedger:
+            raise TypeError("context_ledger must be CallContextLedger")
+        if type(session) is not AuthorizedSendSession:
+            raise TypeError("session must be AuthorizedSendSession")
+        if type(attempt_gate) is not AttemptGate:
+            raise TypeError("attempt_gate must be AttemptGate")
+        checked_deadline_ns = require_plain_int(
+            effective_deadline_ns,
+            "effective_deadline_ns",
+            minimum=1,
+        )
+        runtime_deadline = context.runtime_deadline
+        cancellation_token = context.cancellation_token
+        if (
+            credential_permit._attempt_gate is not attempt_gate
+            or credential_permit._context is not context
+            or credential_permit._context_ledger is not context_ledger
+            or credential_permit._session is not session
+            or context._context_ledger is not context_ledger
+            or type(runtime_deadline) is not MonotonicDeadline
+            or type(cancellation_token) is not CancellationToken
+            or cancellation_token._context_ledger is not context_ledger
+            or checked_deadline_ns
+            > runtime_deadline.deadline_monotonic_ns
+        ):
+            raise _attempt_error("helper stop authority exact binding 无效。")
+        identifier = {
+            "gate_id": attempt_gate._gate_id,
+            "credential_permit_id": credential_permit.permit_id,
+            "credential_permit_digest": credential_permit.permit_digest,
+            "context_id": context.context_id,
+            "context_digest": context.context_digest,
+            "session_id": session.session_id,
+            "session_terms_digest": session.session_terms_digest,
+            "runtime_deadline_digest": runtime_deadline.deadline_digest,
+            "cancellation_token_id": cancellation_token.token_id,
+            "cancellation_token_digest": cancellation_token.token_digest,
+            "effective_deadline_ns": checked_deadline_ns,
+        }
+        authority_id = uuid5(
+            _HELPER_STOP_UUID_NAMESPACE,
+            str(
+                digest256(
+                    "HelperStopAuthorityIdentifier",
+                    HELPER_STOP_AUTHORITY_SCHEMA_VERSION,
+                    identifier,
+                )
+            ),
+        )
+        values = (
+            ("authority_id", authority_id),
+            ("gate_id", attempt_gate._gate_id),
+            ("credential_permit_id", credential_permit.permit_id),
+            ("credential_permit_digest", credential_permit.permit_digest),
+            ("context_id", context.context_id),
+            ("context_digest", context.context_digest),
+            ("session_id", session.session_id),
+            ("session_terms_digest", session.session_terms_digest),
+            ("runtime_deadline_digest", runtime_deadline.deadline_digest),
+            ("cancellation_token_id", cancellation_token.token_id),
+            ("cancellation_token_digest", cancellation_token.token_digest),
+            ("effective_deadline_ns", checked_deadline_ns),
+            ("_attempt_gate", attempt_gate),
+            ("_credential_permit", credential_permit),
+            ("_context", context),
+            ("_context_ledger", context_ledger),
+            ("_session", session),
+            ("_runtime_deadline", runtime_deadline),
+            ("_cancellation_token", cancellation_token),
+            ("_released", False),
+        )
+        for name, value in values:
+            object.__setattr__(self, name, value)
+        authority_digest = digest256(
+            "HelperStopAuthority",
+            HELPER_STOP_AUTHORITY_SCHEMA_VERSION,
+            _helper_stop_authority_payload(self),
+        )
+        object.__setattr__(self, "authority_digest", authority_digest)
+        object.__setattr__(self, "_issued_digest", authority_digest)
+        self.validate_integrity()
+
+    def __setattr__(self, name: str, value: object) -> None:
+        del name, value
+        raise AttributeError("HelperStopAuthority is immutable")
+
+    def __copy__(self) -> "HelperStopAuthority":
+        return self
+
+    def __deepcopy__(self, memo: dict[int, object]) -> "HelperStopAuthority":
+        del memo
+        return self
+
+    def __reduce__(self) -> object:
+        raise TypeError("HelperStopAuthority cannot be serialized")
+
+    def __reduce_ex__(self, protocol: int) -> object:
+        del protocol
+        raise TypeError("HelperStopAuthority cannot be serialized")
+
+    def __repr__(self) -> str:
+        return (
+            "HelperStopAuthority("
+            f"authority_id={self.authority_id!r}, "
+            f"context_id={self.context_id!r}, session_id={self.session_id!r})"
+        )
+
+    def validate_integrity(self) -> None:
+        for name in (
+            "authority_id",
+            "gate_id",
+            "credential_permit_id",
+            "context_id",
+            "session_id",
+            "cancellation_token_id",
+        ):
+            require_uuid(getattr(self, name), name)
+        for name in (
+            "authority_digest",
+            "credential_permit_digest",
+            "context_digest",
+            "session_terms_digest",
+            "runtime_deadline_digest",
+            "cancellation_token_digest",
+            "_issued_digest",
+        ):
+            require_digest(getattr(self, name), name)
+        require_plain_int(
+            self.effective_deadline_ns,
+            "effective_deadline_ns",
+            minimum=1,
+        )
+        if type(self._released) is not bool:
+            raise ValueError("helper stop release state changed")
+        references = (
+            self._attempt_gate,
+            self._credential_permit,
+            self._context,
+            self._context_ledger,
+            self._session,
+            self._runtime_deadline,
+            self._cancellation_token,
+        )
+        if self._released:
+            if any(value is not None for value in references):
+                raise ValueError("released helper stop authority retains authority")
+        else:
+            if (
+                type(self._attempt_gate) is not AttemptGate
+                or type(self._credential_permit)
+                is not CredentialResolutionPermit
+                or type(self._context) is not CallContext
+                or type(self._context_ledger) is not CallContextLedger
+                or type(self._session) is not AuthorizedSendSession
+                or type(self._runtime_deadline) is not MonotonicDeadline
+                or type(self._cancellation_token) is not CancellationToken
+            ):
+                raise ValueError("helper stop authority reference changed")
+            self._credential_permit.validate_integrity()
+            self._context.validate_integrity()
+            self._session.validate_integrity()
+            self._runtime_deadline.validate_integrity()
+            self._cancellation_token.validate_integrity()
+            if (
+                self.gate_id != self._attempt_gate._gate_id
+                or self._credential_permit._attempt_gate is not self._attempt_gate
+                or self.credential_permit_id
+                != self._credential_permit.permit_id
+                or self.credential_permit_digest
+                != self._credential_permit.permit_digest
+                or self._credential_permit._context is not self._context
+                or self._credential_permit._context_ledger
+                is not self._context_ledger
+                or self._credential_permit._session is not self._session
+                or self._context._context_ledger is not self._context_ledger
+                or self.context_id != self._context.context_id
+                or self.context_digest != self._context.context_digest
+                or self.session_id != self._session.session_id
+                or self.session_terms_digest
+                != self._session.session_terms_digest
+                or self._context.runtime_deadline is not self._runtime_deadline
+                or self.runtime_deadline_digest
+                != self._runtime_deadline.deadline_digest
+                or self._context.cancellation_token
+                is not self._cancellation_token
+                or self._cancellation_token._context_ledger
+                is not self._context_ledger
+                or self.cancellation_token_id
+                != self._cancellation_token.token_id
+                or self.cancellation_token_digest
+                != self._cancellation_token.token_digest
+                or self.effective_deadline_ns
+                > self._runtime_deadline.deadline_monotonic_ns
+            ):
+                raise ValueError("helper stop authority exact binding changed")
+        expected_id = uuid5(
+            _HELPER_STOP_UUID_NAMESPACE,
+            str(
+                digest256(
+                    "HelperStopAuthorityIdentifier",
+                    HELPER_STOP_AUTHORITY_SCHEMA_VERSION,
+                    {
+                        key: value
+                        for key, value in _helper_stop_authority_payload(
+                            self
+                        ).items()
+                        if key != "authority_id"
+                    },
+                )
+            ),
+        )
+        if (
+            self.authority_id != expected_id
+            or self.authority_digest != self._issued_digest
+            or self.authority_digest
+            != digest256(
+                "HelperStopAuthority",
+                HELPER_STOP_AUTHORITY_SCHEMA_VERSION,
+                _helper_stop_authority_payload(self),
+            )
+        ):
+            raise ValueError("helper stop authority integrity mismatch")
+
+    def _checkpoint(
+        self,
+        phase: str,
+        *,
+        _authority: object | None = None,
+    ) -> "HelperWaitSlice":
+        """Issue one bounded wait slice through the exact five-ledger path."""
+
+        if _authority is not _TRANSPORT_ATTEMPT_AUTHORITY:
+            raise TypeError("helper checkpoint requires trusted transport")
+        gate = self._attempt_gate
+        if type(gate) is not AttemptGate:
+            raise _attempt_error("helper stop authority 已终结。")
+        return gate._checkpoint_helper_stop_authority(
+            self,
+            phase=phase,
+            _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+        )
+
+    def _release_authority_refs(
+        self,
+        *,
+        _authority: object | None = None,
+    ) -> None:
+        if _authority is not _PERMIT_RELEASE_AUTHORITY:
+            raise TypeError("helper stop cleanup requires AttemptGate")
+        if self._released:
+            return
+        for name in (
+            "_attempt_gate",
+            "_credential_permit",
+            "_context",
+            "_context_ledger",
+            "_session",
+            "_runtime_deadline",
+            "_cancellation_token",
+        ):
+            object.__setattr__(self, name, None)
+        object.__setattr__(self, "_released", True)
+
+    def safe_metadata(self) -> dict[str, object]:
+        return {
+            "authority_id": str(self.authority_id),
+            "context_id": str(self.context_id),
+            "session_id": str(self.session_id),
+            "effective_deadline_ns": self.effective_deadline_ns,
+        }
+
+
+def _helper_wait_slice_payload(value: "HelperWaitSlice") -> dict[str, object]:
+    return {
+        "slice_id": value.slice_id,
+        "authority_id": value.authority_id,
+        "authority_digest": value.authority_digest,
+        "sequence": value.sequence,
+        "phase": value.phase,
+        "context_id": value.context_id,
+        "session_id": value.session_id,
+        "runtime_deadline_digest": value.runtime_deadline_digest,
+        "cancellation_token_id": value.cancellation_token_id,
+        "cancellation_token_digest": value.cancellation_token_digest,
+        "effective_deadline_ns": value.effective_deadline_ns,
+        "observed_monotonic_ns": value.observed_monotonic_ns,
+        "remaining_ns": value.remaining_ns,
+        "max_wait_ns": value.max_wait_ns,
+    }
+
+
+@runtime_final
+class HelperWaitSlice:
+    """Factory-only, single-checkpoint bound for one helper poll."""
+
+    __slots__ = (
+        "slice_id",
+        "authority_id",
+        "authority_digest",
+        "sequence",
+        "phase",
+        "context_id",
+        "session_id",
+        "runtime_deadline_digest",
+        "cancellation_token_id",
+        "cancellation_token_digest",
+        "effective_deadline_ns",
+        "observed_monotonic_ns",
+        "remaining_ns",
+        "max_wait_ns",
+        "slice_digest",
+        "_issued_digest",
+    )
+
+    def __init__(
+        self,
+        *,
+        stop_authority: HelperStopAuthority,
+        sequence: int,
+        phase: str,
+        effective_deadline_ns: int,
+        observed_monotonic_ns: int,
+        _authority: object | None = None,
+    ) -> None:
+        if _authority is not _HELPER_WAIT_SLICE_FACTORY_AUTHORITY:
+            raise TypeError("helper wait slices require AttemptGate")
+        if type(stop_authority) is not HelperStopAuthority:
+            raise TypeError("stop_authority must be HelperStopAuthority")
+        stop_authority.validate_integrity()
+        checked_sequence = require_plain_int(sequence, "sequence", minimum=1)
+        checked_phase = require_text(phase, "phase", max_length=64)
+        checked_deadline = require_plain_int(
+            effective_deadline_ns,
+            "effective_deadline_ns",
+            minimum=1,
+        )
+        checked_observed = require_plain_int(
+            observed_monotonic_ns,
+            "observed_monotonic_ns",
+        )
+        if (
+            checked_deadline != stop_authority.effective_deadline_ns
+            or checked_observed >= checked_deadline
+        ):
+            raise _attempt_error("helper wait slice deadline 无效。")
+        remaining_ns = checked_deadline - checked_observed
+        max_wait_ns = min(remaining_ns, HELPER_WAIT_QUANTUM_NS)
+        slice_id = uuid5(
+            _HELPER_WAIT_SLICE_UUID_NAMESPACE,
+            str(
+                digest256(
+                    "HelperWaitSliceIdentifier",
+                    HELPER_WAIT_SLICE_SCHEMA_VERSION,
+                    {
+                        "authority_id": stop_authority.authority_id,
+                        "authority_digest": stop_authority.authority_digest,
+                        "sequence": checked_sequence,
+                        "phase": checked_phase,
+                        "observed_monotonic_ns": checked_observed,
+                    },
+                )
+            ),
+        )
+        values = (
+            ("slice_id", slice_id),
+            ("authority_id", stop_authority.authority_id),
+            ("authority_digest", stop_authority.authority_digest),
+            ("sequence", checked_sequence),
+            ("phase", checked_phase),
+            ("context_id", stop_authority.context_id),
+            ("session_id", stop_authority.session_id),
+            (
+                "runtime_deadline_digest",
+                stop_authority.runtime_deadline_digest,
+            ),
+            ("cancellation_token_id", stop_authority.cancellation_token_id),
+            (
+                "cancellation_token_digest",
+                stop_authority.cancellation_token_digest,
+            ),
+            ("effective_deadline_ns", checked_deadline),
+            ("observed_monotonic_ns", checked_observed),
+            ("remaining_ns", remaining_ns),
+            ("max_wait_ns", max_wait_ns),
+        )
+        for name, value in values:
+            object.__setattr__(self, name, value)
+        slice_digest = digest256(
+            "HelperWaitSlice",
+            HELPER_WAIT_SLICE_SCHEMA_VERSION,
+            _helper_wait_slice_payload(self),
+        )
+        object.__setattr__(self, "slice_digest", slice_digest)
+        object.__setattr__(self, "_issued_digest", slice_digest)
+        self.validate_integrity()
+
+    def __setattr__(self, name: str, value: object) -> None:
+        del name, value
+        raise AttributeError("HelperWaitSlice is immutable")
+
+    def __copy__(self) -> "HelperWaitSlice":
+        return self
+
+    def __deepcopy__(self, memo: dict[int, object]) -> "HelperWaitSlice":
+        del memo
+        return self
+
+    def __reduce__(self) -> object:
+        raise TypeError("HelperWaitSlice cannot be serialized")
+
+    def __reduce_ex__(self, protocol: int) -> object:
+        del protocol
+        raise TypeError("HelperWaitSlice cannot be serialized")
+
+    def validate_integrity(self) -> None:
+        for name in (
+            "slice_id",
+            "authority_id",
+            "context_id",
+            "session_id",
+            "cancellation_token_id",
+        ):
+            require_uuid(getattr(self, name), name)
+        for name in (
+            "authority_digest",
+            "runtime_deadline_digest",
+            "cancellation_token_digest",
+            "slice_digest",
+            "_issued_digest",
+        ):
+            require_digest(getattr(self, name), name)
+        require_plain_int(self.sequence, "sequence", minimum=1)
+        require_text(self.phase, "phase", max_length=64)
+        require_plain_int(
+            self.effective_deadline_ns,
+            "effective_deadline_ns",
+            minimum=1,
+        )
+        require_plain_int(
+            self.observed_monotonic_ns,
+            "observed_monotonic_ns",
+        )
+        require_plain_int(self.remaining_ns, "remaining_ns", minimum=1)
+        require_plain_int(self.max_wait_ns, "max_wait_ns", minimum=1)
+        if (
+            self.observed_monotonic_ns >= self.effective_deadline_ns
+            or self.remaining_ns
+            != self.effective_deadline_ns - self.observed_monotonic_ns
+            or self.max_wait_ns
+            != min(self.remaining_ns, HELPER_WAIT_QUANTUM_NS)
+            or self.max_wait_ns > HELPER_WAIT_QUANTUM_NS
+        ):
+            raise ValueError("helper wait slice bound changed")
+        expected_id = uuid5(
+            _HELPER_WAIT_SLICE_UUID_NAMESPACE,
+            str(
+                digest256(
+                    "HelperWaitSliceIdentifier",
+                    HELPER_WAIT_SLICE_SCHEMA_VERSION,
+                    {
+                        "authority_id": self.authority_id,
+                        "authority_digest": self.authority_digest,
+                        "sequence": self.sequence,
+                        "phase": self.phase,
+                        "observed_monotonic_ns": self.observed_monotonic_ns,
+                    },
+                )
+            ),
+        )
+        if (
+            self.slice_id != expected_id
+            or self.slice_digest != self._issued_digest
+            or self.slice_digest
+            != digest256(
+                "HelperWaitSlice",
+                HELPER_WAIT_SLICE_SCHEMA_VERSION,
+                _helper_wait_slice_payload(self),
+            )
+        ):
+            raise ValueError("helper wait slice integrity mismatch")
+
+    def safe_metadata(self) -> dict[str, object]:
+        return {
+            "slice_id": str(self.slice_id),
+            "authority_id": str(self.authority_id),
+            "phase": self.phase,
+            "max_wait_ns": self.max_wait_ns,
+        }
+
+
+class _HelperStopAuthorityState:
+    """Gate-owned exact snapshot independent from caller-held authority fields."""
+
+    __slots__ = (
+        "authority",
+        "authority_id",
+        "authority_digest",
+        "gate_id",
+        "credential_permit_id",
+        "credential_permit_digest",
+        "context_id",
+        "context_digest",
+        "session_id",
+        "session_terms_digest",
+        "runtime_deadline_digest",
+        "cancellation_token_id",
+        "cancellation_token_digest",
+        "effective_deadline_ns",
+        "attempt_gate",
+        "credential_permit",
+        "context",
+        "context_ledger",
+        "session",
+        "runtime_deadline",
+        "cancellation_token",
+        "status",
+        "sequence",
+        "issued_wait_slice",
+        "issued_wait_slice_digest",
+        "completion_attempt_id",
+        "completion_receipt_digest",
+    )
+
+    def __init__(self, authority: HelperStopAuthority) -> None:
+        authority.validate_integrity()
+        self.authority = authority
+        self.authority_id = authority.authority_id
+        self.authority_digest = authority.authority_digest
+        self.gate_id = authority.gate_id
+        self.credential_permit_id = authority.credential_permit_id
+        self.credential_permit_digest = authority.credential_permit_digest
+        self.context_id = authority.context_id
+        self.context_digest = authority.context_digest
+        self.session_id = authority.session_id
+        self.session_terms_digest = authority.session_terms_digest
+        self.runtime_deadline_digest = authority.runtime_deadline_digest
+        self.cancellation_token_id = authority.cancellation_token_id
+        self.cancellation_token_digest = authority.cancellation_token_digest
+        self.effective_deadline_ns = authority.effective_deadline_ns
+        self.attempt_gate = authority._attempt_gate
+        self.credential_permit = authority._credential_permit
+        self.context = authority._context
+        self.context_ledger = authority._context_ledger
+        self.session = authority._session
+        self.runtime_deadline = authority._runtime_deadline
+        self.cancellation_token = authority._cancellation_token
+        self.status = "active"
+        self.sequence = 0
+        self.issued_wait_slice: HelperWaitSlice | None = None
+        self.issued_wait_slice_digest: Digest256 | None = None
+        self.completion_attempt_id: UUID | None = None
+        self.completion_receipt_digest: Digest256 | None = None
+
+    def authority_refs(self) -> tuple[object, ...]:
+        return (
+            self.attempt_gate,
+            self.credential_permit,
+            self.context,
+            self.context_ledger,
+            self.session,
+            self.runtime_deadline,
+            self.cancellation_token,
+        )
+
+    def clear_authority_refs(self) -> None:
+        self.attempt_gate = None
+        self.credential_permit = None
+        self.context = None
+        self.context_ledger = None
+        self.session = None
+        self.runtime_deadline = None
+        self.cancellation_token = None
+
+    def restore_authority_refs(self, refs: tuple[object, ...]) -> None:
+        (
+            self.attempt_gate,
+            self.credential_permit,
+            self.context,
+            self.context_ledger,
+            self.session,
+            self.runtime_deadline,
+            self.cancellation_token,
+        ) = refs
+
+
 class _CredentialPermitState:
     __slots__ = (
         "permit",
@@ -842,6 +1505,13 @@ class _AttemptPermitState:
         "terminal_guard_digest",
         "dns_start_id",
         "credential_borrow_id",
+        "resolver_completion_status",
+        "resolver_completion_authority_id",
+        "resolver_completion_claim_id",
+        "resolver_completion_guard_id",
+        "resolver_completion_guard_digest",
+        "resolver_completion_start_id",
+        "resolver_completion_receipt_digest",
     )
 
     def __init__(self, permit: AttemptPermit) -> None:
@@ -862,6 +1532,13 @@ class _AttemptPermitState:
         self.terminal_guard_digest: Digest256 | None = None
         self.dns_start_id: UUID | None = None
         self.credential_borrow_id: UUID | None = None
+        self.resolver_completion_status = "uncommitted"
+        self.resolver_completion_authority_id: UUID | None = None
+        self.resolver_completion_claim_id: UUID | None = None
+        self.resolver_completion_guard_id: UUID | None = None
+        self.resolver_completion_guard_digest: Digest256 | None = None
+        self.resolver_completion_start_id: UUID | None = None
+        self.resolver_completion_receipt_digest: Digest256 | None = None
 
     def clear_recovery_refs(self) -> None:
         """Drop strong recovery anchors after irreversible terminal commit."""
@@ -958,6 +1635,8 @@ class AttemptGate:
         "_gate_id",
         "_credential_permits",
         "_attempt_permits",
+        "_helper_stop_authorities",
+        "_helper_stop_by_credential",
         "_active_by_session",
         "_sequence",
         "_lock",
@@ -967,6 +1646,8 @@ class AttemptGate:
         object.__setattr__(self, "_gate_id", uuid4())
         object.__setattr__(self, "_credential_permits", {})
         object.__setattr__(self, "_attempt_permits", {})
+        object.__setattr__(self, "_helper_stop_authorities", {})
+        object.__setattr__(self, "_helper_stop_by_credential", {})
         object.__setattr__(self, "_active_by_session", {})
         object.__setattr__(self, "_sequence", 0)
         object.__setattr__(self, "_lock", RLock())
@@ -1030,9 +1711,8 @@ class AttemptGate:
         authority_ledger: RegistryPolicyAuthorityLedger,
         context: CallContext,
         context_ledger: CallContextLedger,
-        final_action: Callable[
-            [ExecutionPlanStage, ExecutionPlanNetworkOperation, ClockSample], _T
-        ],
+        final_action: Callable[..., _T],
+        include_effective_deadline: bool = False,
     ) -> _T:
         self._validate_inputs(
             planned=planned,
@@ -1049,6 +1729,8 @@ class AttemptGate:
         )
         if not callable(final_action):
             raise TypeError("final_action must be callable")
+        if type(include_effective_deadline) is not bool:
+            raise TypeError("include_effective_deadline must be bool")
 
         # Obtain caller-independent time before taking the ordered authority
         # locks.  The final context action samples again while all locks remain
@@ -1089,6 +1771,22 @@ class AttemptGate:
             def under_approval() -> _T:
                 def under_session() -> _T:
                     def under_registry() -> _T:
+                        if include_effective_deadline:
+                            return context_ledger._run_active_helper_action(
+                                context=context,
+                                attempt_gate=self,
+                                session_id=session.session_id,
+                                session_valid_until=session.valid_until,
+                                action=lambda sample, effective_deadline_ns: (
+                                    final_action(
+                                        stage,
+                                        operation,
+                                        sample,
+                                        effective_deadline_ns,
+                                    )
+                                ),
+                                _authority=_ATTEMPT_BUDGET_AUTHORITY,
+                            )
                         return context_ledger._run_active_action(
                             context=context,
                             attempt_gate=self,
@@ -1225,6 +1923,347 @@ class AttemptGate:
             context_ledger=context_ledger,
             final_action=issue,
         )
+
+    def _require_helper_stop_state_locked(
+        self,
+        authority: HelperStopAuthority,
+        *,
+        require_active: bool = True,
+    ) -> _HelperStopAuthorityState:
+        if type(authority) is not HelperStopAuthority:
+            raise TypeError("authority must be HelperStopAuthority")
+        try:
+            authority.validate_integrity()
+        except (TypeError, ValueError, AttributeError):
+            raise _attempt_error("helper stop authority 完整性校验失败。") from None
+        state = self._helper_stop_authorities.get(authority.authority_id)
+        primitive_matches = state is not None and (
+            state.authority is authority
+            and state.authority_id == authority.authority_id
+            and state.authority_digest == authority.authority_digest
+            and state.gate_id == authority.gate_id == self._gate_id
+            and state.credential_permit_id
+            == authority.credential_permit_id
+            and state.credential_permit_digest
+            == authority.credential_permit_digest
+            and state.context_id == authority.context_id
+            and state.context_digest == authority.context_digest
+            and state.session_id == authority.session_id
+            and state.session_terms_digest == authority.session_terms_digest
+            and state.runtime_deadline_digest
+            == authority.runtime_deadline_digest
+            and state.cancellation_token_id
+            == authority.cancellation_token_id
+            and state.cancellation_token_digest
+            == authority.cancellation_token_digest
+            and state.effective_deadline_ns
+            == authority.effective_deadline_ns
+            and self._helper_stop_by_credential.get(
+                state.credential_permit_id
+            )
+            == state.authority_id
+        )
+        if not primitive_matches:
+            raise _attempt_error("helper stop authority 不属于当前 AttemptGate。")
+        if not require_active:
+            return state
+        credential_state = self._credential_permits.get(
+            state.credential_permit_id
+        )
+        if (
+            state.status != "active"
+            or authority._released
+            or state.attempt_gate is not self
+            or state.credential_permit is not authority._credential_permit
+            or state.context is not authority._context
+            or state.context_ledger is not authority._context_ledger
+            or state.session is not authority._session
+            or state.runtime_deadline is not authority._runtime_deadline
+            or state.cancellation_token is not authority._cancellation_token
+            or credential_state is None
+            or credential_state.permit is not state.credential_permit
+            or credential_state.status in ("abandoned", "finished")
+            or self._active_by_session.get(state.session_id)
+            != state.credential_permit_id
+        ):
+            raise _attempt_error("helper stop authority 已终结或 owner 已变化。")
+        return state
+
+    def _issue_helper_stop_authority(
+        self,
+        credential_permit: CredentialResolutionPermit,
+        *,
+        _authority: object | None = None,
+    ) -> HelperStopAuthority:
+        """Issue the sole exact helper stop authority for one credential permit."""
+
+        if _authority is not _TRANSPORT_ATTEMPT_AUTHORITY:
+            raise TypeError("helper stop issuance requires trusted transport")
+        if type(credential_permit) is not CredentialResolutionPermit:
+            raise TypeError(
+                "credential_permit must be CredentialResolutionPermit"
+            )
+        if credential_permit._attempt_gate is not self:
+            raise _attempt_error("凭据解析授权不属于当前 AttemptGate。")
+        with self._lock:
+            credential_state = self._require_credential_state_locked(
+                credential_permit
+            )
+            bindings = (
+                credential_permit._planned,
+                credential_permit._invocation,
+                credential_permit._prepared,
+                credential_permit._authorization,
+                credential_permit._consent_ledger,
+                credential_permit._session,
+                credential_permit._approval_ledger,
+                credential_permit._session_ledger,
+                credential_permit._authority_ledger,
+                credential_permit._context,
+                credential_permit._context_ledger,
+            )
+        (
+            planned,
+            invocation,
+            prepared,
+            authorization,
+            consent_ledger,
+            session,
+            approval_ledger,
+            session_ledger,
+            authority_ledger,
+            context,
+            context_ledger,
+        ) = bindings
+
+        def issue_stop(
+            stage: ExecutionPlanStage,
+            operation: ExecutionPlanNetworkOperation,
+            sample: ClockSample,
+            effective_deadline_ns: int,
+        ) -> HelperStopAuthority:
+            del stage, operation
+            if (
+                sample.wall_time < session.issued_at
+                or sample.wall_time >= session.valid_until
+            ):
+                raise _attempt_error("发送会话已经过期或尚未生效。")
+            with self._lock:
+                current = self._require_credential_state_locked(
+                    credential_permit
+                )
+                existing_id = self._helper_stop_by_credential.get(
+                    credential_permit.permit_id
+                )
+                if existing_id is not None:
+                    existing = self._helper_stop_authorities.get(existing_id)
+                    if existing is None:
+                        raise _attempt_error(
+                            "helper stop authority publication 无效。"
+                        )
+                    candidate = existing.authority
+                    validated = self._require_helper_stop_state_locked(candidate)
+                    if (
+                        validated is not existing
+                        or existing.effective_deadline_ns
+                        != effective_deadline_ns
+                    ):
+                        raise _attempt_error(
+                            "helper stop authority deadline 已变化。"
+                        )
+                    return candidate
+                if current is not credential_state or current.status != "authorized":
+                    raise _attempt_error(
+                        "helper stop authority 只能在 helper 启动前签发。"
+                    )
+                candidate = HelperStopAuthority(
+                    credential_permit=credential_permit,
+                    context=context,
+                    context_ledger=context_ledger,
+                    session=session,
+                    effective_deadline_ns=effective_deadline_ns,
+                    attempt_gate=self,
+                    _authority=_HELPER_STOP_FACTORY_AUTHORITY,
+                )
+                stop_state = _HelperStopAuthorityState(candidate)
+                try:
+                    if candidate.authority_id in self._helper_stop_authorities:
+                        raise _attempt_error(
+                            "helper stop authority id 已使用。"
+                        )
+                    self._helper_stop_authorities[candidate.authority_id] = (
+                        stop_state
+                    )
+                    self._helper_stop_by_credential[
+                        credential_permit.permit_id
+                    ] = candidate.authority_id
+                    return candidate
+                except BaseException:
+                    if (
+                        self._helper_stop_authorities.get(candidate.authority_id)
+                        is stop_state
+                    ):
+                        del self._helper_stop_authorities[candidate.authority_id]
+                    if (
+                        self._helper_stop_by_credential.get(
+                            credential_permit.permit_id
+                        )
+                        == candidate.authority_id
+                    ):
+                        del self._helper_stop_by_credential[
+                            credential_permit.permit_id
+                        ]
+                    candidate._release_authority_refs(
+                        _authority=_PERMIT_RELEASE_AUTHORITY,
+                    )
+                    raise
+
+        candidate = self._run_authority_path(
+            planned=planned,
+            invocation=invocation,
+            prepared=prepared,
+            authorization=authorization,
+            consent_ledger=consent_ledger,
+            session=session,
+            approval_ledger=approval_ledger,
+            session_ledger=session_ledger,
+            authority_ledger=authority_ledger,
+            context=context,
+            context_ledger=context_ledger,
+            final_action=issue_stop,
+            include_effective_deadline=True,
+        )
+        with self._lock:
+            state = self._require_helper_stop_state_locked(candidate)
+            if state.credential_permit is not credential_permit:
+                raise _attempt_error("helper stop authority publication 未提交。")
+        return candidate
+
+    def _checkpoint_helper_stop_authority(
+        self,
+        authority: HelperStopAuthority,
+        *,
+        phase: str,
+        _authority: object | None = None,
+    ) -> HelperWaitSlice:
+        """Recheck all live ledgers and issue one caller-independent wait bound."""
+
+        if _authority is not _TRANSPORT_ATTEMPT_AUTHORITY:
+            raise TypeError("helper checkpoint requires trusted transport")
+        checked_phase = require_text(phase, "phase", max_length=64)
+        with self._lock:
+            stop_state = self._require_helper_stop_state_locked(authority)
+            previous_sequence = stop_state.sequence
+            expected_sequence = previous_sequence + 1
+            previous_wait_slice = stop_state.issued_wait_slice
+            previous_wait_slice_digest = stop_state.issued_wait_slice_digest
+            bindings = (
+                stop_state.credential_permit._planned,
+                stop_state.credential_permit._invocation,
+                stop_state.credential_permit._prepared,
+                stop_state.credential_permit._authorization,
+                stop_state.credential_permit._consent_ledger,
+                stop_state.session,
+                stop_state.credential_permit._approval_ledger,
+                stop_state.credential_permit._session_ledger,
+                stop_state.credential_permit._authority_ledger,
+                stop_state.context,
+                stop_state.context_ledger,
+            )
+        (
+            planned,
+            invocation,
+            prepared,
+            authorization,
+            consent_ledger,
+            session,
+            approval_ledger,
+            session_ledger,
+            authority_ledger,
+            context,
+            context_ledger,
+        ) = bindings
+
+        def checkpoint(
+            stage: ExecutionPlanStage,
+            operation: ExecutionPlanNetworkOperation,
+            sample: ClockSample,
+            effective_deadline_ns: int,
+        ) -> HelperWaitSlice:
+            del stage, operation
+            if (
+                sample.wall_time < session.issued_at
+                or sample.wall_time >= session.valid_until
+            ):
+                raise _attempt_error("发送会话已经过期或尚未生效。")
+            with self._lock:
+                current = self._require_helper_stop_state_locked(authority)
+                if (
+                    current is not stop_state
+                    or current.sequence != previous_sequence
+                    or current.issued_wait_slice is not previous_wait_slice
+                    or current.issued_wait_slice_digest
+                    != previous_wait_slice_digest
+                    or effective_deadline_ns
+                    != current.effective_deadline_ns
+                    or sample.monotonic_after_ns >= effective_deadline_ns
+                ):
+                    raise _attempt_error(
+                        "helper stop authority deadline 已变化。"
+                    )
+                wait_slice = HelperWaitSlice(
+                    stop_authority=authority,
+                    sequence=expected_sequence,
+                    phase=checked_phase,
+                    effective_deadline_ns=effective_deadline_ns,
+                    observed_monotonic_ns=sample.monotonic_after_ns,
+                    _authority=_HELPER_WAIT_SLICE_FACTORY_AUTHORITY,
+                )
+                current.sequence = expected_sequence
+                current.issued_wait_slice = wait_slice
+                current.issued_wait_slice_digest = wait_slice.slice_digest
+                return wait_slice
+
+        candidate = self._run_authority_path(
+            planned=planned,
+            invocation=invocation,
+            prepared=prepared,
+            authorization=authorization,
+            consent_ledger=consent_ledger,
+            session=session,
+            approval_ledger=approval_ledger,
+            session_ledger=session_ledger,
+            authority_ledger=authority_ledger,
+            context=context,
+            context_ledger=context_ledger,
+            final_action=checkpoint,
+            include_effective_deadline=True,
+        )
+        candidate_is_valid = type(candidate) is HelperWaitSlice
+        if candidate_is_valid:
+            try:
+                candidate.validate_integrity()
+            except (TypeError, ValueError, AttributeError):
+                candidate_is_valid = False
+        with self._lock:
+            current = self._require_helper_stop_state_locked(authority)
+            publication_is_exact = (
+                candidate_is_valid
+                and current is stop_state
+                and current.sequence == expected_sequence
+                and current.issued_wait_slice is candidate
+                and current.issued_wait_slice_digest
+                == candidate.slice_digest
+                and candidate.sequence == expected_sequence
+                and candidate.authority_id == authority.authority_id
+                and candidate.authority_digest == authority.authority_digest
+                and candidate.phase == checked_phase
+                and candidate.effective_deadline_ns
+                == current.effective_deadline_ns
+            )
+        if not publication_is_exact:
+            raise _attempt_error("helper wait slice publication 未提交。")
+        return candidate
 
     def _confirm_credential_resolution(
         self,
@@ -1535,6 +2574,9 @@ class AttemptGate:
                 and state.context is None
                 and state.context_ledger is None
                 and state.session_id not in self._active_by_session
+                and self._helper_stop_is_terminal_for_credential_locked(
+                    state.permit_id
+                )
             )
 
     def _credential_claim_is_owned(
@@ -1847,6 +2889,148 @@ class AttemptGate:
             )
         )
 
+    def _helper_stop_release_snapshot_locked(
+        self,
+        credential_permit_id: UUID,
+    ) -> tuple[
+        _HelperStopAuthorityState,
+        dict[str, object],
+        tuple[object, ...],
+        str,
+    ] | None:
+        authority_id = self._helper_stop_by_credential.get(
+            credential_permit_id
+        )
+        if authority_id is None:
+            return None
+        state = self._helper_stop_authorities.get(authority_id)
+        if state is None or state.credential_permit_id != credential_permit_id:
+            raise _attempt_error("helper stop authority release owner 无效。")
+        self._require_helper_stop_state_locked(state.authority)
+        return (
+            state,
+            self._snapshot_slots(state.authority),
+            state.authority_refs(),
+            state.status,
+        )
+
+    def _release_helper_stop_locked(
+        self,
+        snapshot: tuple[
+            _HelperStopAuthorityState,
+            dict[str, object],
+            tuple[object, ...],
+            str,
+        ]
+        | None,
+    ) -> None:
+        if snapshot is None:
+            return
+        state, _, _, _ = snapshot
+        authority = state.authority
+        authority._release_authority_refs(
+            _authority=_PERMIT_RELEASE_AUTHORITY,
+        )
+        state.clear_authority_refs()
+        state.status = "terminal"
+        try:
+            authority.validate_integrity()
+        except (TypeError, ValueError, AttributeError):
+            raise _attempt_error(
+                "helper stop authority refs 未释放。"
+            ) from None
+        if state.authority_refs() != (None, None, None, None, None, None, None):
+            raise _attempt_error("helper stop recovery refs 未释放。")
+
+    def _restore_helper_stop_locked(
+        self,
+        snapshot: tuple[
+            _HelperStopAuthorityState,
+            dict[str, object],
+            tuple[object, ...],
+            str,
+        ]
+        | None,
+    ) -> None:
+        if snapshot is None:
+            return
+        state, authority_slots, refs, status = snapshot
+        self._restore_slots(state.authority, authority_slots)
+        state.restore_authority_refs(refs)
+        state.status = status
+
+    def _helper_stop_is_terminal_for_credential_locked(
+        self,
+        credential_permit_id: UUID,
+    ) -> bool:
+        """Prove the exact helper authority has released every live owner."""
+
+        indexed_authority_id = self._helper_stop_by_credential.get(
+            credential_permit_id
+        )
+        matches = [
+            (authority_id, state)
+            for authority_id, state in self._helper_stop_authorities.items()
+            if authority_id == indexed_authority_id
+            or state.credential_permit_id == credential_permit_id
+        ]
+        if indexed_authority_id is None:
+            return not matches
+        if len(matches) != 1:
+            return False
+        authority_id, state = matches[0]
+        authority = state.authority
+        if type(authority) is not HelperStopAuthority:
+            return False
+        try:
+            current = self._require_helper_stop_state_locked(
+                authority,
+                require_active=False,
+            )
+        except (TypeError, ValueError, AttributeError, EndpointPolicyError):
+            return False
+        return (
+            current is state
+            and authority_id == indexed_authority_id == state.authority_id
+            and state.credential_permit_id == credential_permit_id
+            and sum(
+                candidate_id == authority_id
+                for candidate_id in self._helper_stop_by_credential.values()
+            )
+            == 1
+            and state.status == "terminal"
+            and authority._released is True
+            and state.authority_refs()
+            == (None, None, None, None, None, None, None)
+        )
+
+    def _helper_stop_release_is_committed_locked(
+        self,
+        snapshot: tuple[
+            _HelperStopAuthorityState,
+            dict[str, object],
+            tuple[object, ...],
+            str,
+        ]
+        | None,
+        *,
+        credential_permit_id: UUID,
+    ) -> bool:
+        """Independently observe the exact release selected by a transaction."""
+
+        if snapshot is None:
+            return self._helper_stop_is_terminal_for_credential_locked(
+                credential_permit_id
+            )
+        state, _, _, _ = snapshot
+        return (
+            self._helper_stop_authorities.get(state.authority_id) is state
+            and state.credential_permit_id == credential_permit_id
+            and self._helper_stop_is_terminal_for_credential_locked(
+                credential_permit_id
+            )
+        )
+
     def _commit_credential_terminal_locked(
         self,
         *,
@@ -1864,7 +3048,18 @@ class AttemptGate:
         old_claim_id = state.resolver_claim_id
         old_publication_id = state.resolved_publication_id
         old_recovery_refs = state.recovery_refs()
+        helper_stop_snapshot = self._helper_stop_release_snapshot_locked(
+            permit.permit_id
+        )
         try:
+            self._release_helper_stop_locked(helper_stop_snapshot)
+            if not self._helper_stop_release_is_committed_locked(
+                helper_stop_snapshot,
+                credential_permit_id=permit.permit_id,
+            ):
+                raise _attempt_error(
+                    "helper stop authority terminal release 未提交。"
+                )
             permit._release_authority_refs(
                 _authority=_PERMIT_RELEASE_AUTHORITY,
             )
@@ -1890,6 +3085,7 @@ class AttemptGate:
             state.resolved_publication_id = old_publication_id
             state.restore_recovery_refs(old_recovery_refs)
             self._active_by_session[permit.session_id] = active_id
+            self._restore_helper_stop_locked(helper_stop_snapshot)
             raise
 
     def _commit_recovered_credential_terminal_locked(
@@ -1912,7 +3108,18 @@ class AttemptGate:
         old_claim_id = state.resolver_claim_id
         old_publication_id = state.resolved_publication_id
         old_recovery_refs = state.recovery_refs()
+        helper_stop_snapshot = self._helper_stop_release_snapshot_locked(
+            state.permit_id
+        )
         try:
+            self._release_helper_stop_locked(helper_stop_snapshot)
+            if not self._helper_stop_release_is_committed_locked(
+                helper_stop_snapshot,
+                credential_permit_id=state.permit_id,
+            ):
+                raise _attempt_error(
+                    "helper stop authority terminal release 未提交。"
+                )
             permit._release_authority_refs(
                 _authority=_PERMIT_RELEASE_AUTHORITY,
             )
@@ -1938,6 +3145,7 @@ class AttemptGate:
             state.resolved_publication_id = old_publication_id
             state.restore_recovery_refs(old_recovery_refs)
             self._active_by_session[state.session_id] = active_id
+            self._restore_helper_stop_locked(helper_stop_snapshot)
             raise
 
     def _recover_resolved_credential_for_cleanup(
@@ -2178,7 +3386,18 @@ class AttemptGate:
         )
         old_recovery_refs = state.recovery_refs()
         old_credential_recovery_refs = credential_state.recovery_refs()
+        helper_stop_snapshot = self._helper_stop_release_snapshot_locked(
+            permit.credential_permit_id
+        )
         try:
+            self._release_helper_stop_locked(helper_stop_snapshot)
+            if not self._helper_stop_release_is_committed_locked(
+                helper_stop_snapshot,
+                credential_permit_id=permit.credential_permit_id,
+            ):
+                raise _attempt_error(
+                    "helper stop authority terminal release 未提交。"
+                )
             credential._release_authority_refs(
                 _authority=_PERMIT_RELEASE_AUTHORITY,
             )
@@ -2231,6 +3450,7 @@ class AttemptGate:
                 old_credential_recovery_refs
             )
             self._active_by_session[permit.session_id] = active_id
+            self._restore_helper_stop_locked(helper_stop_snapshot)
             raise
 
     def _require_credential_state_locked(
@@ -2497,6 +3717,11 @@ class AttemptGate:
                 or candidate_state.terminal_guard_digest is not None
                 or candidate_state.dns_start_id is not None
                 or candidate_state.credential_borrow_id is not None
+                or candidate_state.resolver_completion_status != "uncommitted"
+                or not self._resolver_completion_proof_is_well_formed(
+                    candidate_state,
+                    allow_committing=False,
+                )
                 or type(candidate) is not AttemptPermit
                 or candidate_state.credential_permit is not credential_permit
                 or candidate_state.credential_permit_id
@@ -2543,7 +3768,18 @@ class AttemptGate:
         old_publication_id = credential_state.resolved_publication_id
         old_recovery_refs = state.recovery_refs()
         old_credential_recovery_refs = credential_state.recovery_refs()
+        helper_stop_snapshot = self._helper_stop_release_snapshot_locked(
+            state.credential_permit_id
+        )
         try:
+            self._release_helper_stop_locked(helper_stop_snapshot)
+            if not self._helper_stop_release_is_committed_locked(
+                helper_stop_snapshot,
+                credential_permit_id=state.credential_permit_id,
+            ):
+                raise _attempt_error(
+                    "helper stop authority terminal release 未提交。"
+                )
             credential._release_authority_refs(
                 _authority=_PERMIT_RELEASE_AUTHORITY,
             )
@@ -2594,6 +3830,7 @@ class AttemptGate:
                 old_credential_recovery_refs
             )
             self._active_by_session[state.session_id] = active_id
+            self._restore_helper_stop_locked(helper_stop_snapshot)
             raise
 
     def _abandon_recovered_attempt_for_cleanup(
@@ -2614,6 +3851,11 @@ class AttemptGate:
                 or state.terminal_guard_digest is not None
                 or state.dns_start_id is not None
                 or state.credential_borrow_id is not None
+                or state.resolver_completion_status != "uncommitted"
+                or not self._resolver_completion_proof_is_well_formed(
+                    state,
+                    allow_committing=False,
+                )
             ):
                 raise _attempt_error("attempt cleanup recovery 状态无效。")
             state.status = "abandoning"
@@ -2725,6 +3967,11 @@ class AttemptGate:
                     or state.terminal_guard_digest is not None
                     or state.dns_start_id is not None
                     or state.credential_borrow_id is not None
+                    or state.resolver_completion_status != "uncommitted"
+                    or not self._resolver_completion_proof_is_well_formed(
+                        state,
+                        allow_committing=False,
+                    )
                 ):
                     return False
                 cleanup_kind = "abandon"
@@ -2733,6 +3980,10 @@ class AttemptGate:
                     state.status not in ("io_claimed", "wire_committed")
                     or state.transport_claim_id != claim_id
                     or state.credential_borrow_id is not None
+                    or not self._resolver_completion_proof_is_well_formed(
+                        state,
+                        allow_committing=False,
+                    )
                 ):
                     return False
                 if state.terminal_guard_id is None:
@@ -2758,7 +4009,13 @@ class AttemptGate:
                 pass
         else:
             with self._lock:
-                if state.status not in ("io_claimed", "wire_committed"):
+                if (
+                    state.status not in ("io_claimed", "wire_committed")
+                    or not self._resolver_completion_proof_is_well_formed(
+                        state,
+                        allow_committing=False,
+                    )
+                ):
                     return state.status in ("finished", "abandoned")
                 previous_status = state.status
                 state.status = "finishing"
@@ -2990,6 +4247,9 @@ class AttemptGate:
                     not in self._active_by_session
                     and credential_state.permit_id
                     not in self._active_by_session.values()
+                    and self._helper_stop_is_terminal_for_credential_locked(
+                        credential_state.permit_id
+                    )
                 )
                 return (
                     "absent"
@@ -3037,6 +4297,10 @@ class AttemptGate:
                 and attempt_state.terminal_guard_digest is None
                 and attempt_state.dns_start_id is None
                 and attempt_state.credential_borrow_id is None
+                and self._resolver_completion_proof_is_well_formed(
+                    attempt_state,
+                    allow_committing=False,
+                )
                 and attempt_state.recovery_refs()
                 == (None, None, None, None)
                 and self._attempt_permit_refs_are_released(
@@ -3053,6 +4317,9 @@ class AttemptGate:
                 not in self._active_by_session
                 and credential_state.permit_id
                 not in self._active_by_session.values()
+                and self._helper_stop_is_terminal_for_credential_locked(
+                    credential_state.permit_id
+                )
             )
             if terminal:
                 return "terminal"
@@ -3076,6 +4343,10 @@ class AttemptGate:
                 and attempt_state.context is not None
                 and attempt_state.context_ledger is not None
                 and attempt_state.reservation is not None
+                and self._resolver_completion_proof_is_well_formed(
+                    attempt_state,
+                    allow_committing=False,
+                )
                 and credential_state.status == "consumed"
                 and credential_state.resolver_claim_id is None
                 and type(credential_state.resolved_publication_id) is UUID
@@ -3114,6 +4385,36 @@ class AttemptGate:
             attempt=attempt,
             _authority=_authority,
         ) == "terminal"
+
+    @staticmethod
+    def _resolver_completion_proof_is_well_formed(
+        state: _AttemptPermitState,
+        *,
+        allow_committing: bool,
+    ) -> bool:
+        status = state.resolver_completion_status
+        proof = (
+            state.resolver_completion_authority_id,
+            state.resolver_completion_claim_id,
+            state.resolver_completion_guard_id,
+            state.resolver_completion_guard_digest,
+            state.resolver_completion_start_id,
+            state.resolver_completion_receipt_digest,
+        )
+        if status == "uncommitted":
+            return all(value is None for value in proof)
+        if status == "committing":
+            return allow_committing and all(value is None for value in proof)
+        if status != "committed":
+            return False
+        return (
+            type(proof[0]) is UUID
+            and type(proof[1]) is UUID
+            and type(proof[2]) is UUID
+            and type(proof[3]) is Digest256
+            and type(proof[4]) is UUID
+            and type(proof[5]) is Digest256
+        )
 
     def _lookup_attempt_state_locked(
         self,
@@ -3455,6 +4756,11 @@ class AttemptGate:
                 or state.terminal_guard_digest is not None
                 or state.dns_start_id is not None
                 or state.credential_borrow_id is not None
+                or state.resolver_completion_status != "uncommitted"
+                or not self._resolver_completion_proof_is_well_formed(
+                    state,
+                    allow_committing=False,
+                )
             ):
                 raise _attempt_error("attempt 当前不能绑定 terminal guard。")
             self._require_transport_owner_locked(state, claim_id)
@@ -3671,6 +4977,355 @@ class AttemptGate:
                 and state.dns_start_id == start_id
             )
 
+    def _commit_resolver_completion(
+        self,
+        authority: HelperStopAuthority,
+        permit: AttemptPermit,
+        *,
+        claim_id: UUID,
+        guard_id: UUID,
+        guard_digest: Digest256,
+        start_id: UUID,
+        result_receipt_digest: Digest256,
+        _authority: object | None = None,
+    ) -> None:
+        """Linearize one exact resolver result under every live authority.
+
+        Resolver completion is independent from the later provider wire-start
+        state.  The attempt therefore remains ``io_claimed`` after this commit.
+        """
+
+        if _authority is not _TRANSPORT_ATTEMPT_AUTHORITY:
+            raise TypeError("resolver completion requires trusted transport")
+        if (
+            type(authority) is not HelperStopAuthority
+            or type(permit) is not AttemptPermit
+            or type(claim_id) is not UUID
+            or type(guard_id) is not UUID
+            or type(guard_digest) is not Digest256
+            or type(start_id) is not UUID
+            or type(result_receipt_digest) is not Digest256
+        ):
+            raise _attempt_error("resolver completion proof 无效。")
+        with self._lock:
+            stop_state = self._require_helper_stop_state_locked(authority)
+            attempt_state = self._lookup_attempt_state_locked(permit)
+            credential = self._require_attempt_credential_proof_locked(permit)
+            if (
+                stop_state.credential_permit is not credential
+                or stop_state.credential_permit_id
+                != permit.credential_permit_id
+                or stop_state.context_id != permit.context_id
+                or stop_state.session_id != permit.session_id
+                or attempt_state.status != "io_claimed"
+                or attempt_state.transport_claim_id != claim_id
+                or attempt_state.terminal_guard_id != guard_id
+                or attempt_state.terminal_guard_digest != guard_digest
+                or attempt_state.dns_start_id != start_id
+                or attempt_state.credential_borrow_id is not None
+                or attempt_state.resolver_completion_status != "uncommitted"
+                or attempt_state.resolver_completion_authority_id is not None
+                or attempt_state.resolver_completion_claim_id is not None
+                or attempt_state.resolver_completion_guard_id is not None
+                or attempt_state.resolver_completion_guard_digest is not None
+                or attempt_state.resolver_completion_start_id is not None
+                or attempt_state.resolver_completion_receipt_digest is not None
+                or stop_state.completion_attempt_id is not None
+                or stop_state.completion_receipt_digest is not None
+            ):
+                raise _attempt_error("resolver completion owner 或状态无效。")
+            bindings = (
+                stop_state.credential_permit._planned,
+                stop_state.credential_permit._invocation,
+                stop_state.credential_permit._prepared,
+                stop_state.credential_permit._authorization,
+                stop_state.credential_permit._consent_ledger,
+                stop_state.session,
+                stop_state.credential_permit._approval_ledger,
+                stop_state.credential_permit._session_ledger,
+                stop_state.credential_permit._authority_ledger,
+                stop_state.context,
+                stop_state.context_ledger,
+            )
+            attempt_state.resolver_completion_status = "committing"
+        (
+            planned,
+            invocation,
+            prepared,
+            authorization,
+            consent_ledger,
+            session,
+            approval_ledger,
+            session_ledger,
+            authority_ledger,
+            context,
+            context_ledger,
+        ) = bindings
+
+        def commit(
+            stage: ExecutionPlanStage,
+            operation: ExecutionPlanNetworkOperation,
+            sample: ClockSample,
+            effective_deadline_ns: int,
+        ) -> None:
+            del stage, operation
+            if (
+                sample.wall_time < session.issued_at
+                or sample.wall_time >= session.valid_until
+            ):
+                raise _attempt_error("发送会话已经过期或尚未生效。")
+            with self._lock:
+                current_stop = self._require_helper_stop_state_locked(
+                    authority
+                )
+                current_attempt = self._lookup_attempt_state_locked(permit)
+                if (
+                    current_stop is not stop_state
+                    or current_attempt is not attempt_state
+                    or effective_deadline_ns
+                    != current_stop.effective_deadline_ns
+                    or current_attempt.status != "io_claimed"
+                    or current_attempt.transport_claim_id != claim_id
+                    or current_attempt.terminal_guard_id != guard_id
+                    or current_attempt.terminal_guard_digest != guard_digest
+                    or current_attempt.dns_start_id != start_id
+                    or current_attempt.credential_borrow_id is not None
+                    or current_attempt.resolver_completion_status
+                    != "committing"
+                    or current_attempt.resolver_completion_authority_id
+                    is not None
+                    or current_attempt.resolver_completion_claim_id is not None
+                    or current_attempt.resolver_completion_guard_id is not None
+                    or current_attempt.resolver_completion_guard_digest
+                    is not None
+                    or current_attempt.resolver_completion_start_id is not None
+                    or current_attempt.resolver_completion_receipt_digest
+                    is not None
+                    or current_stop.completion_attempt_id is not None
+                    or current_stop.completion_receipt_digest is not None
+                ):
+                    raise _attempt_error(
+                        "resolver completion transaction 状态已变化。"
+                    )
+                self._require_attempt_credential_proof_locked(permit)
+                current_attempt.resolver_completion_authority_id = (
+                    authority.authority_id
+                )
+                current_attempt.resolver_completion_claim_id = claim_id
+                current_attempt.resolver_completion_guard_id = guard_id
+                current_attempt.resolver_completion_guard_digest = guard_digest
+                current_attempt.resolver_completion_start_id = start_id
+                current_attempt.resolver_completion_receipt_digest = (
+                    result_receipt_digest
+                )
+                current_stop.completion_attempt_id = permit.attempt_permit_id
+                current_stop.completion_receipt_digest = result_receipt_digest
+                current_attempt.resolver_completion_status = "committed"
+
+        try:
+            self._run_authority_path(
+                planned=planned,
+                invocation=invocation,
+                prepared=prepared,
+                authorization=authorization,
+                consent_ledger=consent_ledger,
+                session=session,
+                approval_ledger=approval_ledger,
+                session_ledger=session_ledger,
+                authority_ledger=authority_ledger,
+                context=context,
+                context_ledger=context_ledger,
+                final_action=commit,
+                include_effective_deadline=True,
+            )
+            with self._lock:
+                if not self._resolver_completion_is_committed_locked(
+                    authority,
+                    permit,
+                    claim_id=claim_id,
+                    guard_id=guard_id,
+                    guard_digest=guard_digest,
+                    start_id=start_id,
+                    result_receipt_digest=result_receipt_digest,
+                ):
+                    raise _attempt_error(
+                        "resolver completion transaction 未提交。"
+                    )
+        except BaseException:
+            with self._lock:
+                if (
+                    self._attempt_permits.get(attempt_state.attempt_permit_id)
+                    is attempt_state
+                    and attempt_state.resolver_completion_status == "committing"
+                ):
+                    attempt_state.resolver_completion_status = "uncommitted"
+                    attempt_state.resolver_completion_authority_id = None
+                    attempt_state.resolver_completion_claim_id = None
+                    attempt_state.resolver_completion_guard_id = None
+                    attempt_state.resolver_completion_guard_digest = None
+                    attempt_state.resolver_completion_start_id = None
+                    attempt_state.resolver_completion_receipt_digest = None
+            raise
+
+    def _resolver_completion_is_committed_locked(
+        self,
+        authority: HelperStopAuthority,
+        permit: AttemptPermit,
+        *,
+        claim_id: UUID,
+        guard_id: UUID,
+        guard_digest: Digest256,
+        start_id: UUID,
+        result_receipt_digest: Digest256,
+    ) -> bool:
+        try:
+            stop_state = self._require_helper_stop_state_locked(
+                authority,
+                require_active=not authority._released,
+            )
+            attempt_state = self._lookup_attempt_state_locked(permit)
+        except (TypeError, ValueError, AttributeError, EndpointPolicyError):
+            return False
+        return (
+            attempt_state.resolver_completion_status == "committed"
+            and attempt_state.resolver_completion_authority_id
+            == authority.authority_id
+            and attempt_state.resolver_completion_claim_id == claim_id
+            and attempt_state.resolver_completion_guard_id == guard_id
+            and attempt_state.resolver_completion_guard_digest == guard_digest
+            and attempt_state.resolver_completion_start_id == start_id
+            and attempt_state.resolver_completion_receipt_digest
+            == result_receipt_digest
+            and stop_state.completion_attempt_id == permit.attempt_permit_id
+            and stop_state.completion_receipt_digest == result_receipt_digest
+        )
+
+    def _resolver_completion_is_committed(
+        self,
+        authority: HelperStopAuthority,
+        permit: AttemptPermit,
+        *,
+        claim_id: UUID,
+        guard_id: UUID,
+        guard_digest: Digest256,
+        start_id: UUID,
+        result_receipt_digest: Digest256,
+        _authority: object | None = None,
+    ) -> bool:
+        """Observe an exact completion, including a commit-then-raise outcome."""
+
+        if _authority is not _TRANSPORT_ATTEMPT_AUTHORITY:
+            raise TypeError("resolver completion observation requires transport")
+        if (
+            type(authority) is not HelperStopAuthority
+            or type(permit) is not AttemptPermit
+            or type(claim_id) is not UUID
+            or type(guard_id) is not UUID
+            or type(guard_digest) is not Digest256
+            or type(start_id) is not UUID
+            or type(result_receipt_digest) is not Digest256
+        ):
+            return False
+        with self._lock:
+            return self._resolver_completion_is_committed_locked(
+                authority,
+                permit,
+                claim_id=claim_id,
+                guard_id=guard_id,
+                guard_digest=guard_digest,
+                start_id=start_id,
+                result_receipt_digest=result_receipt_digest,
+            )
+
+    def _resolver_completion_is_committed_for_publication(
+        self,
+        permit: AttemptPermit,
+        *,
+        claim_id: UUID,
+        guard_id: UUID,
+        guard_digest: Digest256,
+        start_id: UUID,
+        result_receipt_digest: Digest256,
+        _authority: object | None = None,
+    ) -> bool:
+        """Observe the Gate-owned completion before Resolution publication.
+
+        The address-policy factory does not receive a caller-supplied stop
+        authority.  Resolve it only through the exact committed attempt proof
+        so a direct ``build_resolution_set`` call cannot bypass the
+        cancellation/deadline linearization point.
+        """
+
+        if _authority is not _TRANSPORT_ATTEMPT_AUTHORITY:
+            raise TypeError(
+                "resolver completion publication observation requires transport"
+            )
+        if (
+            type(permit) is not AttemptPermit
+            or type(claim_id) is not UUID
+            or type(guard_id) is not UUID
+            or type(guard_digest) is not Digest256
+            or type(start_id) is not UUID
+            or type(result_receipt_digest) is not Digest256
+        ):
+            return False
+        with self._lock:
+            try:
+                attempt_state = self._lookup_attempt_state_locked(permit)
+            except (TypeError, ValueError, AttributeError, EndpointPolicyError):
+                return False
+            authority_id = attempt_state.resolver_completion_authority_id
+            if type(authority_id) is not UUID:
+                return False
+            stop_state = self._helper_stop_authorities.get(authority_id)
+            if stop_state is None or type(stop_state.authority) is not HelperStopAuthority:
+                return False
+            return self._resolver_completion_is_committed_locked(
+                stop_state.authority,
+                permit,
+                claim_id=claim_id,
+                guard_id=guard_id,
+                guard_digest=guard_digest,
+                start_id=start_id,
+                result_receipt_digest=result_receipt_digest,
+            )
+
+    def _helper_stop_authority_is_released(
+        self,
+        authority: HelperStopAuthority,
+        *,
+        _authority: object | None = None,
+    ) -> bool:
+        """Observe exact terminal release without dereferencing live owners."""
+
+        if _authority is not _TRANSPORT_ATTEMPT_AUTHORITY:
+            raise TypeError("helper stop release observation requires transport")
+        if type(authority) is not HelperStopAuthority:
+            return False
+        with self._lock:
+            try:
+                state = self._require_helper_stop_state_locked(
+                    authority,
+                    require_active=False,
+                )
+            except (TypeError, ValueError, AttributeError, EndpointPolicyError):
+                return False
+            credential_state = self._credential_permits.get(
+                state.credential_permit_id
+            )
+            return (
+                state.status == "terminal"
+                and authority._released is True
+                and state.authority_refs()
+                == (None, None, None, None, None, None, None)
+                and self._helper_stop_is_terminal_for_credential_locked(
+                    state.credential_permit_id
+                )
+                and credential_state is not None
+                and credential_state.status in ("abandoned", "finished")
+                and state.session_id not in self._active_by_session
+            )
+
     def _begin_credential_borrow(
         self,
         permit: AttemptPermit,
@@ -3874,6 +5529,10 @@ class AttemptGate:
             if (
                 state.status not in ("io_claimed", "wire_committed")
                 or state.credential_borrow_id is not None
+                or not self._resolver_completion_proof_is_well_formed(
+                    state,
+                    allow_committing=False,
+                )
             ):
                 raise _attempt_error("attempt permit 尚未由 transport 领取。")
             self._require_transport_owner_locked(state, claim_id)
@@ -3958,6 +5617,9 @@ class AttemptGate:
             return {
                 "credential_permit_count": len(self._credential_permits),
                 "attempt_permit_count": len(self._attempt_permits),
+                "helper_stop_authority_count": len(
+                    self._helper_stop_authorities
+                ),
                 "active_session_count": len(self._active_by_session),
             }
 
@@ -3965,7 +5627,12 @@ class AttemptGate:
 __all__ = [
     "ATTEMPT_PERMIT_SCHEMA_VERSION",
     "CREDENTIAL_RESOLUTION_PERMIT_SCHEMA_VERSION",
+    "HELPER_STOP_AUTHORITY_SCHEMA_VERSION",
+    "HELPER_WAIT_QUANTUM_NS",
+    "HELPER_WAIT_SLICE_SCHEMA_VERSION",
     "AttemptGate",
     "AttemptPermit",
     "CredentialResolutionPermit",
+    "HelperStopAuthority",
+    "HelperWaitSlice",
 ]

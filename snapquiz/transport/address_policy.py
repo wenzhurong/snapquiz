@@ -1194,6 +1194,19 @@ def build_resolution_set(
     failed = False
     result: ResolutionSet | None = None
     try:
+        gate = attempt_permit._attempt_gate
+        if not gate._resolver_completion_is_committed_for_publication(
+            attempt_permit,
+            claim_id=result_receipt.transport_claim_id,
+            guard_id=result_receipt.terminal_guard_id,
+            guard_digest=result_receipt.terminal_guard_digest,
+            start_id=result_receipt.dns_start_id,
+            result_receipt_digest=result_receipt.receipt_digest,
+            _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+        ):
+            raise _TranscriptRejected(
+                "resolver completion proof is not committed"
+            )
         transcript = result_receipt._publication_transcript(
             _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
         )
@@ -1214,7 +1227,6 @@ def build_resolution_set(
         )
         if start_frame_digest(exact_start_frame) != result_receipt.start_frame_digest:
             raise _TranscriptRejected("receipt START frame digest changed")
-        gate = attempt_permit._attempt_gate
         if not gate._dns_start_is_committed(
             attempt_permit,
             claim_id=result_receipt.transport_claim_id,

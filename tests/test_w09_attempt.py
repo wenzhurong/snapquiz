@@ -22,9 +22,12 @@ from snapquiz.privacy.egress import EgressApprovalLedger, EgressGate
 from snapquiz.runtime.attempt import (
     ATTEMPT_PERMIT_SCHEMA_VERSION,
     CREDENTIAL_RESOLUTION_PERMIT_SCHEMA_VERSION,
+    HELPER_WAIT_QUANTUM_NS,
     AttemptGate,
     AttemptPermit,
     CredentialResolutionPermit,
+    HelperStopAuthority,
+    HelperWaitSlice,
     _CREDENTIAL_RESOLVER_AUTHORITY,
     _TRANSPORT_ATTEMPT_AUTHORITY,
     _AttemptPermitState,
@@ -225,6 +228,61 @@ def _recover_active_attempt(
         guard_id=None,
         guard_digest=None,
         _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+    )
+
+
+def _prepare_helper_attempt(runtime, gate: AttemptGate) -> tuple[
+    CredentialResolutionPermit,
+    HelperStopAuthority,
+    AttemptPermit,
+    UUID,
+    UUID,
+    Digest256,
+    UUID,
+]:
+    credential = _authorize(runtime, gate)
+    stop_authority = gate._issue_helper_stop_authority(
+        credential,
+        _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+    )
+    _resolve(gate, credential)
+    handle_id, handle_digest = _handle_proof(credential)
+    attempt = gate.reserve_attempt(
+        credential_permit=credential,
+        credential_handle_id=handle_id,
+        credential_handle_digest=handle_digest,
+    )
+    claim_id = _transport_claim_id(attempt)
+    guard_id, guard_digest = _terminal_guard_proof(attempt)
+    start_id = _dns_start_id(attempt)
+    gate._claim_attempt(
+        attempt,
+        claim_id=claim_id,
+        _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+    )
+    gate._bind_terminal_guard(
+        attempt,
+        claim_id=claim_id,
+        guard_id=guard_id,
+        guard_digest=guard_digest,
+        _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+    )
+    gate._commit_dns_start(
+        attempt,
+        claim_id=claim_id,
+        guard_id=guard_id,
+        guard_digest=guard_digest,
+        start_id=start_id,
+        _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+    )
+    return (
+        credential,
+        stop_authority,
+        attempt,
+        claim_id,
+        guard_id,
+        guard_digest,
+        start_id,
     )
 
 
@@ -1959,6 +2017,571 @@ class W09AttemptGateTest(unittest.TestCase):
             0,
         )
         self.assertTrue(runtime.context_ledger.close(runtime.call_context))
+
+    def test_helper_stop_authority_issues_bounded_factory_only_slices(self):
+        runtime = _make_runtime()
+        gate = AttemptGate()
+        credential = _authorize(runtime, gate)
+        authority = gate._issue_helper_stop_authority(
+            credential,
+            _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+        )
+        self.assertIs(
+            gate._issue_helper_stop_authority(
+                credential,
+                _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+            ),
+            authority,
+        )
+        authority.validate_integrity()
+        self.assertEqual(authority.gate_id, gate._gate_id)
+        self.assertEqual(authority.context_id, runtime.call_context.context_id)
+        self.assertEqual(authority.session_id, runtime.session.session_id)
+        self.assertEqual(
+            authority.runtime_deadline_digest,
+            runtime.call_context.runtime_deadline.deadline_digest,
+        )
+        self.assertEqual(
+            authority.cancellation_token_digest,
+            runtime.call_context.cancellation_token.token_digest,
+        )
+
+        first = authority._checkpoint(
+            "resolver_helper.spawn",
+            _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+        )
+        runtime.clock.advance(milliseconds=1)
+        second = authority._checkpoint(
+            "resolver_helper.ready",
+            _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+        )
+        for wait_slice in (first, second):
+            self.assertIs(type(wait_slice), HelperWaitSlice)
+            wait_slice.validate_integrity()
+            self.assertGreater(wait_slice.max_wait_ns, 0)
+            self.assertLessEqual(wait_slice.max_wait_ns, HELPER_WAIT_QUANTUM_NS)
+            self.assertEqual(
+                wait_slice.effective_deadline_ns,
+                authority.effective_deadline_ns,
+            )
+            self.assertLess(
+                wait_slice.observed_monotonic_ns,
+                wait_slice.effective_deadline_ns,
+            )
+        self.assertEqual((first.sequence, second.sequence), (1, 2))
+        with self.assertRaises(TypeError):
+            HelperStopAuthority(
+                credential_permit=credential,
+                context=runtime.call_context,
+                context_ledger=runtime.context_ledger,
+                session=runtime.session,
+                effective_deadline_ns=authority.effective_deadline_ns,
+                attempt_gate=gate,
+            )
+        with self.assertRaises(TypeError):
+            HelperWaitSlice(
+                stop_authority=authority,
+                sequence=3,
+                phase="resolver_helper.start",
+                effective_deadline_ns=authority.effective_deadline_ns,
+                observed_monotonic_ns=runtime.clock.monotonic_ns,
+            )
+
+        self.assertTrue(gate.abandon_credential_resolution(credential))
+        self.assertTrue(
+            gate._helper_stop_authority_is_released(
+                authority,
+                _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+            )
+        )
+
+    def test_helper_stop_release_noop_rolls_back_terminal_commits(self):
+        with self.subTest(owner="credential"):
+            runtime = _make_runtime()
+            gate = AttemptGate()
+            credential = _authorize(runtime, gate)
+            authority = gate._issue_helper_stop_authority(
+                credential,
+                _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+            )
+
+            with patch.object(
+                AttemptGate,
+                "_release_helper_stop_locked",
+                return_value=None,
+            ):
+                with self.assertRaisesRegex(
+                    EndpointPolicyError,
+                    "terminal release",
+                ):
+                    gate.abandon_credential_resolution(credential)
+
+            credential_state = gate._credential_permits[credential.permit_id]
+            stop_state = gate._helper_stop_authorities[authority.authority_id]
+            self.assertEqual(credential_state.status, "authorized")
+            self.assertEqual(stop_state.status, "active")
+            self.assertFalse(authority._released)
+            self.assertFalse(
+                gate._helper_stop_authority_is_released(
+                    authority,
+                    _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+                )
+            )
+            self.assertEqual(
+                runtime.context_ledger.safe_metadata()[
+                    "active_gate_activity_count"
+                ],
+                1,
+            )
+
+            self.assertTrue(gate.abandon_credential_resolution(credential))
+            self.assertTrue(
+                gate._helper_stop_authority_is_released(
+                    authority,
+                    _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+                )
+            )
+
+        with self.subTest(owner="attempt"):
+            runtime = _make_runtime()
+            gate = AttemptGate()
+            (
+                credential,
+                authority,
+                attempt,
+                claim_id,
+                guard_id,
+                guard_digest,
+                _,
+            ) = _prepare_helper_attempt(runtime, gate)
+
+            with patch.object(
+                AttemptGate,
+                "_release_helper_stop_locked",
+                return_value=None,
+            ):
+                with self.assertRaisesRegex(
+                    EndpointPolicyError,
+                    "terminal release",
+                ):
+                    gate.finish_attempt(
+                        attempt,
+                        claim_id=claim_id,
+                        guard_id=guard_id,
+                        guard_digest=guard_digest,
+                        _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+                    )
+
+            attempt_state = gate._attempt_permits[attempt.attempt_permit_id]
+            credential_state = gate._credential_permits[credential.permit_id]
+            stop_state = gate._helper_stop_authorities[authority.authority_id]
+            self.assertEqual(attempt_state.status, "io_claimed")
+            self.assertEqual(credential_state.status, "consumed")
+            self.assertEqual(stop_state.status, "active")
+            self.assertFalse(authority._released)
+            self.assertFalse(attempt._released)
+            self.assertFalse(credential._released)
+            self.assertEqual(
+                runtime.context_ledger.safe_metadata()[
+                    "in_flight_attempt_count"
+                ],
+                1,
+            )
+
+            self.assertTrue(
+                gate.finish_attempt(
+                    attempt,
+                    claim_id=claim_id,
+                    guard_id=guard_id,
+                    guard_digest=guard_digest,
+                    _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+                )
+            )
+            self.assertTrue(
+                gate._helper_stop_authority_is_released(
+                    authority,
+                    _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+                )
+            )
+
+    def test_helper_checkpoint_rejects_same_phase_stale_slice_alias(self):
+        runtime = _make_runtime()
+        gate = AttemptGate()
+        credential = _authorize(runtime, gate)
+        authority = gate._issue_helper_stop_authority(
+            credential,
+            _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+        )
+        phase = "resolver_helper.ready"
+        first = authority._checkpoint(
+            phase,
+            _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+        )
+        remaining_ns = (
+            authority.effective_deadline_ns - runtime.clock.monotonic_ns
+        )
+        self.assertGreater(remaining_ns, 1_000_000)
+        self.assertEqual(remaining_ns % 1_000_000, 0)
+        runtime.clock.advance(
+            milliseconds=(remaining_ns // 1_000_000) - 1
+        )
+        current_remaining_ns = (
+            authority.effective_deadline_ns - runtime.clock.monotonic_ns
+        )
+        self.assertEqual(current_remaining_ns, 1_000_000)
+        self.assertGreater(first.max_wait_ns, current_remaining_ns)
+
+        with patch.object(
+            AttemptGate,
+            "_run_authority_path",
+            return_value=first,
+        ):
+            with self.assertRaises(EndpointPolicyError):
+                authority._checkpoint(
+                    phase,
+                    _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+                )
+
+        state = gate._helper_stop_authorities[authority.authority_id]
+        self.assertEqual(state.sequence, 1)
+        self.assertIs(state.issued_wait_slice, first)
+        self.assertEqual(state.issued_wait_slice_digest, first.slice_digest)
+
+    def test_helper_checkpoint_rejects_authority_path_noop(self):
+        runtime = _make_runtime()
+        gate = AttemptGate()
+        credential = _authorize(runtime, gate)
+        authority = gate._issue_helper_stop_authority(
+            credential,
+            _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+        )
+
+        with patch.object(
+            AttemptGate,
+            "_run_authority_path",
+            return_value=None,
+        ):
+            with self.assertRaises(EndpointPolicyError):
+                authority._checkpoint(
+                    "resolver_helper.spawn",
+                    _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+                )
+
+        state = gate._helper_stop_authorities[authority.authority_id]
+        self.assertEqual(state.sequence, 0)
+        self.assertIsNone(state.issued_wait_slice)
+        self.assertIsNone(state.issued_wait_slice_digest)
+
+    def test_helper_checkpoint_rejects_return_alias_after_exact_commit(self):
+        runtime = _make_runtime()
+        gate = AttemptGate()
+        credential = _authorize(runtime, gate)
+        authority = gate._issue_helper_stop_authority(
+            credential,
+            _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+        )
+        phase = "resolver_helper.result"
+        first = authority._checkpoint(
+            phase,
+            _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+        )
+        original = AttemptGate._run_authority_path
+        committed: list[HelperWaitSlice] = []
+
+        def return_old_alias(selected_gate, **kwargs):
+            committed.append(original(selected_gate, **kwargs))
+            return first
+
+        with patch.object(
+            AttemptGate,
+            "_run_authority_path",
+            new=return_old_alias,
+        ):
+            with self.assertRaises(EndpointPolicyError):
+                authority._checkpoint(
+                    phase,
+                    _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+                )
+
+        self.assertEqual(len(committed), 1)
+        second = committed[0]
+        state = gate._helper_stop_authorities[authority.authority_id]
+        self.assertEqual(state.sequence, 2)
+        self.assertIs(state.issued_wait_slice, second)
+        self.assertIsNot(second, first)
+        self.assertEqual(second.sequence, 2)
+
+        third = authority._checkpoint(
+            phase,
+            _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+        )
+        self.assertEqual(third.sequence, 3)
+        self.assertIs(state.issued_wait_slice, third)
+
+    def test_helper_checkpoint_is_half_open_and_cancellation_wins_boundary(self):
+        with self.subTest(stop="timeout"):
+            runtime = _make_runtime()
+            gate = AttemptGate()
+            credential = _authorize(runtime, gate)
+            authority = gate._issue_helper_stop_authority(
+                credential,
+                _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+            )
+            remaining_ns = (
+                authority.effective_deadline_ns - runtime.clock.monotonic_ns
+            )
+            self.assertGreater(remaining_ns, 0)
+            self.assertEqual(remaining_ns % 1_000_000, 0)
+            runtime.clock.advance(milliseconds=remaining_ns // 1_000_000)
+            with self.assertRaises(TimeoutError):
+                authority._checkpoint(
+                    "resolver_helper.result",
+                    _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+                )
+
+        with self.subTest(stop="cancel-priority"):
+            runtime = _make_runtime()
+            gate = AttemptGate()
+            credential = _authorize(runtime, gate)
+            authority = gate._issue_helper_stop_authority(
+                credential,
+                _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+            )
+            remaining_ns = (
+                authority.effective_deadline_ns - runtime.clock.monotonic_ns
+            )
+            runtime.clock.advance(milliseconds=remaining_ns // 1_000_000)
+            self.assertTrue(
+                runtime.cancellation_source.cancel(
+                    reason=CancellationReason.USER_REQUEST
+                )
+            )
+            with self.assertRaises(CancelledError):
+                authority._checkpoint(
+                    "resolver_helper.result",
+                    _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+                )
+
+    def test_resolver_completion_is_independent_exact_and_releases_refs(self):
+        runtime = _make_runtime()
+        gate = AttemptGate()
+        (
+            credential,
+            authority,
+            attempt,
+            claim_id,
+            guard_id,
+            guard_digest,
+            start_id,
+        ) = _prepare_helper_attempt(runtime, gate)
+        receipt_digest = digest256(
+            "TestResolverResultReceipt",
+            "snapquiz.test-resolver-result-receipt.v1",
+            {
+                "attempt_permit_id": attempt.attempt_permit_id,
+                "authority_id": authority.authority_id,
+            },
+        )
+
+        gate._commit_resolver_completion(
+            authority,
+            attempt,
+            claim_id=claim_id,
+            guard_id=guard_id,
+            guard_digest=guard_digest,
+            start_id=start_id,
+            result_receipt_digest=receipt_digest,
+            _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+        )
+        state = gate._attempt_permits[attempt.attempt_permit_id]
+        self.assertEqual(state.status, "io_claimed")
+        self.assertEqual(state.resolver_completion_status, "committed")
+        self.assertTrue(
+            gate._resolver_completion_is_committed(
+                authority,
+                attempt,
+                claim_id=claim_id,
+                guard_id=guard_id,
+                guard_digest=guard_digest,
+                start_id=start_id,
+                result_receipt_digest=receipt_digest,
+                _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+            )
+        )
+        self.assertFalse(
+            gate._resolver_completion_is_committed(
+                authority,
+                attempt,
+                claim_id=claim_id,
+                guard_id=guard_id,
+                guard_digest=guard_digest,
+                start_id=start_id,
+                result_receipt_digest=Digest256("0" * 64),
+                _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+            )
+        )
+        with self.assertRaises(EndpointPolicyError):
+            gate._commit_resolver_completion(
+                authority,
+                attempt,
+                claim_id=claim_id,
+                guard_id=guard_id,
+                guard_digest=guard_digest,
+                start_id=start_id,
+                result_receipt_digest=receipt_digest,
+                _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+            )
+
+        self.assertTrue(
+            gate.finish_attempt(
+                attempt,
+                claim_id=claim_id,
+                guard_id=guard_id,
+                guard_digest=guard_digest,
+                _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+            )
+        )
+        self.assertTrue(authority._released)
+        self.assertEqual(
+            (
+                authority._attempt_gate,
+                authority._credential_permit,
+                authority._context,
+                authority._context_ledger,
+                authority._session,
+                authority._runtime_deadline,
+                authority._cancellation_token,
+            ),
+            (None, None, None, None, None, None, None),
+        )
+        authority.validate_integrity()
+        self.assertTrue(
+            gate._helper_stop_authority_is_released(
+                authority,
+                _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+            )
+        )
+        self.assertTrue(
+            gate._resolver_completion_is_committed(
+                authority,
+                attempt,
+                claim_id=claim_id,
+                guard_id=guard_id,
+                guard_digest=guard_digest,
+                start_id=start_id,
+                result_receipt_digest=receipt_digest,
+                _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+            )
+        )
+        with self.assertRaises(EndpointPolicyError):
+            authority._checkpoint(
+                "resolver_helper.result_close",
+                _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+            )
+        self.assertTrue(credential._released)
+
+    def test_resolver_completion_distinguishes_precommit_and_postcommit_faults(self):
+        with self.subTest(fault="precommit"):
+            runtime = _make_runtime()
+            gate = AttemptGate()
+            (
+                _,
+                authority,
+                attempt,
+                claim_id,
+                guard_id,
+                guard_digest,
+                start_id,
+            ) = _prepare_helper_attempt(runtime, gate)
+            receipt_digest = digest256(
+                "TestResolverResultReceipt",
+                "snapquiz.test-resolver-result-receipt.v1",
+                {"attempt_permit_id": attempt.attempt_permit_id},
+            )
+            with patch.object(AttemptGate, "_run_authority_path", return_value=None):
+                with self.assertRaises(EndpointPolicyError):
+                    gate._commit_resolver_completion(
+                        authority,
+                        attempt,
+                        claim_id=claim_id,
+                        guard_id=guard_id,
+                        guard_digest=guard_digest,
+                        start_id=start_id,
+                        result_receipt_digest=receipt_digest,
+                        _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+                    )
+            state = gate._attempt_permits[attempt.attempt_permit_id]
+            self.assertEqual(state.resolver_completion_status, "uncommitted")
+            self.assertFalse(
+                gate._resolver_completion_is_committed(
+                    authority,
+                    attempt,
+                    claim_id=claim_id,
+                    guard_id=guard_id,
+                    guard_digest=guard_digest,
+                    start_id=start_id,
+                    result_receipt_digest=receipt_digest,
+                    _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+                )
+            )
+
+        with self.subTest(fault="postcommit"):
+            runtime = _make_runtime()
+            gate = AttemptGate()
+            (
+                _,
+                authority,
+                attempt,
+                claim_id,
+                guard_id,
+                guard_digest,
+                start_id,
+            ) = _prepare_helper_attempt(runtime, gate)
+            receipt_digest = digest256(
+                "TestResolverResultReceipt",
+                "snapquiz.test-resolver-result-receipt.v1",
+                {"attempt_permit_id": attempt.attempt_permit_id},
+            )
+            original = AttemptGate._run_authority_path
+
+            def raise_after_commit(selected_gate, **kwargs):
+                original(selected_gate, **kwargs)
+                raise RuntimeError("injected completion postcommit failure")
+
+            with patch.object(
+                AttemptGate,
+                "_run_authority_path",
+                new=raise_after_commit,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "postcommit"):
+                    gate._commit_resolver_completion(
+                        authority,
+                        attempt,
+                        claim_id=claim_id,
+                        guard_id=guard_id,
+                        guard_digest=guard_digest,
+                        start_id=start_id,
+                        result_receipt_digest=receipt_digest,
+                        _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+                    )
+            self.assertTrue(
+                gate._resolver_completion_is_committed(
+                    authority,
+                    attempt,
+                    claim_id=claim_id,
+                    guard_id=guard_id,
+                    guard_digest=guard_digest,
+                    start_id=start_id,
+                    result_receipt_digest=receipt_digest,
+                    _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+                )
+            )
+            self.assertEqual(
+                gate._attempt_permits[
+                    attempt.attempt_permit_id
+                ].resolver_completion_status,
+                "committed",
+            )
 
 
 if __name__ == "__main__":

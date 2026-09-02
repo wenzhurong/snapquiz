@@ -14,13 +14,20 @@ from uuid import UUID
 
 from snapquiz.config.profiles import GLM_NETWORK_POLICY_VERSION
 from snapquiz.domain.digest import canonical_json_bytes, digest256
-from snapquiz.domain.errors import ConfigError, EndpointPolicyError
+from snapquiz.domain.errors import (
+    CancelledError,
+    ConfigError,
+    EndpointPolicyError,
+    TimeoutError,
+)
 from snapquiz.privacy.egress import EgressApprovalLedger, EgressGate
 from snapquiz.runtime.attempt import (
+    HELPER_WAIT_QUANTUM_NS,
     AttemptGate,
+    HelperStopAuthority,
     _TRANSPORT_ATTEMPT_AUTHORITY,
 )
-from snapquiz.runtime.context import CallContextLedger
+from snapquiz.runtime.context import CallContextLedger, CancellationReason
 import snapquiz.transport.resolver as resolver_module
 import snapquiz.transport.http as http_module
 from snapquiz.transport.address_policy import (
@@ -36,6 +43,8 @@ from snapquiz.transport.http import (
     issue_resolver_cleanup_ticket,
 )
 from snapquiz.transport.resolver import (
+    COMPLETE,
+    PENDING,
     READY_FRAME,
     AttemptTerminalGuard,
     PreAttemptResolverGuard,
@@ -122,8 +131,10 @@ class _FakeKernel:
         self.result_address = result_address
         self.cleanup_fault = cleanup_fault
         self.close_fault = close_fault
+        self.wait_limits: list[tuple[str, int]] = []
 
-    def read_stdout(self, max_bytes: int) -> bytes:
+    def read_stdout(self, max_bytes: int, *, max_wait_ns: int) -> bytes:
+        self.wait_limits.append(("read_stdout", max_wait_ns))
         if not self.writes:
             self.events.append("ready_read")
         elif self._chunks:
@@ -138,7 +149,8 @@ class _FakeKernel:
         self._chunks.insert(0, selected[max_bytes:])
         return selected[:max_bytes]
 
-    def write_stdin(self, frame: bytes) -> None:
+    def write_stdin(self, frame: bytes, *, max_wait_ns: int):
+        self.wait_limits.append(("write_stdin", max_wait_ns))
         self.events.append("start_write")
         self.writes.append(frame)
         start = json.loads(frame)
@@ -150,20 +162,26 @@ class _FakeKernel:
             )
             + b"\n"
         )
+        return COMPLETE
 
-    def terminate(self) -> None:
+    def terminate(self, *, max_wait_ns: int):
+        self.wait_limits.append(("terminate", max_wait_ns))
         self.events.append("terminate")
         if self.cleanup_fault is not None:
             raise self.cleanup_fault
+        return COMPLETE
 
-    def reap(self) -> int:
+    def reap(self, *, max_wait_ns: int) -> int:
+        self.wait_limits.append(("reap", max_wait_ns))
         self.events.append("reap")
         return 0
 
-    def close_pipes(self) -> None:
+    def close_pipes(self, *, max_wait_ns: int):
+        self.wait_limits.append(("close_pipes", max_wait_ns))
         self.events.append("close_pipes")
         if self.close_fault is not None:
             raise self.close_fault
+        return COMPLETE
 
 
 class _FakeSpawner:
@@ -171,8 +189,10 @@ class _FakeSpawner:
         self.kernel = kernel
         self.events = events
         self.requests = []
+        self.wait_limits: list[int] = []
 
-    def spawn(self, request, *, publication):
+    def spawn(self, request, *, publication, max_wait_ns: int):
+        self.wait_limits.append(max_wait_ns)
         self.events.append("spawn")
         self.requests.append(request)
         publication.publish(self.kernel)
@@ -281,6 +301,8 @@ def _recompute_capability_digest(capability) -> None:
             transport_claim_id=capability.transport_claim_id,
             dns_start_id=capability.dns_start_id,
             spawn_request_digest=capability.spawn_request_digest,
+            stop_authority_id=capability.stop_authority_id,
+            stop_authority_digest=capability.stop_authority_digest,
         ),
     )
 
@@ -319,7 +341,6 @@ class W09ResolverCoordinatorTest(unittest.TestCase):
         gate,
         credential,
         *,
-        observer=None,
         cleanup_ticket=None,
     ):
         ticket = (
@@ -342,11 +363,24 @@ class W09ResolverCoordinatorTest(unittest.TestCase):
                 gate=gate,
                 credential_permit=credential,
                 cleanup_ticket=ticket,
-                observer=observer,
             )
 
-    def _reserve_capability(self, launcher, *, reservation_owner=None):
+    def _reserve_capability(
+        self,
+        launcher,
+        *,
+        reservation_owner=None,
+        stop_authority=None,
+    ):
         owner = object() if reservation_owner is None else reservation_owner
+        if stop_authority is None:
+            _, authority_gate, authority_credential = (
+                _make_authorized_credential()
+            )
+            stop_authority = authority_gate._issue_helper_stop_authority(
+                authority_credential,
+                _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+            )
         with patch(
             "snapquiz.transport.resolver.uuid4",
             side_effect=(
@@ -358,6 +392,7 @@ class W09ResolverCoordinatorTest(unittest.TestCase):
         ) as generated:
             capability = launcher._reserve_lifecycle_capability(
                 reservation_owner=owner,
+                stop_authority=stop_authority,
                 _authority=_RESOLVER_LIFECYCLE_AUTHORITY,
             )
         self.assertEqual(generated.call_count, 4)
@@ -415,6 +450,17 @@ class W09ResolverCoordinatorTest(unittest.TestCase):
         self.assertEqual(len(kernel.writes), 1)
         start = json.loads(kernel.writes[0])
         capability = prepared._terminal_guard._capability
+        stop_authority = capability._stop_authority
+        self.assertIs(type(stop_authority), HelperStopAuthority)
+        self.assertIs(stop_authority._attempt_gate, gate)
+        self.assertEqual(
+            capability.stop_authority_id,
+            stop_authority.authority_id,
+        )
+        self.assertEqual(
+            capability.stop_authority_digest,
+            stop_authority.authority_digest,
+        )
         self.assertEqual(capability.publication_id, READY_PUBLICATION_ID)
         self.assertEqual(capability.lifecycle_id, LIFECYCLE_ID)
         self.assertEqual(capability.transport_claim_id, TRANSPORT_CLAIM_ID)
@@ -451,6 +497,32 @@ class W09ResolverCoordinatorTest(unittest.TestCase):
         self.assertEqual(prepared.result_receipt.child_exit_status, 0)
         self.assertTrue(prepared.result_receipt.helper_pipes_closed)
         self.assertEqual(_consumed_budgets(runtime), (1, 1, 1))
+        self.assertTrue(spawner.wait_limits)
+        self.assertTrue(kernel.wait_limits)
+        self.assertTrue(
+            all(
+                0 < value <= HELPER_WAIT_QUANTUM_NS
+                for value in spawner.wait_limits
+            )
+        )
+        self.assertTrue(
+            all(
+                0 < value <= HELPER_WAIT_QUANTUM_NS
+                for _, value in kernel.wait_limits
+            )
+        )
+        self.assertTrue(
+            gate._resolver_completion_is_committed(
+                stop_authority,
+                prepared.attempt_permit,
+                claim_id=prepared.transport_claim_id,
+                guard_id=prepared.terminal_guard_id,
+                guard_digest=prepared.terminal_guard_digest,
+                start_id=prepared.dns_start_id,
+                result_receipt_digest=prepared.result_receipt.receipt_digest,
+                _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+            )
+        )
 
         self.assertTrue(prepared.close())
         self.assertFalse(prepared.close())
@@ -462,6 +534,12 @@ class W09ResolverCoordinatorTest(unittest.TestCase):
             0,
         )
         self.assertEqual(_consumed_budgets(runtime), (1, 1, 1))
+        self.assertTrue(
+            gate._helper_stop_authority_is_released(
+                stop_authority,
+                _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+            )
+        )
 
     def test_public_signature_rejects_caller_generated_role_ids_before_spawn(self):
         _, gate, credential = _make_authorized_credential()
@@ -470,6 +548,10 @@ class W09ResolverCoordinatorTest(unittest.TestCase):
         self.assertNotIn("lifecycle_id", parameters)
         self.assertNotIn("transport_claim_id", parameters)
         self.assertNotIn("dns_start_id", parameters)
+        self.assertNotIn("stop_authority", parameters)
+        self.assertNotIn("deadline", parameters)
+        self.assertNotIn("cancellation_token", parameters)
+        self.assertNotIn("now", parameters)
 
         try:
             with _poison_real_io(), self.assertRaises(TypeError):
@@ -489,6 +571,317 @@ class W09ResolverCoordinatorTest(unittest.TestCase):
             self.assertEqual(launcher._ready_publications, {})
         finally:
             gate.abandon_credential_resolution(credential)
+
+    def test_stop_before_helper_reservation_is_zero_io_and_cancel_wins_deadline(self):
+        cases = (
+            ("cancel", CancelledError),
+            ("deadline", TimeoutError),
+            ("cancel_at_deadline", CancelledError),
+        )
+        for mode, expected_error in cases:
+            with self.subTest(mode=mode):
+                runtime, gate, credential = _make_authorized_credential()
+                launcher, resolver, source, spawner, _, events = _components()
+                ticket = issue_resolver_cleanup_ticket()
+                if mode in ("deadline", "cancel_at_deadline"):
+                    runtime.clock.advance(milliseconds=25_000)
+                if mode in ("cancel", "cancel_at_deadline"):
+                    self.assertTrue(
+                        runtime.cancellation_source.cancel(
+                            reason=CancellationReason.USER_REQUEST,
+                        )
+                    )
+
+                with _poison_real_io(), self.assertRaises(expected_error):
+                    self._coordinate(
+                        launcher,
+                        resolver,
+                        gate,
+                        credential,
+                        cleanup_ticket=ticket,
+                    )
+
+                self.assertEqual(spawner.requests, [])
+                self.assertEqual(source.calls, [])
+                self.assertNotIn("spawn", events)
+                self.assertEqual(_consumed_budgets(runtime), (0, 0, 0))
+                self.assertTrue(ticket.is_terminal)
+                self.assertTrue(credential._released)
+
+    def test_cancel_after_ready_poll_cleans_helper_before_secret_or_budget(self):
+        runtime, gate, credential = _make_authorized_credential()
+        launcher, resolver, source, _, kernel, events = _components()
+        ticket = issue_resolver_cleanup_ticket()
+        original_read = kernel.read_stdout
+        cancelled = False
+
+        def cancel_after_ready(max_bytes, *, max_wait_ns):
+            nonlocal cancelled
+            result = original_read(max_bytes, max_wait_ns=max_wait_ns)
+            if not cancelled and not kernel.writes:
+                cancelled = True
+                self.assertTrue(
+                    runtime.cancellation_source.cancel(
+                        reason=CancellationReason.USER_REQUEST,
+                    )
+                )
+            return result
+
+        with patch.object(kernel, "read_stdout", new=cancel_after_ready):
+            with self.assertRaises(CancelledError):
+                self._coordinate(
+                    launcher,
+                    resolver,
+                    gate,
+                    credential,
+                    cleanup_ticket=ticket,
+                )
+
+        self.assertEqual(source.calls, [])
+        self.assertNotIn("credential_read", events)
+        self.assertNotIn("start_write", events)
+        self.assertEqual(_cleanup_counts(kernel), (1, 1, 1))
+        self.assertEqual(_consumed_budgets(runtime), (0, 0, 0))
+        self.assertTrue(ticket.is_terminal)
+        stop = next(iter(gate._helper_stop_authorities.values())).authority
+        self.assertTrue(
+            gate._helper_stop_authority_is_released(
+                stop,
+                _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+            )
+        )
+
+    def test_cancel_after_atomic_start_never_writes_a_second_frame(self):
+        runtime, gate, credential = _make_authorized_credential()
+        launcher, resolver, source, _, kernel, events = _components()
+        ticket = issue_resolver_cleanup_ticket()
+        original_write = kernel.write_stdin
+
+        def cancel_after_write(frame, *, max_wait_ns):
+            result = original_write(frame, max_wait_ns=max_wait_ns)
+            self.assertTrue(
+                runtime.cancellation_source.cancel(
+                    reason=CancellationReason.USER_REQUEST,
+                )
+            )
+            return result
+
+        with patch.object(kernel, "write_stdin", new=cancel_after_write):
+            with self.assertRaises(CancelledError):
+                self._coordinate(
+                    launcher,
+                    resolver,
+                    gate,
+                    credential,
+                    cleanup_ticket=ticket,
+                )
+
+        self.assertEqual(len(source.calls), 1)
+        self.assertTrue(all(value == 0 for value in source.returned[0]))
+        self.assertEqual(len(kernel.writes), 1)
+        self.assertEqual(events.count("start_write"), 1)
+        self.assertNotIn("result_read", events)
+        self.assertEqual(_cleanup_counts(kernel), (1, 1, 1))
+        self.assertEqual(_consumed_budgets(runtime), (1, 1, 1))
+        self.assertTrue(ticket.is_terminal)
+
+    def test_deadline_after_pending_result_cleans_without_refunding_budget(self):
+        runtime, gate, credential = _make_authorized_credential()
+        launcher, resolver, source, _, kernel, events = _components()
+        ticket = issue_resolver_cleanup_ticket()
+        original_read = kernel.read_stdout
+        pending_returned = False
+
+        def expire_on_result(max_bytes, *, max_wait_ns):
+            nonlocal pending_returned
+            if kernel.writes and not pending_returned:
+                pending_returned = True
+                events.append("result_pending")
+                runtime.clock.advance(milliseconds=25_000)
+                return PENDING
+            return original_read(max_bytes, max_wait_ns=max_wait_ns)
+
+        with patch.object(kernel, "read_stdout", new=expire_on_result):
+            with self.assertRaises(TimeoutError):
+                self._coordinate(
+                    launcher,
+                    resolver,
+                    gate,
+                    credential,
+                    cleanup_ticket=ticket,
+                )
+
+        self.assertEqual(len(source.calls), 1)
+        self.assertEqual(len(kernel.writes), 1)
+        self.assertEqual(events.count("result_pending"), 1)
+        self.assertEqual(_cleanup_counts(kernel), (1, 1, 1))
+        self.assertEqual(_consumed_budgets(runtime), (1, 1, 1))
+        self.assertTrue(ticket.is_terminal)
+
+    def test_completion_normal_noop_is_rejected_before_prepared_publication(self):
+        runtime, gate, credential = _make_authorized_credential()
+        launcher, resolver, _, _, kernel, _ = _components()
+        ticket = issue_resolver_cleanup_ticket()
+
+        with (
+            patch.object(
+                AttemptGate,
+                "_commit_resolver_completion",
+                return_value=None,
+            ),
+            patch.object(
+                http_module,
+                "_build_started_resolution",
+                wraps=http_module._build_started_resolution,
+            ) as build_resolution,
+        ):
+            with self.assertRaisesRegex(
+                EndpointPolicyError,
+                "resolver completion claim 未能精确提交",
+            ):
+                self._coordinate(
+                    launcher,
+                    resolver,
+                    gate,
+                    credential,
+                    cleanup_ticket=ticket,
+                )
+
+        build_resolution.assert_not_called()
+        self.assertEqual(_cleanup_counts(kernel), (0, 1, 1))
+        self.assertEqual(_consumed_budgets(runtime), (1, 1, 1))
+        self.assertTrue(ticket.is_terminal)
+
+    def test_stop_before_completion_claim_prevents_resolution_publication(self):
+        runtime, gate, credential = _make_authorized_credential()
+        launcher, resolver, _, _, kernel, _ = _components()
+        ticket = issue_resolver_cleanup_ticket()
+        original_commit = AttemptGate._commit_resolver_completion
+
+        def cancel_then_commit(selected, authority, attempt, **kwargs):
+            self.assertTrue(
+                runtime.cancellation_source.cancel(
+                    reason=CancellationReason.USER_REQUEST,
+                )
+            )
+            return original_commit(selected, authority, attempt, **kwargs)
+
+        with (
+            patch.object(
+                AttemptGate,
+                "_commit_resolver_completion",
+                new=cancel_then_commit,
+            ),
+            patch.object(
+                http_module,
+                "_build_started_resolution",
+                wraps=http_module._build_started_resolution,
+            ) as build_resolution,
+        ):
+            with self.assertRaises(CancelledError):
+                self._coordinate(
+                    launcher,
+                    resolver,
+                    gate,
+                    credential,
+                    cleanup_ticket=ticket,
+                )
+
+        build_resolution.assert_not_called()
+        self.assertEqual(_cleanup_counts(kernel), (0, 1, 1))
+        self.assertEqual(_consumed_budgets(runtime), (1, 1, 1))
+        self.assertTrue(ticket.is_terminal)
+
+    def test_completion_claim_wins_before_later_cancel_and_resolution(self):
+        runtime, gate, credential = _make_authorized_credential()
+        launcher, resolver, _, _, kernel, _ = _components()
+        ticket = issue_resolver_cleanup_ticket()
+        original_build = http_module._build_started_resolution
+        build_calls = 0
+
+        def cancel_then_build(attempt, receipt):
+            nonlocal build_calls
+            build_calls += 1
+            self.assertTrue(
+                runtime.cancellation_source.cancel(
+                    reason=CancellationReason.USER_REQUEST,
+                )
+            )
+            return original_build(attempt, receipt)
+
+        with patch.object(
+            http_module,
+            "_build_started_resolution",
+            new=cancel_then_build,
+        ):
+            prepared = self._coordinate(
+                launcher,
+                resolver,
+                gate,
+                credential,
+                cleanup_ticket=ticket,
+            )
+
+        self.assertEqual(build_calls, 1)
+        self.assertIsNotNone(
+            prepared._terminal_guard._ledger._issued_resolution_snapshot
+        )
+        self.assertEqual(_consumed_budgets(runtime), (1, 1, 1))
+        self.assertTrue(prepared.close())
+        self.assertTrue(ticket.is_terminal)
+        self.assertEqual(_cleanup_counts(kernel), (0, 1, 1))
+
+    def test_completion_postcommit_fault_preserves_primary_and_exact_proof(self):
+        runtime, gate, credential = _make_authorized_credential()
+        launcher, resolver, _, _, kernel, _ = _components()
+        ticket = issue_resolver_cleanup_ticket()
+        primary = RuntimeError("synthetic completion postcommit")
+        original_commit = AttemptGate._commit_resolver_completion
+        captured: list[tuple[object, object, dict[str, object]]] = []
+
+        def commit_then_raise(selected, authority, attempt, **kwargs):
+            original_commit(selected, authority, attempt, **kwargs)
+            captured.append((authority, attempt, dict(kwargs)))
+            raise primary
+
+        with patch.object(
+            AttemptGate,
+            "_commit_resolver_completion",
+            new=commit_then_raise,
+        ):
+            with self.assertRaises(RuntimeError) as raised:
+                self._coordinate(
+                    launcher,
+                    resolver,
+                    gate,
+                    credential,
+                    cleanup_ticket=ticket,
+                )
+
+        self.assertIs(raised.exception, primary)
+        self.assertEqual(len(captured), 1)
+        authority, attempt, kwargs = captured[0]
+        self.assertTrue(
+            gate._resolver_completion_is_committed(
+                authority,
+                attempt,
+                claim_id=kwargs["claim_id"],
+                guard_id=kwargs["guard_id"],
+                guard_digest=kwargs["guard_digest"],
+                start_id=kwargs["start_id"],
+                result_receipt_digest=kwargs["result_receipt_digest"],
+                _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+            )
+        )
+        self.assertTrue(
+            gate._helper_stop_authority_is_released(
+                authority,
+                _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+            )
+        )
+        self.assertEqual(_cleanup_counts(kernel), (0, 1, 1))
+        self.assertEqual(_consumed_budgets(runtime), (1, 1, 1))
+        self.assertTrue(ticket.is_terminal)
 
     def test_result_is_factory_only_noncopyable_and_nonserializable(self):
         _, gate, credential = _make_authorized_credential()
@@ -563,12 +956,12 @@ class W09ResolverCoordinatorTest(unittest.TestCase):
 
         with patch.object(
             AttemptGate,
-            "_run_authority_path",
+            "_claim_credential_resolution",
             return_value=None,
         ):
             with self.assertRaisesRegex(
                 EndpointPolicyError,
-                "credential claim transaction 未提交",
+                "冻结的凭据绑定未通过安全策略",
             ):
                 self._coordinate(launcher, resolver, gate, credential)
 
@@ -909,7 +1302,10 @@ class W09ResolverCoordinatorTest(unittest.TestCase):
         )
         self.assertEqual(len(source.calls), 1)
         self.assertNotIn("start_write", events)
-        self.assertEqual(_cleanup_counts(kernel), (1, 1, 1))
+        # The stop authority can only be issued while the credential permit is
+        # still pre-resolution, so the invalid second coordinate now fails
+        # before reserving or spawning a helper.
+        self.assertEqual(_cleanup_counts(kernel), (0, 0, 0))
         self.assertFalse(
             resolver._recover_published_handle_for_cleanup(
                 credential,
@@ -1046,6 +1442,10 @@ class W09ResolverCoordinatorTest(unittest.TestCase):
         runtime, gate, credential = _make_authorized_credential()
         launcher, resolver, source, spawner, kernel, events = _components()
         other_owner = object()
+        stop_authority = gate._issue_helper_stop_authority(
+            credential,
+            _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+        )
         with patch(
             "snapquiz.transport.resolver.uuid4",
             side_effect=(
@@ -1057,6 +1457,7 @@ class W09ResolverCoordinatorTest(unittest.TestCase):
         ):
             other_ticket = launcher._reserve_lifecycle_capability(
                 reservation_owner=other_owner,
+                stop_authority=stop_authority,
                 _authority=_RESOLVER_LIFECYCLE_AUTHORITY,
             )
 
@@ -2515,34 +2916,28 @@ class W09ResolverCoordinatorTest(unittest.TestCase):
         self.assertEqual(state.status, "closed")
         self.assertIsNone(state.secret)
 
-    def test_result_attestation_observer_fault_closes_gate_and_credential(self):
-        runtime, gate, credential = _make_authorized_credential()
-        launcher, resolver, _, _, kernel, _ = _components()
-        observations = []
-
-        def fail_after_attestation(event, metadata):
-            observations.append((event, metadata["state"]))
-            if event == "result_attested":
-                raise RuntimeError("result attestation observer fault")
-
-        with self.assertRaisesRegex(RuntimeError, "attestation observer"):
-            self._coordinate(
-                launcher,
-                resolver,
-                gate,
-                credential,
-                observer=fail_after_attestation,
-            )
-
-        self.assertIn(("result_attested", "result_attested"), observations)
-        self.assertEqual(_cleanup_counts(kernel), (0, 1, 1))
-        self.assertEqual(
-            runtime.context_ledger.safe_metadata()["in_flight_attempt_count"],
-            0,
+    def test_public_coordinator_rejects_synchronous_observer_before_io(self):
+        _, gate, credential = _make_authorized_credential()
+        launcher, resolver, source, spawner, _, events = _components()
+        self.assertNotIn(
+            "observer",
+            inspect.signature(coordinate_resolver_attempt).parameters,
         )
-        handle_state = next(iter(resolver._ledger._states.values()))
-        self.assertEqual(handle_state.status, "closed")
-        self.assertIsNone(handle_state.secret)
+        try:
+            with _poison_real_io(), self.assertRaises(TypeError):
+                coordinate_resolver_attempt(
+                    launcher=launcher,
+                    credential_resolver=resolver,
+                    gate=gate,
+                    credential_permit=credential,
+                    cleanup_ticket=issue_resolver_cleanup_ticket(),
+                    observer=lambda *_: None,
+                )
+            self.assertEqual(spawner.requests, [])
+            self.assertEqual(source.calls, [])
+            self.assertNotIn("spawn", events)
+        finally:
+            gate.abandon_credential_resolution(credential)
 
     def test_close_never_repeats_attested_helper_actions(self):
         runtime, gate, credential = _make_authorized_credential()
@@ -3133,11 +3528,15 @@ class W09ResolverCoordinatorTest(unittest.TestCase):
         errors: list[BaseException] = []
         original_spawn = spawner.spawn
 
-        def blocked_spawn(request, *, publication):
+        def blocked_spawn(request, *, publication, max_wait_ns):
             entered.set()
             if not released.wait(timeout=5):
                 raise AssertionError("test did not release helper spawn")
-            return original_spawn(request, publication=publication)
+            return original_spawn(
+                request,
+                publication=publication,
+                max_wait_ns=max_wait_ns,
+            )
 
         def worker() -> None:
             try:
@@ -3180,11 +3579,15 @@ class W09ResolverCoordinatorTest(unittest.TestCase):
         errors: list[BaseException] = []
         original_spawn = spawner.spawn
 
-        def blocked_spawn(request, *, publication):
+        def blocked_spawn(request, *, publication, max_wait_ns):
             entered.set()
             if not released.wait(timeout=5):
                 raise AssertionError("test did not release helper spawn")
-            return original_spawn(request, publication=publication)
+            return original_spawn(
+                request,
+                publication=publication,
+                max_wait_ns=max_wait_ns,
+            )
 
         def winner() -> None:
             try:
