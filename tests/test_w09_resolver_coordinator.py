@@ -7,7 +7,7 @@ import copy
 import inspect
 import json
 import pickle
-from threading import Barrier, Thread
+from threading import Barrier, Event, Thread
 import unittest
 from unittest.mock import patch
 from uuid import UUID
@@ -22,6 +22,7 @@ from snapquiz.runtime.attempt import (
 )
 from snapquiz.runtime.context import CallContextLedger
 import snapquiz.transport.resolver as resolver_module
+import snapquiz.transport.http as http_module
 from snapquiz.transport.address_policy import (
     INTERNET_PUBLIC_ADDRESS_POLICY_DIGEST,
     INTERNET_PUBLIC_ADDRESS_POLICY_REF,
@@ -30,10 +31,13 @@ from snapquiz.transport.address_policy import (
 from snapquiz.transport.credentials import CredentialResolver
 from snapquiz.transport.http import (
     PreparedResolverAttempt,
+    ResolverCleanupTicket,
     coordinate_resolver_attempt,
+    issue_resolver_cleanup_ticket,
 )
 from snapquiz.transport.resolver import (
     READY_FRAME,
+    AttemptTerminalGuard,
     PreAttemptResolverGuard,
     ResolverHelperLauncher,
     ResolverResultReceipt,
@@ -316,7 +320,13 @@ class W09ResolverCoordinatorTest(unittest.TestCase):
         credential,
         *,
         observer=None,
+        cleanup_ticket=None,
     ):
+        ticket = (
+            issue_resolver_cleanup_ticket()
+            if cleanup_ticket is None
+            else cleanup_ticket
+        )
         with _poison_real_io(), patch(
             "snapquiz.transport.resolver.uuid4",
             side_effect=(
@@ -331,6 +341,7 @@ class W09ResolverCoordinatorTest(unittest.TestCase):
                 credential_resolver=resolver,
                 gate=gate,
                 credential_permit=credential,
+                cleanup_ticket=ticket,
                 observer=observer,
             )
 
@@ -467,6 +478,7 @@ class W09ResolverCoordinatorTest(unittest.TestCase):
                     credential_resolver=resolver,
                     gate=gate,
                     credential_permit=credential,
+                    cleanup_ticket=issue_resolver_cleanup_ticket(),
                     lifecycle_id=LIFECYCLE_ID,
                     transport_claim_id=TRANSPORT_CLAIM_ID,
                     dns_start_id=DNS_START_ID,
@@ -2761,6 +2773,980 @@ class W09ResolverCoordinatorTest(unittest.TestCase):
         self.assertIsNone(attempt_state.context_ledger)
         self.assertIsNone(credential_state.context)
         self.assertIsNone(credential_state.context_ledger)
+
+    def test_cleanup_ticket_factory_is_inert_factory_only_and_opaque(self):
+        with _poison_real_io():
+            ticket = issue_resolver_cleanup_ticket()
+
+        self.assertIs(type(ticket), ResolverCleanupTicket)
+        self.assertEqual(
+            ticket.safe_metadata(),
+            {
+                "policy_version": "snapquiz.resolver-coordinator.v1",
+                "state": "issued",
+                "terminal": False,
+                "retryable": False,
+            },
+        )
+        self.assertFalse(ticket.retry_cleanup())
+        self.assertFalse(ticket.is_terminal)
+        self.assertNotIn("secret", repr(ticket).lower())
+        self.assertNotIn("permit", repr(ticket).lower())
+        with self.assertRaises(TypeError):
+            ResolverCleanupTicket(object())  # type: ignore[arg-type]
+        with self.assertRaises(TypeError):
+            copy.copy(ticket)
+        with self.assertRaises(TypeError):
+            copy.deepcopy(ticket)
+        with self.assertRaises(TypeError):
+            pickle.dumps(ticket)
+
+    def test_cleanup_ticket_factory_rejects_attach_normal_noop(self):
+        ledger_type = http_module._ResolverCoordinationRecoveryLedger
+
+        with patch.object(ledger_type, "attach_ticket", return_value=None):
+            with self.assertRaises(EndpointPolicyError) as raised:
+                issue_resolver_cleanup_ticket()
+
+        self.assertEqual(raised.exception.stage, "resolver_coordinator")
+
+    def test_cleanup_ticket_is_required_and_can_bind_only_once(self):
+        parameter = inspect.signature(coordinate_resolver_attempt).parameters[
+            "cleanup_ticket"
+        ]
+        self.assertIs(parameter.default, inspect.Parameter.empty)
+
+        _, gate, credential = _make_authorized_credential()
+        launcher, resolver, _, _, kernel, _ = _components()
+        ticket = issue_resolver_cleanup_ticket()
+        prepared = self._coordinate(
+            launcher,
+            resolver,
+            gate,
+            credential,
+            cleanup_ticket=ticket,
+        )
+
+        _, other_gate, other_credential = _make_authorized_credential()
+        other = _components()
+        other_launcher, other_resolver, other_source, other_spawner, _, _ = other
+        try:
+            with self.assertRaises(EndpointPolicyError):
+                self._coordinate(
+                    other_launcher,
+                    other_resolver,
+                    other_gate,
+                    other_credential,
+                    cleanup_ticket=ticket,
+                )
+            self.assertEqual(other_spawner.requests, [])
+            self.assertEqual(other_source.calls, [])
+            self.assertEqual(ticket.safe_metadata()["state"], "recoverable")
+        finally:
+            other_gate.abandon_credential_resolution(other_credential)
+            prepared.close()
+        self.assertTrue(ticket.is_terminal)
+        self.assertEqual(_cleanup_counts(kernel), (0, 1, 1))
+
+    def test_caller_ticket_recovers_when_prepared_return_is_lost(self):
+        runtime, gate, credential = _make_authorized_credential()
+        launcher, resolver, source, _, kernel, _ = _components()
+        ticket = issue_resolver_cleanup_ticket()
+        primary = RuntimeError("synthetic outer publication failure")
+
+        def lose_prepared_return() -> None:
+            self._coordinate(
+                launcher,
+                resolver,
+                gate,
+                credential,
+                cleanup_ticket=ticket,
+            )
+            raise primary
+
+        with self.assertRaises(RuntimeError) as raised:
+            lose_prepared_return()
+
+        self.assertIs(raised.exception, primary)
+        self.assertEqual(ticket.safe_metadata()["state"], "recoverable")
+        self.assertFalse(ticket.is_terminal)
+        self.assertEqual(
+            runtime.context_ledger.safe_metadata()["in_flight_attempt_count"],
+            1,
+        )
+        self.assertTrue(ticket.retry_cleanup())
+        self.assertTrue(ticket.is_terminal)
+        self.assertEqual(_cleanup_counts(kernel), (0, 1, 1))
+        self.assertEqual(
+            runtime.context_ledger.safe_metadata()["in_flight_attempt_count"],
+            0,
+        )
+        state = next(iter(resolver._ledger._states.values()))
+        self.assertEqual(state.status, "closed")
+        self.assertIsNone(state.secret)
+        self.assertTrue(all(value == 0 for value in source.returned[0]))
+
+    def test_cleanup_failed_ticket_stays_pending_without_action_replay(self):
+        primary = RuntimeError("synthetic close uncertainty")
+        runtime, gate, credential = _make_authorized_credential()
+        launcher, resolver, _, _, kernel, _ = _components(
+            close_fault=primary,
+        )
+        ticket = issue_resolver_cleanup_ticket()
+
+        with self.assertRaises(RuntimeError) as raised:
+            self._coordinate(
+                launcher,
+                resolver,
+                gate,
+                credential,
+                cleanup_ticket=ticket,
+            )
+
+        self.assertIs(raised.exception, primary)
+        self.assertEqual(ticket.safe_metadata()["state"], "recoverable")
+        counts = _cleanup_counts(kernel)
+        self.assertEqual(counts, (0, 1, 1))
+        self.assertFalse(ticket.retry_cleanup())
+        self.assertFalse(ticket.retry_cleanup())
+        kernel.close_fault = None
+        self.assertFalse(ticket.retry_cleanup())
+        self.assertEqual(_cleanup_counts(kernel), counts)
+        self.assertFalse(ticket.is_terminal)
+        self.assertEqual(len(launcher._lifecycle_recovery), 1)
+        self.assertEqual(
+            runtime.context_ledger.safe_metadata()["in_flight_attempt_count"],
+            1,
+        )
+        handle_state = next(iter(resolver._ledger._states.values()))
+        self.assertEqual(handle_state.status, "active")
+        self.assertIsNotNone(handle_state.secret)
+
+    def test_business_primary_survives_uncertain_helper_cleanup(self):
+        primary = RuntimeError("synthetic business claim failure")
+        cleanup_secondary = RuntimeError("synthetic pipe close uncertainty")
+        runtime, gate, credential = _make_authorized_credential()
+        launcher, resolver, _, _, kernel, events = _components(
+            close_fault=cleanup_secondary,
+        )
+        ticket = issue_resolver_cleanup_ticket()
+
+        with patch.object(
+            AttemptGate,
+            "_claim_attempt",
+            side_effect=primary,
+        ):
+            with self.assertRaises(RuntimeError) as raised:
+                self._coordinate(
+                    launcher,
+                    resolver,
+                    gate,
+                    credential,
+                    cleanup_ticket=ticket,
+                )
+
+        self.assertIs(raised.exception, primary)
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertIsNone(raised.exception.__context__)
+        self.assertNotIn("start_write", events)
+        self.assertEqual(ticket.safe_metadata()["state"], "recoverable")
+        self.assertFalse(ticket.is_terminal)
+        counts = _cleanup_counts(kernel)
+        self.assertEqual(counts, (1, 1, 1))
+        self.assertEqual(
+            runtime.context_ledger.safe_metadata()["in_flight_attempt_count"],
+            1,
+        )
+        attempt_state = next(iter(gate._attempt_permits.values()))
+        self.assertEqual(attempt_state.status, "active")
+        handle_state = next(iter(resolver._ledger._states.values()))
+        self.assertEqual(handle_state.status, "active")
+        self.assertIsNotNone(handle_state.secret)
+
+        kernel.close_fault = None
+        self.assertFalse(ticket.retry_cleanup())
+        self.assertEqual(_cleanup_counts(kernel), counts)
+        self.assertFalse(ticket.is_terminal)
+
+    def test_helper_recovery_return_value_cannot_fake_ticket_terminal(self):
+        runtime, gate, credential = _make_authorized_credential()
+        launcher, resolver, _, _, kernel, _ = _components()
+        ticket = issue_resolver_cleanup_ticket()
+        prepared = self._coordinate(
+            launcher,
+            resolver,
+            gate,
+            credential,
+            cleanup_ticket=ticket,
+        )
+
+        with patch.object(
+            ResolverHelperLauncher,
+            "_recover_ready_publication_for_cleanup",
+            return_value=True,
+        ):
+            self.assertFalse(ticket.retry_cleanup())
+
+        self.assertFalse(ticket.is_terminal)
+        self.assertEqual(
+            runtime.context_ledger.safe_metadata()["in_flight_attempt_count"],
+            1,
+        )
+        self.assertFalse(prepared.credential_handle.is_closed)
+        self.assertTrue(ticket.retry_cleanup())
+        self.assertTrue(ticket.is_terminal)
+        self.assertEqual(_cleanup_counts(kernel), (0, 1, 1))
+        self.assertTrue(prepared.is_closed)
+        self.assertFalse(prepared.close())
+
+    def test_gate_recovery_return_value_cannot_close_credential_early(self):
+        runtime, gate, credential = _make_authorized_credential()
+        launcher, resolver, _, _, kernel, _ = _components()
+        ticket = issue_resolver_cleanup_ticket()
+        prepared = self._coordinate(
+            launcher,
+            resolver,
+            gate,
+            credential,
+            cleanup_ticket=ticket,
+        )
+
+        with (
+            patch.object(
+                AttemptGate,
+                "_recover_attempt_for_cleanup",
+                return_value=True,
+            ),
+            patch.object(
+                AttemptGate,
+                "_recover_published_attempt_for_cleanup",
+                return_value=True,
+            ),
+        ):
+            self.assertFalse(ticket.retry_cleanup())
+
+        self.assertFalse(ticket.is_terminal)
+        self.assertFalse(prepared.credential_handle.is_closed)
+        self.assertEqual(
+            runtime.context_ledger.safe_metadata()["in_flight_attempt_count"],
+            1,
+        )
+        self.assertTrue(ticket.retry_cleanup())
+        self.assertEqual(_cleanup_counts(kernel), (0, 1, 1))
+        self.assertTrue(prepared.is_closed)
+        self.assertFalse(prepared.close())
+
+    def test_credential_recovery_return_value_cannot_fake_zeroization(self):
+        _, gate, credential = _make_authorized_credential()
+        launcher, resolver, _, _, kernel, _ = _components()
+        ticket = issue_resolver_cleanup_ticket()
+        prepared = self._coordinate(
+            launcher,
+            resolver,
+            gate,
+            credential,
+            cleanup_ticket=ticket,
+        )
+        handle_state = resolver._ledger._states[prepared.credential_handle]
+
+        with (
+            patch.object(CredentialResolver, "close", return_value=True),
+            patch.object(
+                CredentialResolver,
+                "_recover_published_handle_for_cleanup",
+                return_value=True,
+            ),
+            patch.object(
+                CredentialResolver,
+                "_recover_published_handle_state_for_cleanup",
+                return_value=True,
+            ),
+        ):
+            self.assertFalse(ticket.retry_cleanup())
+
+        self.assertFalse(ticket.is_terminal)
+        self.assertEqual(handle_state.status, "active")
+        self.assertIsNotNone(handle_state.secret)
+        self.assertTrue(ticket.retry_cleanup())
+        self.assertEqual(handle_state.status, "closed")
+        self.assertIsNone(handle_state.secret)
+        self.assertEqual(_cleanup_counts(kernel), (0, 1, 1))
+        self.assertTrue(prepared.is_closed)
+        self.assertFalse(prepared.close())
+
+    def test_ticket_retry_is_serialized_and_uses_frozen_ledger(self):
+        _, gate, credential = _make_authorized_credential()
+        launcher, resolver, _, _, kernel, _ = _components()
+        ticket = issue_resolver_cleanup_ticket()
+        prepared = self._coordinate(
+            launcher,
+            resolver,
+            gate,
+            credential,
+            cleanup_ticket=ticket,
+        )
+        object.__setattr__(ticket, "_ledger", object())
+        barrier = Barrier(3)
+        results: list[bool] = []
+        errors: list[BaseException] = []
+        recovery_calls: list[object] = []
+        original = AttemptGate._recover_attempt_for_cleanup
+
+        def counted_recovery(selected, *args, **kwargs):
+            recovery_calls.append(selected)
+            return original(selected, *args, **kwargs)
+
+        def worker() -> None:
+            try:
+                barrier.wait()
+                results.append(ticket.retry_cleanup())
+            except BaseException as error:
+                errors.append(error)
+
+        with patch.object(
+            AttemptGate,
+            "_recover_attempt_for_cleanup",
+            new=counted_recovery,
+        ):
+            threads = [Thread(target=worker) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            barrier.wait()
+            for thread in threads:
+                thread.join()
+
+        self.assertEqual(errors, [])
+        self.assertEqual(results, [True, True])
+        self.assertEqual(recovery_calls, [gate])
+        self.assertTrue(ticket.is_terminal)
+        self.assertEqual(_cleanup_counts(kernel), (0, 1, 1))
+        self.assertTrue(prepared.is_closed)
+        self.assertFalse(prepared.close())
+
+    def test_ticket_retry_during_coordination_is_not_cancellation(self):
+        _, gate, credential = _make_authorized_credential()
+        launcher, resolver, _, spawner, _, _ = _components()
+        ticket = issue_resolver_cleanup_ticket()
+        entered = Event()
+        released = Event()
+        prepared_results: list[PreparedResolverAttempt] = []
+        errors: list[BaseException] = []
+        original_spawn = spawner.spawn
+
+        def blocked_spawn(request, *, publication):
+            entered.set()
+            if not released.wait(timeout=5):
+                raise AssertionError("test did not release helper spawn")
+            return original_spawn(request, publication=publication)
+
+        def worker() -> None:
+            try:
+                prepared_results.append(
+                    self._coordinate(
+                        launcher,
+                        resolver,
+                        gate,
+                        credential,
+                        cleanup_ticket=ticket,
+                    )
+                )
+            except BaseException as error:
+                errors.append(error)
+
+        with patch.object(spawner, "spawn", new=blocked_spawn):
+            thread = Thread(target=worker)
+            thread.start()
+            self.assertTrue(entered.wait(timeout=5))
+            self.assertEqual(ticket.safe_metadata()["state"], "coordinating")
+            self.assertFalse(ticket.retry_cleanup())
+            self.assertEqual(spawner.requests, [])
+            released.set()
+            thread.join(timeout=5)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(len(prepared_results), 1)
+        self.assertEqual(ticket.safe_metadata()["state"], "recoverable")
+        self.assertTrue(prepared_results[0].close())
+        self.assertTrue(ticket.is_terminal)
+
+    def test_same_ticket_concurrent_coordinate_cannot_cleanup_winner(self):
+        _, gate, credential = _make_authorized_credential()
+        launcher, resolver, source, spawner, kernel, _ = _components()
+        ticket = issue_resolver_cleanup_ticket()
+        entered = Event()
+        released = Event()
+        prepared_results: list[PreparedResolverAttempt] = []
+        errors: list[BaseException] = []
+        original_spawn = spawner.spawn
+
+        def blocked_spawn(request, *, publication):
+            entered.set()
+            if not released.wait(timeout=5):
+                raise AssertionError("test did not release helper spawn")
+            return original_spawn(request, publication=publication)
+
+        def winner() -> None:
+            try:
+                prepared_results.append(
+                    self._coordinate(
+                        launcher,
+                        resolver,
+                        gate,
+                        credential,
+                        cleanup_ticket=ticket,
+                    )
+                )
+            except BaseException as error:
+                errors.append(error)
+
+        with patch.object(spawner, "spawn", new=blocked_spawn):
+            thread = Thread(target=winner)
+            thread.start()
+            self.assertTrue(entered.wait(timeout=5))
+            with self.assertRaises(EndpointPolicyError):
+                self._coordinate(
+                    launcher,
+                    resolver,
+                    gate,
+                    credential,
+                    cleanup_ticket=ticket,
+                )
+            self.assertEqual(ticket.safe_metadata()["state"], "coordinating")
+            self.assertEqual(spawner.requests, [])
+            self.assertEqual(source.calls, [])
+            self.assertEqual(_cleanup_counts(kernel), (0, 0, 0))
+            released.set()
+            thread.join(timeout=5)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(len(prepared_results), 1)
+        self.assertEqual(len(spawner.requests), 1)
+        self.assertEqual(len(source.calls), 1)
+        self.assertEqual(ticket.safe_metadata()["state"], "recoverable")
+        self.assertEqual(_cleanup_counts(kernel), (0, 1, 1))
+        self.assertTrue(prepared_results[0].close())
+        self.assertTrue(ticket.is_terminal)
+
+    def test_bookkeeping_only_retry_never_replays_helper_actions(self):
+        runtime, gate, credential = _make_authorized_credential()
+        launcher, resolver, _, _, kernel, _ = _components(
+            result_address="127.0.0.1"
+        )
+        ticket = issue_resolver_cleanup_ticket()
+
+        with patch.object(
+            resolver_module._ResolverLifecycleLedger,
+            "finish_cleanup",
+            return_value=None,
+        ):
+            with self.assertRaises(EndpointPolicyError) as raised:
+                self._coordinate(
+                    launcher,
+                    resolver,
+                    gate,
+                    credential,
+                    cleanup_ticket=ticket,
+                )
+
+        self.assertEqual(raised.exception.stage, "address_policy")
+        ledger = next(iter(launcher._lifecycle_recovery.values())).ledger
+        self.assertEqual(ledger.safe_metadata()["state"], "cleaning")
+        counts = _cleanup_counts(kernel)
+        self.assertEqual(counts, (0, 1, 1))
+        self.assertFalse(ticket.is_terminal)
+
+        self.assertTrue(ticket.retry_cleanup())
+        self.assertTrue(ticket.is_terminal)
+        self.assertTrue(ledger.is_terminal())
+        self.assertEqual(_cleanup_counts(kernel), counts)
+        self.assertEqual(launcher._lifecycle_recovery, {})
+        self.assertEqual(
+            runtime.context_ledger.safe_metadata()["in_flight_attempt_count"],
+            0,
+        )
+        handle_state = next(iter(resolver._ledger._states.values()))
+        self.assertEqual(handle_state.status, "closed")
+        self.assertIsNone(handle_state.secret)
+
+    def test_ticket_retry_has_no_business_transition_capability(self):
+        _, gate, credential = _make_authorized_credential()
+        launcher, resolver, _, _, kernel, _ = _components()
+        ticket = issue_resolver_cleanup_ticket()
+        prepared = self._coordinate(
+            launcher,
+            resolver,
+            gate,
+            credential,
+            cleanup_ticket=ticket,
+        )
+        forbidden = AssertionError("business transition during cleanup retry")
+
+        with (
+            patch.object(AttemptTerminalGuard, "_start", side_effect=forbidden),
+            patch.object(
+                AttemptTerminalGuard,
+                "_read_result_receipt",
+                side_effect=forbidden,
+            ),
+            patch.object(AttemptGate, "reserve_attempt", side_effect=forbidden),
+            patch.object(AttemptGate, "_claim_attempt", side_effect=forbidden),
+            patch.object(AttemptGate, "_commit_dns_start", side_effect=forbidden),
+            patch.object(
+                AttemptGate,
+                "_begin_credential_borrow",
+                side_effect=forbidden,
+            ),
+            patch.object(CredentialResolver, "resolve", side_effect=forbidden),
+            patch.object(
+                CredentialResolver,
+                "_borrow_once",
+                side_effect=forbidden,
+            ),
+        ):
+            self.assertTrue(ticket.retry_cleanup())
+
+        self.assertTrue(ticket.is_terminal)
+        self.assertEqual(_cleanup_counts(kernel), (0, 1, 1))
+        self.assertTrue(prepared.is_closed)
+        self.assertFalse(prepared.close())
+
+    def test_recovery_snapshot_normal_noops_fail_before_next_risk(self):
+        boundaries = (
+            ("record_ready_ticket", 0, 0),
+            ("record_ready_ledger", 0, 0),
+            ("begin_credential_publication", 0, 0),
+            ("record_credential_handle", 1, 0),
+            ("begin_attempt_publication", 1, 0),
+            ("record_attempt", 1, 1),
+            ("record_terminal_guard", 1, 1),
+            ("publish_recoverable", 1, 1),
+        )
+        ledger_type = http_module._ResolverCoordinationRecoveryLedger
+
+        for method_name, credential_reads, consumed_budget in boundaries:
+            with self.subTest(method=method_name):
+                runtime, gate, credential = _make_authorized_credential()
+                launcher, resolver, source, _, kernel, events = _components()
+                ticket = issue_resolver_cleanup_ticket()
+                with patch.object(
+                    ledger_type,
+                    method_name,
+                    return_value=None,
+                ):
+                    with self.assertRaises(EndpointPolicyError):
+                        self._coordinate(
+                            launcher,
+                            resolver,
+                            gate,
+                            credential,
+                            cleanup_ticket=ticket,
+                        )
+
+                self.assertEqual(len(source.calls), credential_reads)
+                self.assertEqual(
+                    _consumed_budgets(runtime),
+                    (consumed_budget, consumed_budget, consumed_budget),
+                )
+                if method_name != "publish_recoverable":
+                    self.assertNotIn("start_write", events)
+                self.assertTrue(ticket.is_terminal)
+                self.assertEqual(
+                    runtime.context_ledger.safe_metadata()[
+                        "in_flight_attempt_count"
+                    ],
+                    0,
+                )
+                self.assertEqual(launcher._lifecycle_recovery, {})
+                if source.returned:
+                    self.assertTrue(
+                        all(value == 0 for value in source.returned[0])
+                    )
+                self.assertIn(
+                    _cleanup_counts(kernel),
+                    ((0, 0, 0), (1, 1, 1), (0, 1, 1)),
+                )
+
+    def test_recovery_snapshot_commit_then_raise_preserves_primary(self):
+        boundaries = (
+            ("record_ready_ticket", 0, 0),
+            ("record_ready_ledger", 0, 0),
+            ("begin_credential_publication", 0, 0),
+            ("record_credential_handle", 1, 0),
+            ("begin_attempt_publication", 1, 0),
+            ("record_attempt", 1, 1),
+            ("record_terminal_guard", 1, 1),
+            ("publish_recoverable", 1, 1),
+        )
+        ledger_type = http_module._ResolverCoordinationRecoveryLedger
+
+        for method_name, credential_reads, consumed_budget in boundaries:
+            with self.subTest(method=method_name):
+                runtime, gate, credential = _make_authorized_credential()
+                launcher, resolver, source, _, kernel, _ = _components()
+                ticket = issue_resolver_cleanup_ticket()
+                primary = RuntimeError(f"synthetic {method_name} postcommit")
+                original = getattr(ledger_type, method_name)
+
+                def commit_then_raise(selected, *args, **kwargs):
+                    original(selected, *args, **kwargs)
+                    raise primary
+
+                with patch.object(
+                    ledger_type,
+                    method_name,
+                    new=commit_then_raise,
+                ):
+                    with self.assertRaises(RuntimeError) as raised:
+                        self._coordinate(
+                            launcher,
+                            resolver,
+                            gate,
+                            credential,
+                            cleanup_ticket=ticket,
+                        )
+
+                self.assertIs(raised.exception, primary)
+                self.assertTrue(ticket.is_terminal)
+                self.assertEqual(len(source.calls), credential_reads)
+                self.assertEqual(
+                    _consumed_budgets(runtime),
+                    (consumed_budget, consumed_budget, consumed_budget),
+                )
+                self.assertEqual(
+                    runtime.context_ledger.safe_metadata()[
+                        "in_flight_attempt_count"
+                    ],
+                    0,
+                )
+                self.assertEqual(launcher._lifecycle_recovery, {})
+                if source.returned:
+                    self.assertTrue(
+                        all(value == 0 for value in source.returned[0])
+                    )
+                self.assertIn(
+                    _cleanup_counts(kernel),
+                    ((0, 0, 0), (1, 1, 1), (0, 1, 1)),
+                )
+
+    def test_ticket_publication_is_the_cleanup_linearization_point(self):
+        runtime, gate, credential = _make_authorized_credential()
+        launcher, resolver, _, _, kernel, _ = _components()
+        ticket = issue_resolver_cleanup_ticket()
+        published = Event()
+        released = Event()
+        prepared_results: list[PreparedResolverAttempt] = []
+        errors: list[BaseException] = []
+        ledger_type = http_module._ResolverCoordinationRecoveryLedger
+        original = ledger_type.publish_recoverable
+
+        def publish_then_block(selected, owner):
+            original(selected, owner)
+            published.set()
+            if not released.wait(timeout=5):
+                raise AssertionError("test did not release publication")
+
+        def worker() -> None:
+            try:
+                prepared_results.append(
+                    self._coordinate(
+                        launcher,
+                        resolver,
+                        gate,
+                        credential,
+                        cleanup_ticket=ticket,
+                    )
+                )
+            except BaseException as error:
+                errors.append(error)
+
+        with patch.object(
+            ledger_type,
+            "publish_recoverable",
+            new=publish_then_block,
+        ):
+            thread = Thread(target=worker)
+            thread.start()
+            self.assertTrue(published.wait(timeout=5))
+            self.assertEqual(ticket.safe_metadata()["state"], "recoverable")
+            self.assertTrue(ticket.retry_cleanup())
+            self.assertTrue(ticket.is_terminal)
+            released.set()
+            thread.join(timeout=5)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(len(prepared_results), 1)
+        prepared = prepared_results[0]
+        self.assertTrue(prepared.is_closed)
+        self.assertEqual(prepared.safe_metadata()["state"], "closed")
+        self.assertFalse(prepared.close())
+        self.assertTrue(prepared.credential_handle.is_closed)
+        self.assertEqual(_cleanup_counts(kernel), (0, 1, 1))
+        self.assertEqual(
+            runtime.context_ledger.safe_metadata()["in_flight_attempt_count"],
+            0,
+        )
+
+    def test_ticket_retry_recovers_after_unexpected_wrapper_fault(self):
+        runtime, gate, credential = _make_authorized_credential()
+        launcher, resolver, _, _, kernel, _ = _components()
+        ticket = issue_resolver_cleanup_ticket()
+        prepared = self._coordinate(
+            launcher,
+            resolver,
+            gate,
+            credential,
+            cleanup_ticket=ticket,
+        )
+        ledger_type = http_module._ResolverCoordinationRecoveryLedger
+
+        with patch.object(
+            ledger_type,
+            "_helper_terminal_locked",
+            side_effect=RuntimeError("synthetic cleanup wrapper fault"),
+        ):
+            self.assertFalse(ticket.retry_cleanup())
+
+        self.assertEqual(ticket.safe_metadata()["state"], "recoverable")
+        self.assertTrue(ticket.safe_metadata()["retryable"])
+        self.assertFalse(ticket.is_terminal)
+        self.assertEqual(_cleanup_counts(kernel), (0, 1, 1))
+        self.assertTrue(ticket.retry_cleanup())
+        self.assertTrue(prepared.is_closed)
+        self.assertFalse(prepared.close())
+        self.assertEqual(_cleanup_counts(kernel), (0, 1, 1))
+        self.assertEqual(
+            runtime.context_ledger.safe_metadata()["in_flight_attempt_count"],
+            0,
+        )
+
+    def test_prepared_close_recovers_after_unexpected_wrapper_fault(self):
+        _, gate, credential = _make_authorized_credential()
+        launcher, resolver, _, _, kernel, _ = _components()
+        ticket = issue_resolver_cleanup_ticket()
+        prepared = self._coordinate(
+            launcher,
+            resolver,
+            gate,
+            credential,
+            cleanup_ticket=ticket,
+        )
+        ledger_type = http_module._ResolverCoordinationRecoveryLedger
+
+        with patch.object(
+            ledger_type,
+            "_helper_terminal_locked",
+            side_effect=RuntimeError("synthetic cleanup wrapper fault"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "wrapper fault"):
+                prepared.close()
+
+        self.assertFalse(prepared.is_closed)
+        self.assertEqual(ticket.safe_metadata()["state"], "recoverable")
+        self.assertTrue(prepared.close())
+        self.assertTrue(prepared.is_closed)
+        self.assertEqual(_cleanup_counts(kernel), (0, 1, 1))
+
+    def test_terminal_requires_aggregate_resource_reference_release(self):
+        _, gate, credential = _make_authorized_credential()
+        launcher, resolver, _, _, kernel, _ = _components()
+        ticket = issue_resolver_cleanup_ticket()
+        prepared = self._coordinate(
+            launcher,
+            resolver,
+            gate,
+            credential,
+            cleanup_ticket=ticket,
+        )
+        ledger = prepared._recovery_ledger_snapshot
+
+        with patch.object(
+            http_module._ResolverCoordinationRecoveryLedger,
+            "_release_resource_refs_locked",
+            return_value=None,
+        ):
+            self.assertFalse(ticket.retry_cleanup())
+
+        self.assertFalse(ticket.is_terminal)
+        self.assertEqual(ticket.safe_metadata()["state"], "recoverable")
+        counts = _cleanup_counts(kernel)
+        self.assertEqual(counts, (0, 1, 1))
+        self.assertTrue(ticket.retry_cleanup())
+        self.assertTrue(ticket.is_terminal)
+        self.assertEqual(_cleanup_counts(kernel), counts)
+        self.assertTrue(prepared.is_closed)
+        self.assertFalse(prepared.close())
+
+    def test_terminal_commit_retries_after_reference_observer_fault(self):
+        _, gate, credential = _make_authorized_credential()
+        launcher, resolver, _, _, kernel, _ = _components()
+        ticket = issue_resolver_cleanup_ticket()
+        prepared = self._coordinate(
+            launcher,
+            resolver,
+            gate,
+            credential,
+            cleanup_ticket=ticket,
+        )
+        ledger_type = http_module._ResolverCoordinationRecoveryLedger
+
+        with patch.object(
+            ledger_type,
+            "_resource_refs_are_released_locked",
+            side_effect=RuntimeError("synthetic release observer fault"),
+        ):
+            self.assertFalse(ticket.retry_cleanup())
+
+        self.assertFalse(ticket.is_terminal)
+        self.assertEqual(ticket.safe_metadata()["state"], "recoverable")
+        counts = _cleanup_counts(kernel)
+        self.assertEqual(counts, (0, 1, 1))
+        self.assertTrue(ticket.retry_cleanup())
+        self.assertTrue(ticket.is_terminal)
+        self.assertEqual(_cleanup_counts(kernel), counts)
+        self.assertTrue(prepared.is_closed)
+        self.assertFalse(prepared.close())
+
+    def test_terminal_credential_state_keeps_only_primitive_owner_proof(self):
+        _, gate, credential = _make_authorized_credential()
+        launcher, resolver, _, _, _, _ = _components()
+        ticket = issue_resolver_cleanup_ticket()
+        prepared = self._coordinate(
+            launcher,
+            resolver,
+            gate,
+            credential,
+            cleanup_ticket=ticket,
+        )
+        handle_state = resolver._ledger._states[prepared.credential_handle]
+
+        self.assertTrue(ticket.retry_cleanup())
+
+        self.assertIsNone(handle_state.permit)
+        self.assertIsNone(handle_state.gate)
+        self.assertNotIn("permit_snapshot", handle_state.__slots__)
+        self.assertNotIn("gate_snapshot", handle_state.__slots__)
+        self.assertIs(type(handle_state.permit_id_snapshot), UUID)
+        self.assertIs(type(handle_state.gate_id_snapshot), UUID)
+        self.assertTrue(prepared.is_closed)
+
+    def test_ticket_bind_commit_then_raise_is_recovered_without_io(self):
+        runtime, gate, credential = _make_authorized_credential()
+        launcher, resolver, source, spawner, kernel, events = _components()
+        ticket = issue_resolver_cleanup_ticket()
+        primary = RuntimeError("synthetic ticket bind publication failure")
+        ledger_type = http_module._ResolverCoordinationRecoveryLedger
+        original = ledger_type.bind_coordination
+
+        def commit_then_raise(selected, *args, **kwargs):
+            original(selected, *args, **kwargs)
+            raise primary
+
+        with patch.object(
+            ledger_type,
+            "bind_coordination",
+            new=commit_then_raise,
+        ):
+            with self.assertRaises(RuntimeError) as raised:
+                self._coordinate(
+                    launcher,
+                    resolver,
+                    gate,
+                    credential,
+                    cleanup_ticket=ticket,
+                )
+
+        self.assertIs(raised.exception, primary)
+        self.assertTrue(ticket.is_terminal)
+        self.assertTrue(credential._released)
+        self.assertEqual(spawner.requests, [])
+        self.assertEqual(source.calls, [])
+        self.assertNotIn("spawn", events)
+        self.assertEqual(_cleanup_counts(kernel), (0, 0, 0))
+        self.assertEqual(
+            runtime.context_ledger.safe_metadata()["active_gate_activity_count"],
+            0,
+        )
+
+    def test_ticket_bind_normal_noop_preserves_caller_owner_and_is_reusable(self):
+        runtime, gate, credential = _make_authorized_credential()
+        launcher, resolver, source, spawner, kernel, events = _components()
+        ticket = issue_resolver_cleanup_ticket()
+        ledger_type = http_module._ResolverCoordinationRecoveryLedger
+
+        with patch.object(
+            ledger_type,
+            "bind_coordination",
+            return_value=(object(), object()),
+        ):
+            with self.assertRaises(EndpointPolicyError):
+                self._coordinate(
+                    launcher,
+                    resolver,
+                    gate,
+                    credential,
+                    cleanup_ticket=ticket,
+                )
+
+        self.assertEqual(ticket.safe_metadata()["state"], "issued")
+        self.assertFalse(ticket.is_terminal)
+        self.assertFalse(credential._released)
+        self.assertEqual(spawner.requests, [])
+        self.assertEqual(source.calls, [])
+        self.assertNotIn("spawn", events)
+        self.assertEqual(_cleanup_counts(kernel), (0, 0, 0))
+        self.assertEqual(
+            runtime.context_ledger.safe_metadata()["active_gate_activity_count"],
+            1,
+        )
+
+        prepared = self._coordinate(
+            launcher,
+            resolver,
+            gate,
+            credential,
+            cleanup_ticket=ticket,
+        )
+        self.assertTrue(prepared.close())
+        self.assertTrue(ticket.is_terminal)
+
+    def test_ticket_bind_return_alias_is_rejected_and_recovered_before_io(self):
+        runtime, gate, credential = _make_authorized_credential()
+        launcher, resolver, source, spawner, kernel, events = _components()
+        ticket = issue_resolver_cleanup_ticket()
+        ledger_type = http_module._ResolverCoordinationRecoveryLedger
+        original = ledger_type.bind_coordination
+
+        def return_alias(selected, *args, **kwargs):
+            original(selected, *args, **kwargs)
+            return object(), object()
+
+        with patch.object(
+            ledger_type,
+            "bind_coordination",
+            new=return_alias,
+        ):
+            with self.assertRaises(EndpointPolicyError):
+                self._coordinate(
+                    launcher,
+                    resolver,
+                    gate,
+                    credential,
+                    cleanup_ticket=ticket,
+                )
+
+        self.assertTrue(ticket.is_terminal)
+        self.assertTrue(credential._released)
+        self.assertEqual(spawner.requests, [])
+        self.assertEqual(source.calls, [])
+        self.assertNotIn("spawn", events)
+        self.assertEqual(_cleanup_counts(kernel), (0, 0, 0))
+        self.assertEqual(
+            runtime.context_ledger.safe_metadata()["active_gate_activity_count"],
+            0,
+        )
 
 
 if __name__ == "__main__":

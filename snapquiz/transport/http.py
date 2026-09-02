@@ -18,6 +18,7 @@ from snapquiz.runtime.attempt import (
     AttemptGate,
     AttemptPermit,
     CredentialResolutionPermit,
+    _CREDENTIAL_RESOLVER_AUTHORITY,
     _TRANSPORT_ATTEMPT_AUTHORITY,
 )
 from snapquiz.transport.address_policy import (
@@ -39,13 +40,13 @@ from snapquiz.transport.resolver import (
     ResolverResultReceipt,
     _ResolverLifecycleLedger,
     _RESOLVER_LIFECYCLE_AUTHORITY,
-    _cleanup_guard,
 )
 
 
 RESOLVER_COORDINATOR_POLICY_VERSION = "snapquiz.resolver-coordinator.v1"
 
 _PREPARED_RESOLVER_ATTEMPT_AUTHORITY = object()
+_RESOLVER_CLEANUP_TICKET_AUTHORITY = object()
 
 
 def _coordinator_error(message: str) -> EndpointPolicyError:
@@ -56,144 +57,813 @@ def _coordinator_error(message: str) -> EndpointPolicyError:
     )
 
 
-def _cleanup_failed_coordination(
-    *,
-    gate: AttemptGate,
-    credential_permit: CredentialResolutionPermit,
-    credential_resolver: CredentialResolver,
-    pre_guard: PreAttemptResolverGuard | None,
-    terminal_guard: AttemptTerminalGuard | None,
-    credential_handle: CredentialHandle | None,
-    credential_publication_id: UUID | None = None,
-    credential_handle_id: UUID | None = None,
-    credential_handle_digest: Digest256 | None = None,
-    attempt: AttemptPermit | None,
-    claim_id: UUID | None,
-    terminal_guard_id: UUID | None = None,
-    terminal_guard_digest: Digest256 | None = None,
-    helper_terminal_hint: bool = False,
-) -> None:
-    """Best-effort cleanup without ever changing the selected primary error.
+class _ResolverCoordinationRecoveryLedger:
+    """Strong, cleanup-only ownership for one coordinator invocation.
 
-    Rejected owner/proof candidates are side-effect free.  This allows an
-    uncertain observer path to try the exact terminal-guard proof, then the
-    no-guard proof, and finally active-attempt abandonment without stealing a
-    different owner's state.
+    The public ticket never receives transport capabilities.  This ledger
+    freezes each owner before the operation that can publish it, then retains
+    those exact identities until independent observers prove all three layers
+    terminal in helper -> attempt -> credential order.
     """
 
-    helper_owner: object | None = terminal_guard or pre_guard
-    helper_terminal = helper_terminal_hint or helper_owner is None
-    if helper_owner is not None and not helper_terminal:
-        try:
-            helper_owner.cleanup()  # type: ignore[union-attr]
-        except BaseException:
-            pass
-        try:
-            helper_terminal = (
-                helper_owner.safe_metadata()["state"] == "terminal"  # type: ignore[union-attr]
-            )
-        except BaseException:
-            helper_terminal = False
+    __slots__ = (
+        "_lock",
+        "_state",
+        "_ticket",
+        "_coordination_owner",
+        "_launcher",
+        "_credential_resolver",
+        "_gate",
+        "_credential_permit",
+        "_ready_reservation_owner",
+        "_ready_launch_owner",
+        "_ready_ticket",
+        "_ready_capability_snapshot",
+        "_ready_ledger",
+        "_credential_publication_id",
+        "_credential_handle",
+        "_credential_handle_id",
+        "_credential_handle_digest",
+        "_attempt_started",
+        "_attempt",
+        "_claim_id",
+        "_terminal_guard_id",
+        "_terminal_guard_digest",
+        "_prepared_published",
+        "_resources_terminal_proven",
+    )
 
-    # The helper owner is the outermost resource.  If kill/reap/pipe cleanup
-    # is not proven, retaining the claimed Gate and handle is safer than
-    # terminalizing their only recovery anchor while a child may still live.
-    if not helper_terminal:
-        return
+    def __init__(self) -> None:
+        self._lock = RLock()
+        self._state = "issued"
+        self._ticket: ResolverCleanupTicket | None = None
+        self._coordination_owner: object | None = None
+        self._launcher: ResolverHelperLauncher | None = None
+        self._credential_resolver: CredentialResolver | None = None
+        self._gate: AttemptGate | None = None
+        self._credential_permit: CredentialResolutionPermit | None = None
+        self._ready_reservation_owner = object()
+        self._ready_launch_owner = object()
+        self._ready_ticket: object | None = None
+        self._ready_capability_snapshot: object | None = None
+        self._ready_ledger: _ResolverLifecycleLedger | None = None
+        self._credential_publication_id: UUID | None = None
+        self._credential_handle: CredentialHandle | None = None
+        self._credential_handle_id: UUID | None = None
+        self._credential_handle_digest: Digest256 | None = None
+        self._attempt_started = False
+        self._attempt: AttemptPermit | None = None
+        self._claim_id: UUID | None = None
+        self._terminal_guard_id: UUID | None = None
+        self._terminal_guard_digest: Digest256 | None = None
+        self._prepared_published = False
+        self._resources_terminal_proven = False
 
-    attempt_terminal = False
-    if attempt is not None and type(claim_id) is UUID:
-        try:
-            attempt_terminal = gate._recover_attempt_for_cleanup(
-                attempt,
-                credential_permit=credential_permit,
-                credential_handle_id=credential_handle_id,
-                credential_handle_digest=credential_handle_digest,
-                claim_id=claim_id,
-                guard_id=terminal_guard_id,
-                guard_digest=terminal_guard_digest,
-                _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
-            )
-        except BaseException:
-            attempt_terminal = False
+    def attach_ticket(
+        self,
+        ticket: "ResolverCleanupTicket",
+        *,
+        _authority: object | None = None,
+    ) -> None:
+        if _authority is not _RESOLVER_CLEANUP_TICKET_AUTHORITY:
+            raise TypeError("resolver cleanup ticket requires its factory")
+        with self._lock:
+            if self._ticket is not None or self._state != "issued":
+                raise _coordinator_error("resolver cleanup ticket 已绑定。")
+            self._ticket = ticket
 
-    # A wrapper may publish the real AttemptPermit, then return a different
-    # object normally.  The assigned object cannot identify that live ledger
-    # entry, so fall back to the frozen credential proof used for reservation.
-    if (
-        not attempt_terminal
-        and type(credential_handle_id) is UUID
-        and type(credential_handle_digest) is Digest256
-    ):
-        try:
-            attempt_terminal = gate._recover_published_attempt_for_cleanup(
-                credential_permit=credential_permit,
-                credential_handle_id=credential_handle_id,
-                credential_handle_digest=credential_handle_digest,
-                _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+    def ticket_is_attached(self, ticket: "ResolverCleanupTicket") -> bool:
+        with self._lock:
+            return (
+                self._ticket is ticket
+                and ticket._ledger_snapshot is self
+                and self._state == "issued"
+                and self._coordination_owner is None
             )
-        except BaseException:
-            attempt_terminal = False
 
-    handle_terminal = False
-    if type(credential_publication_id) is UUID:
-        try:
-            credential_resolver._recover_published_handle_for_cleanup(
-                credential_permit,
-                publication_id=credential_publication_id,
-                _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+    def bind_coordination(
+        self,
+        ticket: "ResolverCleanupTicket",
+        *,
+        coordination_owner: object,
+        launcher: ResolverHelperLauncher,
+        credential_resolver: CredentialResolver,
+        gate: AttemptGate,
+        credential_permit: CredentialResolutionPermit,
+    ) -> tuple[object, object]:
+        """Bind once before reservation, spawn, secret read, or budget use."""
+
+        if coordination_owner is None:
+            raise TypeError("coordination_owner must be an identity object")
+        with self._lock:
+            if (
+                self._ticket is not ticket
+                or ticket._ledger_snapshot is not self
+                or self._state != "issued"
+                or self._coordination_owner is not None
+            ):
+                raise _coordinator_error(
+                    "resolver cleanup ticket 已使用或不属于当前协调。"
+                )
+            self._coordination_owner = coordination_owner
+            self._launcher = launcher
+            self._credential_resolver = credential_resolver
+            self._gate = gate
+            self._credential_permit = credential_permit
+            self._state = "coordinating"
+            return (
+                self._ready_reservation_owner,
+                self._ready_launch_owner,
             )
-        except BaseException:
-            pass
-        try:
-            handle_terminal = (
-                credential_resolver._published_handle_is_closed_for_cleanup(
-                    credential_permit,
-                    publication_id=credential_publication_id,
-                    _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+
+    def _require_coordinating_locked(self, owner: object) -> None:
+        if (
+            self._coordination_owner is not owner
+            or self._state != "coordinating"
+        ):
+            raise _coordinator_error("resolver cleanup owner 或状态已经变化。")
+
+    def coordination_is_exact(
+        self,
+        ticket: "ResolverCleanupTicket",
+        owner: object,
+        *,
+        launcher: ResolverHelperLauncher,
+        credential_resolver: CredentialResolver,
+        gate: AttemptGate,
+        credential_permit: CredentialResolutionPermit,
+        reservation_owner: object,
+        launch_owner: object,
+    ) -> bool:
+        with self._lock:
+            return (
+                self._ticket is ticket
+                and self._coordination_owner is owner
+                and self._state == "coordinating"
+                and self._launcher is launcher
+                and self._credential_resolver is credential_resolver
+                and self._gate is gate
+                and self._credential_permit is credential_permit
+                and self._ready_reservation_owner is reservation_owner
+                and self._ready_launch_owner is launch_owner
+            )
+
+    def record_ready_ticket(
+        self,
+        owner: object,
+        ticket: object,
+        capability_snapshot: object,
+    ) -> None:
+        with self._lock:
+            self._require_coordinating_locked(owner)
+            if self._ready_ticket is not None:
+                raise _coordinator_error("resolver READY ticket 已记录。")
+            if (
+                getattr(capability_snapshot, "launcher", None)
+                is not self._launcher
+                or getattr(capability_snapshot, "reservation_owner", None)
+                is not self._ready_reservation_owner
+                or getattr(capability_snapshot, "transport_claim_id", None)
+                is None
+            ):
+                raise _coordinator_error("resolver READY ticket snapshot 无效。")
+            self._ready_ticket = ticket
+            self._ready_capability_snapshot = capability_snapshot
+            self._claim_id = getattr(
+                capability_snapshot,
+                "transport_claim_id",
+            )
+
+    def ready_ticket_is_exact(
+        self,
+        owner: object,
+        ticket: object,
+        capability_snapshot: object,
+    ) -> bool:
+        with self._lock:
+            return (
+                self._coordination_owner is owner
+                and self._state == "coordinating"
+                and self._ready_ticket is ticket
+                and self._ready_capability_snapshot is capability_snapshot
+                and self._claim_id
+                == getattr(capability_snapshot, "transport_claim_id", None)
+            )
+
+    def record_ready_ledger(
+        self,
+        owner: object,
+        ledger: _ResolverLifecycleLedger,
+    ) -> None:
+        with self._lock:
+            self._require_coordinating_locked(owner)
+            if (
+                type(ledger) is not _ResolverLifecycleLedger
+                or self._ready_ticket is None
+                or ledger._capability is not self._ready_ticket
+            ):
+                raise _coordinator_error("resolver READY ledger snapshot 无效。")
+            self._ready_ledger = ledger
+
+    def ready_ledger_is_exact(
+        self,
+        owner: object,
+        ledger: _ResolverLifecycleLedger,
+    ) -> bool:
+        with self._lock:
+            return (
+                self._coordination_owner is owner
+                and self._state == "coordinating"
+                and self._ready_ledger is ledger
+                and ledger._capability is self._ready_ticket
+            )
+
+    def begin_credential_publication(
+        self,
+        owner: object,
+        publication_id: UUID,
+    ) -> None:
+        require_uuid(publication_id, "credential_publication_id")
+        with self._lock:
+            self._require_coordinating_locked(owner)
+            if self._credential_publication_id is not None:
+                raise _coordinator_error("credential publication 已开始。")
+            self._credential_publication_id = publication_id
+
+    def credential_publication_is_exact(
+        self,
+        owner: object,
+        publication_id: UUID,
+    ) -> bool:
+        with self._lock:
+            return (
+                self._coordination_owner is owner
+                and self._state == "coordinating"
+                and self._credential_publication_id == publication_id
+            )
+
+    def record_credential_handle(
+        self,
+        owner: object,
+        handle: CredentialHandle,
+        *,
+        handle_id: UUID,
+        handle_digest: Digest256,
+    ) -> None:
+        require_uuid(handle_id, "credential_handle_id")
+        if type(handle_digest) is not Digest256:
+            raise TypeError("handle_digest must be Digest256")
+        with self._lock:
+            self._require_coordinating_locked(owner)
+            if (
+                type(handle) is not CredentialHandle
+                or self._credential_publication_id is None
+                or self._credential_handle is not None
+            ):
+                raise _coordinator_error("credential handle snapshot 无效。")
+            self._credential_handle = handle
+            self._credential_handle_id = handle_id
+            self._credential_handle_digest = handle_digest
+
+    def credential_handle_is_exact(
+        self,
+        owner: object,
+        handle: CredentialHandle,
+        *,
+        handle_id: UUID,
+        handle_digest: Digest256,
+    ) -> bool:
+        with self._lock:
+            return (
+                self._coordination_owner is owner
+                and self._state == "coordinating"
+                and self._credential_handle is handle
+                and self._credential_handle_id == handle_id
+                and self._credential_handle_digest == handle_digest
+            )
+
+    def begin_attempt_publication(self, owner: object) -> None:
+        with self._lock:
+            self._require_coordinating_locked(owner)
+            if (
+                self._attempt_started
+                or type(self._credential_handle_id) is not UUID
+                or type(self._credential_handle_digest) is not Digest256
+            ):
+                raise _coordinator_error("attempt publication snapshot 无效。")
+            self._attempt_started = True
+
+    def attempt_publication_is_started(self, owner: object) -> bool:
+        with self._lock:
+            return (
+                self._coordination_owner is owner
+                and self._state == "coordinating"
+                and self._attempt_started
+            )
+
+    def record_attempt(
+        self,
+        owner: object,
+        attempt: AttemptPermit,
+    ) -> bool:
+        with self._lock:
+            self._require_coordinating_locked(owner)
+            if type(attempt) is not AttemptPermit:
+                return False
+            if not self._attempt_started or self._attempt is not None:
+                raise _coordinator_error("attempt owner snapshot 无效。")
+            permit = self._credential_permit
+            if (
+                attempt._attempt_gate is not self._gate
+                or type(permit) is not CredentialResolutionPermit
+                or attempt.credential_permit_id != permit.permit_id
+                or attempt.credential_permit_digest != permit.permit_digest
+                or attempt.credential_handle_id != self._credential_handle_id
+                or attempt.credential_handle_digest
+                != self._credential_handle_digest
+            ):
+                return False
+            self._attempt = attempt
+            return True
+
+    def attempt_is_exact(
+        self,
+        owner: object,
+        attempt: AttemptPermit,
+    ) -> bool:
+        with self._lock:
+            return (
+                self._coordination_owner is owner
+                and self._state == "coordinating"
+                and self._attempt is attempt
+            )
+
+    def record_terminal_guard(
+        self,
+        owner: object,
+        *,
+        guard_id: UUID,
+        guard_digest: Digest256,
+    ) -> None:
+        require_uuid(guard_id, "terminal_guard_id")
+        if type(guard_digest) is not Digest256:
+            raise TypeError("guard_digest must be Digest256")
+        with self._lock:
+            self._require_coordinating_locked(owner)
+            if self._attempt is None:
+                raise _coordinator_error("terminal guard 缺少 attempt owner。")
+            self._terminal_guard_id = guard_id
+            self._terminal_guard_digest = guard_digest
+
+    def terminal_guard_is_exact(
+        self,
+        owner: object,
+        *,
+        guard_id: UUID,
+        guard_digest: Digest256,
+    ) -> bool:
+        with self._lock:
+            return (
+                self._coordination_owner is owner
+                and self._state == "coordinating"
+                and self._terminal_guard_id == guard_id
+                and self._terminal_guard_digest == guard_digest
+            )
+
+    def prepared_inputs_are_exact(
+        self,
+        owner: object,
+        *,
+        gate: AttemptGate,
+        credential_resolver: CredentialResolver,
+        terminal_guard_ledger: _ResolverLifecycleLedger,
+        credential_handle: CredentialHandle,
+        attempt_permit: AttemptPermit,
+        transport_claim_id: UUID,
+        terminal_guard_id: UUID,
+        terminal_guard_digest: Digest256,
+    ) -> bool:
+        with self._lock:
+            return (
+                self._coordination_owner is owner
+                and self._state == "coordinating"
+                and self._gate is gate
+                and self._credential_resolver is credential_resolver
+                and self._ready_ledger is terminal_guard_ledger
+                and self._credential_handle is credential_handle
+                and self._attempt is attempt_permit
+                and self._claim_id == transport_claim_id
+                and self._terminal_guard_id == terminal_guard_id
+                and self._terminal_guard_digest == terminal_guard_digest
+            )
+
+    def publish_recoverable(self, owner: object) -> None:
+        with self._lock:
+            self._require_coordinating_locked(owner)
+            self._prepared_published = True
+            self._state = "recoverable"
+
+    def prepared_publication_is_committed(self, owner: object) -> bool:
+        with self._lock:
+            return (
+                self._prepared_published
+                and self._state in ("recoverable", "terminal")
+                and (
+                    self._coordination_owner is owner
+                    or self._state == "terminal"
                 )
             )
-        except BaseException:
-            handle_terminal = False
-        if not handle_terminal:
+
+    def _helper_terminal_locked(self, errors: list[BaseException]) -> bool:
+        launcher = self._launcher
+        if type(launcher) is not ResolverHelperLauncher:
+            return False
+        ticket = self._ready_ticket
+        if ticket is None:
             try:
-                credential_resolver._recover_published_handle_state_for_cleanup(
-                    credential_permit,
-                    publication_id=credential_publication_id,
+                launcher._recover_lifecycle_reservation(
+                    reservation_owner=self._ready_reservation_owner,
+                    _authority=_RESOLVER_LIFECYCLE_AUTHORITY,
+                )
+            except BaseException as error:
+                errors.append(error)
+            try:
+                return launcher._lifecycle_reservation_is_absent_for_cleanup(
+                    reservation_owner=self._ready_reservation_owner,
+                    _authority=_RESOLVER_LIFECYCLE_AUTHORITY,
+                )
+            except BaseException as error:
+                errors.append(error)
+                return False
+
+        try:
+            launcher._recover_ready_publication_for_cleanup(
+                ticket,
+                launch_owner=self._ready_launch_owner,
+                _authority=_RESOLVER_LIFECYCLE_AUTHORITY,
+            )
+        except BaseException as error:
+            errors.append(error)
+        try:
+            launcher._recover_lifecycle_reservation(
+                reservation_owner=self._ready_reservation_owner,
+                _authority=_RESOLVER_LIFECYCLE_AUTHORITY,
+            )
+        except BaseException as error:
+            errors.append(error)
+        try:
+            return launcher._ready_publication_is_terminal_for_cleanup(
+                ticket,
+                reservation_owner=self._ready_reservation_owner,
+                launch_owner=self._ready_launch_owner,
+                ledger=self._ready_ledger,
+                capability_snapshot=self._ready_capability_snapshot,
+                _authority=_RESOLVER_LIFECYCLE_AUTHORITY,
+            )
+        except BaseException as error:
+            errors.append(error)
+            return False
+
+    def _attempt_terminal_locked(self, errors: list[BaseException]) -> bool:
+        if not self._attempt_started:
+            return True
+        gate = self._gate
+        permit = self._credential_permit
+        handle_id = self._credential_handle_id
+        handle_digest = self._credential_handle_digest
+        if (
+            type(gate) is not AttemptGate
+            or type(permit) is not CredentialResolutionPermit
+            or type(handle_id) is not UUID
+            or type(handle_digest) is not Digest256
+        ):
+            return False
+        if self._attempt is not None and type(self._claim_id) is UUID:
+            try:
+                gate._recover_attempt_for_cleanup(
+                    self._attempt,
+                    credential_permit=permit,
+                    credential_handle_id=handle_id,
+                    credential_handle_digest=handle_digest,
+                    claim_id=self._claim_id,
+                    guard_id=self._terminal_guard_id,
+                    guard_digest=self._terminal_guard_digest,
                     _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
                 )
-            except BaseException:
-                pass
+            except BaseException as error:
+                errors.append(error)
+        try:
+            gate._recover_published_attempt_for_cleanup(
+                credential_permit=permit,
+                credential_handle_id=handle_id,
+                credential_handle_digest=handle_digest,
+                _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+            )
+        except BaseException as error:
+            errors.append(error)
+        try:
+            state = gate._attempt_terminal_state_for_cleanup(
+                credential_permit=permit,
+                credential_handle_id=handle_id,
+                credential_handle_digest=handle_digest,
+                attempt=self._attempt,
+                _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+            )
+        except BaseException as error:
+            errors.append(error)
+            return False
+        return state in ("absent", "terminal")
+
+    def _credential_terminal_locked(
+        self,
+        errors: list[BaseException],
+        *,
+        raise_errors: bool,
+    ) -> bool:
+        resolver = self._credential_resolver
+        gate = self._gate
+        permit = self._credential_permit
+        if (
+            type(resolver) is not CredentialResolver
+            or type(gate) is not AttemptGate
+            or type(permit) is not CredentialResolutionPermit
+        ):
+            return False
+
+        publication_id = self._credential_publication_id
+        publication_state = "absent"
+        close_failed = False
+        if type(publication_id) is UUID:
+            if self._credential_handle is not None:
+                try:
+                    resolver.close(self._credential_handle)
+                except BaseException as error:
+                    errors.append(error)
+                    close_failed = True
+            if not close_failed or not raise_errors:
+                try:
+                    resolver._recover_published_handle_for_cleanup(
+                        permit,
+                        publication_id=publication_id,
+                        _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+                    )
+                except BaseException as error:
+                    errors.append(error)
+                try:
+                    resolver._recover_published_handle_state_for_cleanup(
+                        permit,
+                        publication_id=publication_id,
+                        _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+                    )
+                except BaseException as error:
+                    errors.append(error)
             try:
-                handle_terminal = (
-                    credential_resolver._published_handle_is_closed_for_cleanup(
-                        credential_permit,
-                        publication_id=credential_publication_id,
+                publication_state = (
+                    resolver._published_handle_terminal_state_for_cleanup(
+                        permit,
+                        publication_id=publication_id,
                         _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
                     )
                 )
-            except BaseException:
-                handle_terminal = False
+            except BaseException as error:
+                errors.append(error)
+                publication_state = "ambiguous"
 
-    if credential_handle is not None and not handle_terminal:
+        if publication_state == "absent":
+            try:
+                gate.abandon_credential_resolution(permit)
+            except BaseException as error:
+                errors.append(error)
         try:
-            handle_terminal = (
-                credential_resolver._handle_is_closed_for_cleanup(
-                    credential_handle,
-                    _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
-                )
+            gate_terminal = gate._credential_resolution_is_terminal_for_cleanup(
+                permit,
+                _authority=_CREDENTIAL_RESOLVER_AUTHORITY,
             )
-        except BaseException:
-            handle_terminal = False
+        except BaseException as error:
+            errors.append(error)
+            gate_terminal = False
+        return publication_state in ("absent", "closed") and gate_terminal
 
-    if credential_handle is None and attempt is None:
-        # Covers launch-before-read failures.  CredentialResolver owns any
-        # permit it successfully claimed, so this public transition can only
-        # abandon the still-authorized pre-read state.
+    def _release_resource_refs_locked(self) -> None:
+        self._coordination_owner = None
+        self._launcher = None
+        self._credential_resolver = None
+        self._gate = None
+        self._credential_permit = None
+        self._ready_reservation_owner = None
+        self._ready_launch_owner = None
+        self._ready_ticket = None
+        self._ready_capability_snapshot = None
+        self._ready_ledger = None
+        self._credential_publication_id = None
+        self._credential_handle = None
+        self._credential_handle_id = None
+        self._credential_handle_digest = None
+        self._attempt = None
+        self._claim_id = None
+        self._terminal_guard_id = None
+        self._terminal_guard_digest = None
+
+    def _resource_refs_are_released_locked(self) -> bool:
+        return self._resources_terminal_proven and all(
+            value is None
+            for value in (
+                self._coordination_owner,
+                self._launcher,
+                self._credential_resolver,
+                self._gate,
+                self._credential_permit,
+                self._ready_reservation_owner,
+                self._ready_launch_owner,
+                self._ready_ticket,
+                self._ready_capability_snapshot,
+                self._ready_ledger,
+                self._credential_publication_id,
+                self._credential_handle,
+                self._credential_handle_id,
+                self._credential_handle_digest,
+                self._attempt,
+                self._claim_id,
+                self._terminal_guard_id,
+                self._terminal_guard_digest,
+            )
+        )
+
+    def _retry_locked(self, *, raise_errors: bool) -> bool:
+        errors: list[BaseException] = []
+        self._state = "retrying"
         try:
-            gate.abandon_credential_resolution(credential_permit)
-        except BaseException:
-            pass
+            all_terminal = self._resources_terminal_proven
+            if not all_terminal:
+                helper_terminal = self._helper_terminal_locked(errors)
+                attempt_terminal = False
+                credential_terminal = False
+                if helper_terminal:
+                    attempt_terminal = self._attempt_terminal_locked(errors)
+                if helper_terminal and attempt_terminal:
+                    credential_terminal = self._credential_terminal_locked(
+                        errors,
+                        raise_errors=raise_errors,
+                    )
+                all_terminal = (
+                    helper_terminal
+                    and attempt_terminal
+                    and credential_terminal
+                )
+                if all_terminal:
+                    self._resources_terminal_proven = True
+            if all_terminal:
+                try:
+                    self._release_resource_refs_locked()
+                except BaseException as error:
+                    errors.append(error)
+                all_terminal = self._resource_refs_are_released_locked()
+                if not all_terminal:
+                    errors.append(
+                        _coordinator_error(
+                            "resolver cleanup resource release 未提交。"
+                        )
+                    )
+            self._state = "terminal" if all_terminal else "recoverable"
+            if raise_errors and errors:
+                raise errors[0]
+            return all_terminal
+        finally:
+            if self._state == "retrying":
+                self._state = "recoverable"
+
+    def fail_and_retry(self, owner: object) -> bool:
+        """Internal failure path; never retain or replace the primary error."""
+
+        with self._lock:
+            if self._coordination_owner is not owner:
+                return False
+            if self._state == "terminal":
+                return True
+            if self._state == "coordinating":
+                self._state = "recoverable"
+            if self._state != "recoverable":
+                return False
+            return self._retry_locked(raise_errors=False)
+
+    def retry_cleanup(self, ticket: "ResolverCleanupTicket") -> bool:
+        with self._lock:
+            if self._ticket is not ticket:
+                return False
+            if self._state == "terminal":
+                return True
+            if self._state in ("issued", "coordinating", "retrying"):
+                return False
+            if self._state != "recoverable":
+                return False
+            try:
+                return self._retry_locked(raise_errors=False)
+            except BaseException:
+                return False
+
+    def retry_for_prepared(self, *, _authority: object | None = None) -> bool:
+        if _authority is not _PREPARED_RESOLVER_ATTEMPT_AUTHORITY:
+            raise TypeError("prepared cleanup requires coordinator authority")
+        with self._lock:
+            if self._state == "terminal":
+                return True
+            if self._state != "recoverable":
+                return False
+            return self._retry_locked(raise_errors=True)
+
+    def is_terminal(self) -> bool:
+        with self._lock:
+            return self._state == "terminal"
+
+    def safe_metadata(self, ticket: "ResolverCleanupTicket") -> dict[str, object]:
+        with self._lock:
+            if self._ticket is not ticket:
+                return {
+                    "policy_version": RESOLVER_COORDINATOR_POLICY_VERSION,
+                    "state": "invalid",
+                    "terminal": False,
+                    "retryable": False,
+                }
+            return {
+                "policy_version": RESOLVER_COORDINATOR_POLICY_VERSION,
+                "state": self._state,
+                "terminal": self._state == "terminal",
+                "retryable": self._state == "recoverable",
+            }
+
+
+@runtime_final
+class ResolverCleanupTicket:
+    """Caller-owned, cleanup-only recovery handle issued before coordination."""
+
+    __slots__ = ("policy_version", "_ledger", "_ledger_snapshot")
+
+    def __init__(
+        self,
+        ledger: _ResolverCoordinationRecoveryLedger,
+        *,
+        _authority: object | None = None,
+    ) -> None:
+        if _authority is not _RESOLVER_CLEANUP_TICKET_AUTHORITY:
+            raise TypeError("ResolverCleanupTicket requires its factory")
+        if type(ledger) is not _ResolverCoordinationRecoveryLedger:
+            raise TypeError("ledger must be resolver recovery ledger")
+        object.__setattr__(
+            self,
+            "policy_version",
+            RESOLVER_COORDINATOR_POLICY_VERSION,
+        )
+        object.__setattr__(self, "_ledger", ledger)
+        object.__setattr__(self, "_ledger_snapshot", ledger)
+        ledger.attach_ticket(
+            self,
+            _authority=_RESOLVER_CLEANUP_TICKET_AUTHORITY,
+        )
+
+    def __setattr__(self, name: str, value: object) -> None:
+        del name, value
+        raise AttributeError("ResolverCleanupTicket is immutable")
+
+    def __copy__(self) -> "ResolverCleanupTicket":
+        raise TypeError("ResolverCleanupTicket cannot be copied")
+
+    def __deepcopy__(self, memo: dict[int, object]) -> "ResolverCleanupTicket":
+        del memo
+        raise TypeError("ResolverCleanupTicket cannot be copied")
+
+    def __reduce__(self) -> object:
+        raise TypeError("ResolverCleanupTicket cannot be serialized")
+
+    def __reduce_ex__(self, protocol: int) -> object:
+        del protocol
+        raise TypeError("ResolverCleanupTicket cannot be serialized")
+
+    def __repr__(self) -> str:
+        metadata = self.safe_metadata()
+        return f"ResolverCleanupTicket(state={metadata['state']!r})"
+
+    @property
+    def is_terminal(self) -> bool:
+        return bool(self.safe_metadata()["terminal"])
+
+    def safe_metadata(self) -> dict[str, object]:
+        return self._ledger_snapshot.safe_metadata(self)
+
+    def retry_cleanup(self) -> bool:
+        return self._ledger_snapshot.retry_cleanup(self)
+
+
+def issue_resolver_cleanup_ticket() -> ResolverCleanupTicket:
+    """Issue an inert recovery owner before any resolver-side operation."""
+
+    ledger = _ResolverCoordinationRecoveryLedger()
+    ticket = ResolverCleanupTicket(
+        ledger,
+        _authority=_RESOLVER_CLEANUP_TICKET_AUTHORITY,
+    )
+    if not ledger.ticket_is_attached(ticket):
+        raise _coordinator_error("resolver cleanup ticket issuance 未提交。")
+    return ticket
 
 
 def _build_started_resolution(
@@ -234,6 +904,7 @@ class PreparedResolverAttempt:
         "_credential_handle_snapshot",
         "_credential_handle_id_snapshot",
         "_credential_handle_digest_snapshot",
+        "_recovery_ledger_snapshot",
         "_status",
         "_lock",
     )
@@ -253,6 +924,8 @@ class PreparedResolverAttempt:
         terminal_guard_id: UUID,
         terminal_guard_digest: Digest256,
         dns_start_id: UUID,
+        recovery_ledger: _ResolverCoordinationRecoveryLedger,
+        coordination_owner: object,
         _authority: object | None = None,
     ) -> None:
         if _authority is not _PREPARED_RESOLVER_ATTEMPT_AUTHORITY:
@@ -275,6 +948,8 @@ class PreparedResolverAttempt:
             raise TypeError("result_receipt must be ResolverResultReceipt")
         if type(resolution_set) is not ResolutionSet:
             raise TypeError("resolution_set must be ResolutionSet")
+        if type(recovery_ledger) is not _ResolverCoordinationRecoveryLedger:
+            raise TypeError("recovery_ledger must be resolver recovery ledger")
         require_uuid(transport_claim_id, "transport_claim_id")
         require_uuid(terminal_guard_id, "terminal_guard_id")
         require_uuid(dns_start_id, "dns_start_id")
@@ -317,6 +992,18 @@ class PreparedResolverAttempt:
         )
         if not all(exact):
             raise _coordinator_error("resolver attempt 的 owner proof 不匹配。")
+        if not recovery_ledger.prepared_inputs_are_exact(
+            coordination_owner,
+            gate=gate,
+            credential_resolver=credential_resolver,
+            terminal_guard_ledger=terminal_guard_ledger,
+            credential_handle=credential_handle,
+            attempt_permit=attempt_permit,
+            transport_claim_id=transport_claim_id,
+            terminal_guard_id=terminal_guard_id,
+            terminal_guard_digest=terminal_guard_digest,
+        ):
+            raise _coordinator_error("resolver cleanup ledger owner proof 不匹配。")
         if not gate._dns_start_is_committed(
             attempt_permit,
             claim_id=transport_claim_id,
@@ -349,6 +1036,7 @@ class PreparedResolverAttempt:
                 "_credential_handle_digest_snapshot",
                 credential_handle.handle_digest,
             ),
+            ("_recovery_ledger_snapshot", recovery_ledger),
             ("_status", "active"),
             ("_lock", RLock()),
         )
@@ -384,13 +1072,32 @@ class PreparedResolverAttempt:
             f"closed={self.is_closed!r})"
         )
 
+    def _sync_terminal_state_locked(self) -> None:
+        if (
+            self._status != "closed"
+            and self._recovery_ledger_snapshot.is_terminal()
+        ):
+            object.__setattr__(self, "_status", "closed")
+
+    def _sync_terminal_state(
+        self,
+        *,
+        _authority: object | None = None,
+    ) -> None:
+        if _authority is not _PREPARED_RESOLVER_ATTEMPT_AUTHORITY:
+            raise TypeError("prepared state sync requires coordinator authority")
+        with self._lock:
+            self._sync_terminal_state_locked()
+
     @property
     def is_closed(self) -> bool:
         with self._lock:
+            self._sync_terminal_state_locked()
             return self._status == "closed"
 
     def safe_metadata(self) -> dict[str, object]:
         with self._lock:
+            self._sync_terminal_state_locked()
             return {
                 "policy_version": self.policy_version,
                 "attempt_permit_id": str(
@@ -410,82 +1117,34 @@ class PreparedResolverAttempt:
         """Close every owner-held resource; consumed budget is not refunded."""
 
         with self._lock:
+            self._sync_terminal_state_locked()
             if self._status == "closed":
                 return False
             if self._status == "closing":
                 raise _coordinator_error("resolver attempt 正在终结。")
             object.__setattr__(self, "_status", "closing")
-
-            errors: list[BaseException] = []
             try:
-                _cleanup_guard(
-                    self._terminal_guard,
-                    self._terminal_guard_ledger_snapshot,
-                    observer=None,
-                    suppress_errors=False,
-                )
-            except BaseException as error:
-                errors.append(error)
-
-            helper_terminal = False
-            try:
-                helper_terminal = (
-                    self._terminal_guard_ledger_snapshot.is_terminal()
-                )
-            except BaseException:
-                pass
-
-            attempt_terminal = False
-            if helper_terminal:
-                try:
-                    attempt_terminal = (
-                        self._gate._recover_attempt_for_cleanup(
-                            self._attempt_permit_snapshot,
-                            credential_permit=self._credential_permit_snapshot,
-                            credential_handle_id=(
-                                self._credential_handle_id_snapshot
-                            ),
-                            credential_handle_digest=(
-                                self._credential_handle_digest_snapshot
-                            ),
-                            claim_id=self.transport_claim_id,
-                            guard_id=self.terminal_guard_id,
-                            guard_digest=self.terminal_guard_digest,
-                            _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
-                        )
-                    )
-                except BaseException:
-                    attempt_terminal = False
-
-            if attempt_terminal:
-                try:
-                    self._credential_resolver.close(
-                        self._credential_handle_snapshot
-                    )
-                except BaseException as error:
-                    errors.append(error)
-
-            handle_terminal = False
-            try:
-                handle_terminal = (
-                    self._credential_resolver._handle_is_closed_for_cleanup(
-                        self._credential_handle_snapshot,
-                        _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+                all_terminal = (
+                    self._recovery_ledger_snapshot.retry_for_prepared(
+                        _authority=_PREPARED_RESOLVER_ATTEMPT_AUTHORITY,
                     )
                 )
             except BaseException:
-                pass
-            all_terminal = (
-                helper_terminal and attempt_terminal and handle_terminal
-            )
+                object.__setattr__(
+                    self,
+                    "_status",
+                    (
+                        "closed"
+                        if self._recovery_ledger_snapshot.is_terminal()
+                        else "active"
+                    ),
+                )
+                raise
             object.__setattr__(
                 self,
                 "_status",
                 "closed" if all_terminal else "active",
             )
-
-            if errors:
-                raise errors[0]
             if not all_terminal:
                 raise _coordinator_error("resolver attempt 未能证明完整终结。")
             return True
@@ -497,6 +1156,7 @@ def coordinate_resolver_attempt(
     credential_resolver: CredentialResolver,
     gate: AttemptGate,
     credential_permit: CredentialResolutionPermit,
+    cleanup_ticket: ResolverCleanupTicket,
     observer: LifecycleObserver | None = None,
 ) -> PreparedResolverAttempt:
     """Resolve exactly once through READY -> secret -> claim -> DNS START.
@@ -515,8 +1175,43 @@ def coordinate_resolver_attempt(
         raise TypeError("gate must be AttemptGate")
     if type(credential_permit) is not CredentialResolutionPermit:
         raise TypeError("credential_permit must be CredentialResolutionPermit")
+    if type(cleanup_ticket) is not ResolverCleanupTicket:
+        raise TypeError("cleanup_ticket must be ResolverCleanupTicket")
     if credential_permit._attempt_gate is not gate:
         raise _coordinator_error("credential permit 不属于当前 AttemptGate。")
+    recovery_ledger = cleanup_ticket._ledger_snapshot
+    if type(recovery_ledger) is not _ResolverCoordinationRecoveryLedger:
+        raise _coordinator_error("resolver cleanup ticket ledger 无效。")
+    coordination_owner = object()
+    try:
+        (
+            ready_reservation_owner,
+            ready_launch_owner,
+        ) = recovery_ledger.bind_coordination(
+            cleanup_ticket,
+            coordination_owner=coordination_owner,
+            launcher=launcher,
+            credential_resolver=credential_resolver,
+            gate=gate,
+            credential_permit=credential_permit,
+        )
+        if not recovery_ledger.coordination_is_exact(
+            cleanup_ticket,
+            coordination_owner,
+            launcher=launcher,
+            credential_resolver=credential_resolver,
+            gate=gate,
+            credential_permit=credential_permit,
+            reservation_owner=ready_reservation_owner,
+            launch_owner=ready_launch_owner,
+        ):
+            raise _coordinator_error("resolver cleanup ticket bind 未提交。")
+    except BaseException:
+        try:
+            recovery_ledger.fail_and_retry(coordination_owner)
+        except BaseException:
+            pass
+        raise
 
     pre_guard: PreAttemptResolverGuard | None = None
     terminal_guard: AttemptTerminalGuard | None = None
@@ -526,13 +1221,10 @@ def coordinate_resolver_attempt(
     attempt: AttemptPermit | None = None
     terminal_guard_id: UUID | None = None
     terminal_guard_digest: Digest256 | None = None
-    helper_cleanup_terminal = False
     credential_publication_id: UUID | None = None
     ready_ledger_snapshot: _ResolverLifecycleLedger | None = None
     attempt_permit_id: UUID | None = None
     attempt_permit_digest: Digest256 | None = None
-    ready_reservation_owner = object()
-    ready_launch_owner = object()
     try:
         ready_publication_ticket = launcher._reserve_lifecycle_capability(
             reservation_owner=ready_reservation_owner,
@@ -547,30 +1239,24 @@ def coordinate_resolver_attempt(
                 _authority=_RESOLVER_LIFECYCLE_AUTHORITY,
             )
         )
+        recovery_ledger.record_ready_ticket(
+            coordination_owner,
+            ready_publication_ticket,
+            ready_capability_snapshot,
+        )
+        if not recovery_ledger.ready_ticket_is_exact(
+            coordination_owner,
+            ready_publication_ticket,
+            ready_capability_snapshot,
+        ):
+            raise _coordinator_error("resolver READY ticket recovery 未提交。")
         transport_claim_id = ready_capability_snapshot.transport_claim_id
         dns_start_id = ready_capability_snapshot.dns_start_id
     except BaseException:
-        # Reservation itself can return through an outer wrapper that raises
-        # before assignment.  The pre-created owner identity removes only
-        # this exact still-reserved entry and cannot steal a colliding caller.
         try:
-            launcher._recover_lifecycle_reservation(
-                reservation_owner=ready_reservation_owner,
-                _authority=_RESOLVER_LIFECYCLE_AUTHORITY,
-            )
+            recovery_ledger.fail_and_retry(coordination_owner)
         except BaseException:
             pass
-        _cleanup_failed_coordination(
-            gate=gate,
-            credential_permit=credential_permit,
-            credential_resolver=credential_resolver,
-            pre_guard=None,
-            terminal_guard=None,
-            credential_handle=None,
-            credential_publication_id=None,
-            attempt=None,
-            claim_id=None,
-        )
         raise
     try:
         # This is deliberately the first operation that can cross an injected
@@ -597,19 +1283,25 @@ def coordinate_resolver_attempt(
                 launch_owner=ready_launch_owner,
                 _authority=_RESOLVER_LIFECYCLE_AUTHORITY,
             )
+            recovery_ledger.record_ready_ledger(
+                coordination_owner,
+                ready_ledger_snapshot,
+            )
+            if not recovery_ledger.ready_ledger_is_exact(
+                coordination_owner,
+                ready_ledger_snapshot,
+            ):
+                raise _coordinator_error("resolver READY ledger recovery 未提交。")
             pre_guard = candidate_pre_guard
         except BaseException:
             # Cleanup is performed inside the launcher against the exact
             # pre-created launch owner.  No live guard is returned to this
             # exception path, and a concurrent loser cannot steal a winner.
             try:
-                helper_cleanup_terminal = (
-                    launcher._recover_ready_publication_for_cleanup(
-                        ready_publication_ticket,
-                        launch_owner=ready_launch_owner,
-                        _authority=_RESOLVER_LIFECYCLE_AUTHORITY,
-                    )
-                    or helper_cleanup_terminal
+                launcher._recover_ready_publication_for_cleanup(
+                    ready_publication_ticket,
+                    launch_owner=ready_launch_owner,
+                    _authority=_RESOLVER_LIFECYCLE_AUTHORITY,
                 )
             except BaseException:
                 pass
@@ -623,6 +1315,15 @@ def coordinate_resolver_attempt(
             raise
 
         credential_publication_id = uuid4()
+        recovery_ledger.begin_credential_publication(
+            coordination_owner,
+            credential_publication_id,
+        )
+        if not recovery_ledger.credential_publication_is_exact(
+            coordination_owner,
+            credential_publication_id,
+        ):
+            raise _coordinator_error("credential publication recovery 未提交。")
         try:
             candidate_credential_handle = credential_resolver.resolve(
                 credential_permit,
@@ -656,7 +1357,25 @@ def coordinate_resolver_attempt(
         credential_handle = candidate_credential_handle
         credential_handle_id = candidate_credential_handle.handle_id
         credential_handle_digest = candidate_credential_handle.handle_digest
+        recovery_ledger.record_credential_handle(
+            coordination_owner,
+            candidate_credential_handle,
+            handle_id=credential_handle_id,
+            handle_digest=credential_handle_digest,
+        )
+        if not recovery_ledger.credential_handle_is_exact(
+            coordination_owner,
+            candidate_credential_handle,
+            handle_id=credential_handle_id,
+            handle_digest=credential_handle_digest,
+        ):
+            raise _coordinator_error("credential handle recovery 未提交。")
 
+        recovery_ledger.begin_attempt_publication(coordination_owner)
+        if not recovery_ledger.attempt_publication_is_started(
+            coordination_owner
+        ):
+            raise _coordinator_error("attempt publication recovery 未提交。")
         try:
             attempt = gate.reserve_attempt(
                 credential_permit=credential_permit,
@@ -677,6 +1396,23 @@ def coordinate_resolver_attempt(
             except BaseException:
                 pass
             raise
+        candidate_attempt_is_expected = (
+            type(attempt) is AttemptPermit
+            and attempt._attempt_gate is gate
+            and attempt.credential_permit_id == credential_permit.permit_id
+            and attempt.credential_permit_digest == credential_permit.permit_digest
+            and attempt.credential_handle_id == credential_handle_id
+            and attempt.credential_handle_digest == credential_handle_digest
+        )
+        recovery_ledger.record_attempt(coordination_owner, attempt)
+        if (
+            candidate_attempt_is_expected
+            and not recovery_ledger.attempt_is_exact(
+                coordination_owner,
+                attempt,
+            )
+        ):
+            raise _coordinator_error("attempt owner recovery 未提交。")
 
         try:
             gate._claim_attempt(
@@ -740,22 +1476,16 @@ def coordinate_resolver_attempt(
             # pre-owner so only its matching terminal guard can be recovered.
             try:
                 if ready_ledger_snapshot is not None:
-                    helper_cleanup_terminal = (
-                        ready_ledger_snapshot.recover_transferred_guard_for_cleanup(
-                            pre_guard,
-                            attempt_permit_id=attempt_permit_id,
-                            attempt_permit_digest=attempt_permit_digest,
-                        )
-                        or helper_cleanup_terminal
+                    ready_ledger_snapshot.recover_transferred_guard_for_cleanup(
+                        pre_guard,
+                        attempt_permit_id=attempt_permit_id,
+                        attempt_permit_digest=attempt_permit_digest,
                     )
                 else:
-                    helper_cleanup_terminal = (
-                        pre_guard._recover_transferred_guard_for_cleanup(
-                            attempt_permit_id=attempt_permit_id,
-                            attempt_permit_digest=attempt_permit_digest,
-                            _authority=_RESOLVER_LIFECYCLE_AUTHORITY,
-                        )
-                        or helper_cleanup_terminal
+                    pre_guard._recover_transferred_guard_for_cleanup(
+                        attempt_permit_id=attempt_permit_id,
+                        attempt_permit_digest=attempt_permit_digest,
+                        _authority=_RESOLVER_LIFECYCLE_AUTHORITY,
                     )
             except BaseException:
                 pass
@@ -766,6 +1496,17 @@ def coordinate_resolver_attempt(
         )
         terminal_guard_id = terminal_snapshot.terminal_guard_id
         terminal_guard_digest = terminal_snapshot.terminal_guard_digest
+        recovery_ledger.record_terminal_guard(
+            coordination_owner,
+            guard_id=terminal_guard_id,
+            guard_digest=terminal_guard_digest,
+        )
+        if not recovery_ledger.terminal_guard_is_exact(
+            coordination_owner,
+            guard_id=terminal_guard_id,
+            guard_digest=terminal_guard_digest,
+        ):
+            raise _coordinator_error("terminal guard recovery 未提交。")
         try:
             gate._bind_terminal_guard(
                 attempt,
@@ -845,7 +1586,7 @@ def coordinate_resolver_attempt(
             attempt,
             result_receipt,
         )
-        return PreparedResolverAttempt(
+        prepared = PreparedResolverAttempt(
             gate=gate,
             credential_resolver=credential_resolver,
             terminal_guard=terminal_guard,
@@ -858,41 +1599,31 @@ def coordinate_resolver_attempt(
             terminal_guard_id=terminal_guard_id,
             terminal_guard_digest=terminal_guard_digest,
             dns_start_id=dns_start_id,
+            recovery_ledger=recovery_ledger,
+            coordination_owner=coordination_owner,
             _authority=_PREPARED_RESOLVER_ATTEMPT_AUTHORITY,
         )
+        recovery_ledger.publish_recoverable(coordination_owner)
+        if not recovery_ledger.prepared_publication_is_committed(
+            coordination_owner
+        ):
+            raise _coordinator_error("resolver cleanup ticket publication 未提交。")
+        prepared._sync_terminal_state(
+            _authority=_PREPARED_RESOLVER_ATTEMPT_AUTHORITY,
+        )
+        return prepared
     except BaseException:
         try:
-            helper_cleanup_terminal = (
-                launcher._recover_ready_publication_for_cleanup(
-                    ready_publication_ticket,
-                    launch_owner=ready_launch_owner,
-                    _authority=_RESOLVER_LIFECYCLE_AUTHORITY,
-                )
-                or helper_cleanup_terminal
-            )
+            recovery_ledger.fail_and_retry(coordination_owner)
         except BaseException:
             pass
-        _cleanup_failed_coordination(
-            gate=gate,
-            credential_permit=credential_permit,
-            credential_resolver=credential_resolver,
-            pre_guard=pre_guard,
-            terminal_guard=terminal_guard,
-            credential_handle=credential_handle,
-            credential_publication_id=credential_publication_id,
-            credential_handle_id=credential_handle_id,
-            credential_handle_digest=credential_handle_digest,
-            attempt=attempt,
-            claim_id=transport_claim_id,
-            terminal_guard_id=terminal_guard_id,
-            terminal_guard_digest=terminal_guard_digest,
-            helper_terminal_hint=helper_cleanup_terminal,
-        )
         raise
 
 
 __all__ = [
     "RESOLVER_COORDINATOR_POLICY_VERSION",
     "PreparedResolverAttempt",
+    "ResolverCleanupTicket",
     "coordinate_resolver_attempt",
+    "issue_resolver_cleanup_ticket",
 ]

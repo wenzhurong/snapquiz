@@ -534,6 +534,7 @@ class _ResolverLifecycleLedger:
         "_issued_receipt",
         "_issued_receipt_snapshot",
         "_issued_resolution_snapshot",
+        "_launch_owner_snapshot",
         "_on_terminal",
     )
 
@@ -570,7 +571,27 @@ class _ResolverLifecycleLedger:
         self._issued_receipt: ResolverResultReceipt | None = None
         self._issued_receipt_snapshot: _ResultReceiptIssuanceSnapshot | None = None
         self._issued_resolution_snapshot: _ResolutionPublicationSnapshot | None = None
+        self._launch_owner_snapshot: object | None = None
         self._on_terminal = on_terminal
+
+    def bind_launch_owner(
+        self,
+        capability: object,
+        launch_owner: object,
+    ) -> None:
+        """Freeze the exact launch identity before helper creation is possible."""
+
+        if launch_owner is None:
+            raise TypeError("launch_owner must be an identity object")
+        with self._lock:
+            if (
+                capability is not self._capability
+                or self._launch_owner_snapshot is not None
+                or _validated_lifecycle_capability_snapshot(capability)
+                != self._capability_snapshot
+            ):
+                raise _lifecycle_error("resolver helper launch owner 已变化。")
+            self._launch_owner_snapshot = launch_owner
 
     def require_exact_capability(
         self,
@@ -2382,6 +2403,8 @@ class _ReadyPublicationTicket:
         "capability_digest",
         "_launcher",
         "_reservation_owner",
+        "_launch_owner_snapshot",
+        "_ledger_snapshot",
     )
 
     def __init__(
@@ -2433,6 +2456,8 @@ class _ReadyPublicationTicket:
         )
         object.__setattr__(self, "_launcher", launcher)
         object.__setattr__(self, "_reservation_owner", reservation_owner)
+        object.__setattr__(self, "_launch_owner_snapshot", None)
+        object.__setattr__(self, "_ledger_snapshot", None)
         _validated_lifecycle_capability_snapshot(self, launcher=launcher)
 
     def __setattr__(self, name: str, value: object) -> None:
@@ -2614,6 +2639,74 @@ class ResolverHelperLauncher:
             del self._ready_publications[publication_id]
             return True
 
+    def _lifecycle_reservation_is_absent_for_cleanup(
+        self,
+        *,
+        reservation_owner: object,
+        _authority: object | None = None,
+    ) -> bool:
+        """Observe a lost-return reservation as absent without trusting recovery.
+
+        This path is for a coordinator that has not received a READY ticket.
+        Every registry entry is validated before absence is accepted because a
+        malformed entry could otherwise conceal the exact reservation owner.
+        No helper or cleanup action is invoked.
+        """
+
+        if _authority is not _RESOLVER_LIFECYCLE_AUTHORITY:
+            raise TypeError("resolver capability observation requires coordinator")
+        if reservation_owner is None:
+            return False
+        with self._publication_lock:
+            try:
+                for publication_id, state in self._ready_publications.items():
+                    if (
+                        type(publication_id) is not UUID
+                        or type(state) is not _ReadyPublicationState
+                        or type(state.ticket) is not _ReadyPublicationTicket
+                    ):
+                        return False
+                    snapshot = _validated_lifecycle_capability_snapshot(
+                        state.ticket,
+                        launcher=self,
+                    )
+                    if (
+                        publication_id != snapshot.publication_id
+                        or state.capability_snapshot != snapshot
+                        or state.ticket._reservation_owner
+                        is not snapshot.reservation_owner
+                    ):
+                        return False
+                    if snapshot.reservation_owner is reservation_owner:
+                        return False
+
+                for publication_id, recovery in self._lifecycle_recovery.items():
+                    if (
+                        type(publication_id) is not UUID
+                        or type(recovery) is not _LifecycleRecoveryState
+                        or type(recovery.ticket) is not _ReadyPublicationTicket
+                        or type(recovery.ledger) is not _ResolverLifecycleLedger
+                    ):
+                        return False
+                    snapshot = _validated_lifecycle_capability_snapshot(
+                        recovery.ticket,
+                        launcher=self,
+                    )
+                    if (
+                        publication_id != snapshot.publication_id
+                        or recovery.capability_snapshot != snapshot
+                        or recovery.ticket._reservation_owner
+                        is not snapshot.reservation_owner
+                        or recovery.ledger._capability is not recovery.ticket
+                        or recovery.ledger._capability_snapshot != snapshot
+                    ):
+                        return False
+                    if snapshot.reservation_owner is reservation_owner:
+                        return False
+            except BaseException:
+                return False
+            return True
+
     def _reserved_lifecycle_snapshot_for_owner(
         self,
         ticket: _ReadyPublicationTicket,
@@ -2678,8 +2771,11 @@ class ResolverHelperLauncher:
                 or state.status != "reserved"
                 or state.guard is not None
                 or state.launch_owner is not None
+                or ticket._launch_owner_snapshot is not None
+                or ticket._ledger_snapshot is not None
             ):
                 raise _lifecycle_error("resolver lifecycle capability 不可启动。")
+            object.__setattr__(ticket, "_launch_owner_snapshot", launch_owner)
             state.launch_owner = launch_owner
             state.status = "launching"
         return snapshot
@@ -2730,9 +2826,13 @@ class ResolverHelperLauncher:
                 or state.launch_owner is not launch_owner
                 or state.guard is not None
                 or state.ledger is not None
+                or ticket._launch_owner_snapshot is not launch_owner
+                or ticket._ledger_snapshot is not None
                 or snapshot.publication_id in self._lifecycle_recovery
             ):
                 raise _lifecycle_error("resolver lifecycle recovery anchor 无效。")
+            ledger.bind_launch_owner(ticket, launch_owner)
+            object.__setattr__(ticket, "_ledger_snapshot", ledger)
             state.ledger = ledger
             self._lifecycle_recovery[snapshot.publication_id] = (
                 _LifecycleRecoveryState(
@@ -2921,6 +3021,208 @@ class ResolverHelperLauncher:
                 ready_state is None or ready_state.ledger is not ledger
             )
         return recovery_is_gone and ready_state_is_gone
+
+    def _ready_publication_is_terminal_for_cleanup(
+        self,
+        ticket: _ReadyPublicationTicket,
+        *,
+        reservation_owner: object,
+        launch_owner: object,
+        ledger: _ResolverLifecycleLedger | None = None,
+        capability_snapshot: _LifecycleCapabilitySnapshot | None = None,
+        _authority: object | None = None,
+    ) -> bool:
+        """Observe exact helper terminal state independently from recovery.
+
+        The READY and strong-recovery registries are checked together.  A
+        terminal ledger may have survived only because its best-effort
+        ``on_terminal`` callback failed; in that case this method may release
+        the exact bookkeeping anchors, but it never invokes helper actions.
+        Wrong owners, aliases, duplicate identities, or malformed registry
+        state all fail closed.
+        """
+
+        if _authority is not _RESOLVER_LIFECYCLE_AUTHORITY:
+            raise TypeError("READY terminal observation requires coordinator")
+        if (
+            type(ticket) is not _ReadyPublicationTicket
+            or reservation_owner is None
+            or launch_owner is None
+            or (ledger is not None and type(ledger) is not _ResolverLifecycleLedger)
+            or (
+                capability_snapshot is not None
+                and type(capability_snapshot) is not _LifecycleCapabilitySnapshot
+            )
+        ):
+            return False
+        if capability_snapshot is None:
+            try:
+                snapshot = _validated_lifecycle_capability_snapshot(
+                    ticket,
+                    launcher=self,
+                )
+            except BaseException:
+                return False
+        else:
+            snapshot = capability_snapshot
+        if (
+            snapshot.launcher is not self
+            or snapshot.reservation_owner is not reservation_owner
+            or ticket._reservation_owner is not reservation_owner
+            or ticket._launcher is not self
+            or ticket._launch_owner_snapshot not in (None, launch_owner)
+        ):
+            return False
+
+        ticket_ledger = ticket._ledger_snapshot
+        if ticket_ledger is not None and type(ticket_ledger) is not _ResolverLifecycleLedger:
+            return False
+        if ledger is not None and ticket_ledger is not ledger:
+            return False
+
+        if ticket_ledger is not None:
+            try:
+                with ticket_ledger._lock:
+                    if (
+                        ticket_ledger._capability is not ticket
+                        or ticket_ledger._capability_snapshot != snapshot
+                        or ticket_ledger.lifecycle_id != snapshot.lifecycle_id
+                        or ticket_ledger._launch_owner_snapshot is not launch_owner
+                    ):
+                        return False
+            except BaseException:
+                return False
+
+        selected_ledger: _ResolverLifecycleLedger | None = ticket_ledger
+        with self._publication_lock:
+            try:
+                ready_matches = [
+                    (publication_id, state)
+                    for publication_id, state in self._ready_publications.items()
+                    if publication_id == snapshot.publication_id
+                    or getattr(state, "ticket", None) is ticket
+                ]
+                recovery_matches = [
+                    (publication_id, recovery)
+                    for publication_id, recovery in self._lifecycle_recovery.items()
+                    if publication_id == snapshot.publication_id
+                    or getattr(recovery, "ticket", None) is ticket
+                ]
+            except BaseException:
+                return False
+            if len(ready_matches) > 1 or len(recovery_matches) > 1:
+                return False
+
+            ready_state: _ReadyPublicationState | None = None
+            if ready_matches:
+                publication_id, candidate = ready_matches[0]
+                if (
+                    publication_id != snapshot.publication_id
+                    or type(candidate) is not _ReadyPublicationState
+                    or candidate.ticket is not ticket
+                    or candidate.capability_snapshot != snapshot
+                    or candidate.capability_snapshot.reservation_owner
+                    is not reservation_owner
+                ):
+                    return False
+                ready_state = candidate
+
+            recovery_state: _LifecycleRecoveryState | None = None
+            if recovery_matches:
+                publication_id, candidate = recovery_matches[0]
+                if (
+                    publication_id != snapshot.publication_id
+                    or type(candidate) is not _LifecycleRecoveryState
+                    or candidate.ticket is not ticket
+                    or candidate.capability_snapshot != snapshot
+                    or candidate.launch_owner is not launch_owner
+                    or type(candidate.ledger) is not _ResolverLifecycleLedger
+                    or ticket._ledger_snapshot is not candidate.ledger
+                    or candidate.ledger._capability is not ticket
+                    or candidate.ledger._capability_snapshot != snapshot
+                    or candidate.ledger._launch_owner_snapshot is not launch_owner
+                ):
+                    return False
+                recovery_state = candidate
+                selected_ledger = candidate.ledger
+
+            if ready_state is not None:
+                if ready_state.status == "reserved":
+                    if (
+                        ready_state.guard is not None
+                        or ready_state.ledger is not None
+                        or ready_state.launch_owner is not None
+                        or ticket._launch_owner_snapshot is not None
+                        or ticket._ledger_snapshot is not None
+                    ):
+                        return False
+                    return False
+                if ready_state.status not in ("launching", "published"):
+                    return False
+                if ready_state.launch_owner is not launch_owner:
+                    return False
+                if ready_state.ledger is None:
+                    if recovery_state is not None:
+                        return False
+                    return False
+                if (
+                    type(ready_state.ledger) is not _ResolverLifecycleLedger
+                    or ticket._ledger_snapshot is not ready_state.ledger
+                    or recovery_state is None
+                    or recovery_state.ledger is not ready_state.ledger
+                ):
+                    return False
+                selected_ledger = ready_state.ledger
+                if ready_state.status == "launching":
+                    if ready_state.guard is not None:
+                        return False
+                elif (
+                    type(ready_state.guard) is not PreAttemptResolverGuard
+                    or ready_state.guard._ledger is not selected_ledger
+                    or ready_state.guard._capability is not ticket
+                ):
+                    return False
+
+            if ledger is not None:
+                if selected_ledger is None:
+                    selected_ledger = ledger
+                elif selected_ledger is not ledger:
+                    return False
+
+        if selected_ledger is None:
+            # A validated exact ticket with neither a READY entry nor a strong
+            # recovery anchor represents a consumed no-helper or terminal
+            # lifecycle.  Wrong-owner tickets were rejected above.
+            return True
+        try:
+            if not selected_ledger.is_terminal():
+                return False
+            self._release_lifecycle_recovery(
+                snapshot.publication_id,
+                selected_ledger,
+            )
+        except BaseException:
+            return False
+
+        # Prove the exact anchors are now absent.  Do not trust the release
+        # helper's successful return as the terminal observation.
+        with self._publication_lock:
+            try:
+                ready_matches = [
+                    state
+                    for publication_id, state in self._ready_publications.items()
+                    if publication_id == snapshot.publication_id
+                    or getattr(state, "ticket", None) is ticket
+                ]
+                recovery_matches = [
+                    recovery
+                    for publication_id, recovery in self._lifecycle_recovery.items()
+                    if publication_id == snapshot.publication_id
+                    or getattr(recovery, "ticket", None) is ticket
+                ]
+            except BaseException:
+                return False
+            return not ready_matches and not recovery_matches
 
     def _accepted_ready_guard_ledger(
         self,

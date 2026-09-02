@@ -2897,6 +2897,224 @@ class AttemptGate:
                 and session_id not in self._active_by_session
             )
 
+    def _attempt_terminal_state_for_cleanup(
+        self,
+        *,
+        credential_permit: CredentialResolutionPermit,
+        credential_handle_id: UUID,
+        credential_handle_digest: Digest256,
+        attempt: AttemptPermit | None = None,
+        _authority: object | None = None,
+    ) -> str:
+        """Classify exact attempt cleanup without trusting recovery calls.
+
+        ``attempt`` is the candidate returned to the coordinator when that
+        assignment completed.  A ``None`` candidate covers the narrower
+        reserve publication window: the frozen credential permit and handle
+        proof can establish that publication is absent, active, or terminal.
+        Multiple matches and malformed or identity-mismatched records are
+        always ``"ambiguous"``.
+
+        This method only observes Gate-owned state.  It never attempts cleanup
+        and the transport-only authority prevents it becoming a public proof
+        oracle or attempt capability.
+        """
+
+        if _authority is not _TRANSPORT_ATTEMPT_AUTHORITY:
+            raise TypeError("attempt cleanup observation requires transport")
+        if (
+            type(credential_permit) is not CredentialResolutionPermit
+            or type(credential_handle_id) is not UUID
+            or type(credential_handle_digest) is not Digest256
+            or (attempt is not None and type(attempt) is not AttemptPermit)
+        ):
+            return "ambiguous"
+
+        with self._lock:
+            credential_matches = [
+                state
+                for key, state in self._credential_permits.items()
+                if state.permit_id == key
+                and state.permit is credential_permit
+                and state.credential_handle_id == credential_handle_id
+                and state.credential_handle_digest
+                == credential_handle_digest
+            ]
+            if len(credential_matches) != 1:
+                return "ambiguous"
+            credential_state = credential_matches[0]
+
+            attempt_matches = [
+                state
+                for key, state in self._attempt_permits.items()
+                if state.attempt_permit_id == key
+                and state.credential_permit_id
+                == credential_state.permit_id
+                and state.credential_handle_id == credential_handle_id
+                and state.credential_handle_digest
+                == credential_handle_digest
+            ]
+            if not attempt_matches:
+                if attempt is not None:
+                    return "ambiguous"
+                active_absence = (
+                    credential_state.status == "resolved"
+                    and credential_state.resolver_claim_id is None
+                    and type(credential_state.resolved_publication_id) is UUID
+                    and credential_state.recovery_refs()
+                    == (
+                        credential_state.context,
+                        credential_state.context_ledger,
+                    )
+                    and credential_state.context is not None
+                    and credential_state.context_ledger is not None
+                    and self._active_by_session.get(
+                        credential_state.session_id
+                    )
+                    == credential_state.permit_id
+                    and sum(
+                        active_id == credential_state.permit_id
+                        for active_id in self._active_by_session.values()
+                    )
+                    == 1
+                )
+                terminal_absence = (
+                    credential_state.status in ("abandoned", "finished")
+                    and credential_state.resolver_claim_id is None
+                    and credential_state.resolved_publication_id is None
+                    and credential_state.recovery_refs() == (None, None)
+                    and self._credential_permit_refs_are_released(
+                        credential_permit
+                    )
+                    and credential_state.session_id
+                    not in self._active_by_session
+                    and credential_state.permit_id
+                    not in self._active_by_session.values()
+                )
+                return (
+                    "absent"
+                    if active_absence or terminal_absence
+                    else "ambiguous"
+                )
+            if len(attempt_matches) != 1:
+                return "ambiguous"
+            attempt_state = attempt_matches[0]
+            published_attempt = attempt_state.permit
+            if (
+                type(published_attempt) is not AttemptPermit
+                or (
+                    attempt is not None
+                    and published_attempt is not attempt
+                )
+            ):
+                return "ambiguous"
+
+            exact_binding = (
+                (attempt is None or published_attempt is attempt)
+                and type(attempt_state.attempt_permit_id) is UUID
+                and type(attempt_state.attempt_permit_digest) is Digest256
+                and type(credential_state.permit_id) is UUID
+                and type(credential_state.session_id) is UUID
+                and self._attempt_permits.get(
+                    attempt_state.attempt_permit_id
+                )
+                is attempt_state
+                and self._credential_permits.get(
+                    attempt_state.credential_permit_id
+                )
+                is credential_state
+                and credential_state.permit is credential_permit
+                and attempt_state.permit is published_attempt
+                and attempt_state.session_id == credential_state.session_id
+            )
+            if not exact_binding:
+                return "ambiguous"
+
+            terminal = (
+                attempt_state.status in ("finished", "abandoned")
+                and attempt_state.transport_claim_id is None
+                and attempt_state.terminal_guard_id is None
+                and attempt_state.terminal_guard_digest is None
+                and attempt_state.dns_start_id is None
+                and attempt_state.credential_borrow_id is None
+                and attempt_state.recovery_refs()
+                == (None, None, None, None)
+                and self._attempt_permit_refs_are_released(
+                    published_attempt
+                )
+                and credential_state.status == "finished"
+                and credential_state.resolver_claim_id is None
+                and credential_state.resolved_publication_id is None
+                and credential_state.recovery_refs() == (None, None)
+                and self._credential_permit_refs_are_released(
+                    credential_permit
+                )
+                and credential_state.session_id
+                not in self._active_by_session
+                and credential_state.permit_id
+                not in self._active_by_session.values()
+            )
+            if terminal:
+                return "terminal"
+
+            active = (
+                attempt_state.status
+                in (
+                    "active",
+                    "claiming",
+                    "io_claimed",
+                    "dns_starting",
+                    "wire_committing",
+                    "wire_committed",
+                    "abandoning",
+                    "finishing",
+                )
+                and attempt_state.credential_permit is credential_permit
+                and attempt_state.context is credential_state.context
+                and attempt_state.context_ledger
+                is credential_state.context_ledger
+                and attempt_state.context is not None
+                and attempt_state.context_ledger is not None
+                and attempt_state.reservation is not None
+                and credential_state.status == "consumed"
+                and credential_state.resolver_claim_id is None
+                and type(credential_state.resolved_publication_id) is UUID
+                and credential_state.recovery_refs()
+                == (
+                    credential_state.context,
+                    credential_state.context_ledger,
+                )
+                and self._active_by_session.get(
+                    credential_state.session_id
+                )
+                == credential_state.permit_id
+                and sum(
+                    active_id == credential_state.permit_id
+                    for active_id in self._active_by_session.values()
+                )
+                == 1
+            )
+            return "active" if active else "ambiguous"
+
+    def _attempt_is_terminal_for_cleanup(
+        self,
+        *,
+        credential_permit: CredentialResolutionPermit,
+        credential_handle_id: UUID,
+        credential_handle_digest: Digest256,
+        attempt: AttemptPermit | None = None,
+        _authority: object | None = None,
+    ) -> bool:
+        """Observe terminal Gate state independently of recovery results."""
+
+        return self._attempt_terminal_state_for_cleanup(
+            credential_permit=credential_permit,
+            credential_handle_id=credential_handle_id,
+            credential_handle_digest=credential_handle_digest,
+            attempt=attempt,
+            _authority=_authority,
+        ) == "terminal"
+
     def _lookup_attempt_state_locked(
         self,
         permit: AttemptPermit,

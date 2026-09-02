@@ -377,7 +377,10 @@ class _HandleState:
         "publication_id",
         "publication_id_snapshot",
         "permit",
+        "permit_id_snapshot",
+        "permit_digest_snapshot",
         "gate",
+        "gate_id_snapshot",
         "secret",
         "status",
     )
@@ -400,7 +403,10 @@ class _HandleState:
         )
         self.publication_id_snapshot = self.publication_id
         self.permit: CredentialResolutionPermit | None = permit
+        self.permit_id_snapshot = permit.permit_id
+        self.permit_digest_snapshot = permit.permit_digest
         self.gate: AttemptGate | None = gate
+        self.gate_id_snapshot = permit.gate_id
         self.secret: bytearray | None = secret
         # This state is caller-unobservable until AttemptGate confirmation
         # returns and resolve() returns the handle.  Confirmation is the sole
@@ -612,6 +618,65 @@ class _CredentialLedger:
                 and state.publication_id is None
                 and state.handle is handle
             )
+
+    def _publication_terminal_state_for_cleanup(
+        self,
+        permit: CredentialResolutionPermit,
+        *,
+        publication_id: UUID,
+    ) -> str:
+        """Classify one exact publication without trusting live handle slots.
+
+        ``absent`` is reserved for a publication ID that was never anchored in
+        this resolver ledger.  ``closed`` requires one and only one ledger
+        entry whose frozen primitive permit/Gate proof matches and whose live
+        secret and ownership references have all been cleared.  Every active,
+        duplicate, malformed, or wrong-owner state is deliberately collapsed
+        to ``ambiguous`` so a cleanup caller must fail closed.
+        """
+
+        if (
+            type(permit) is not CredentialResolutionPermit
+            or type(publication_id) is not UUID
+        ):
+            return "ambiguous"
+        try:
+            permit.validate_integrity()
+        except (TypeError, ValueError, AttributeError):
+            return "ambiguous"
+
+        with self._lock:
+            matches = [
+                (handle, state)
+                for handle, state in self._states.items()
+                if getattr(state, "publication_id_snapshot", None)
+                == publication_id
+            ]
+            if not matches:
+                return "absent"
+            if len(matches) != 1:
+                return "ambiguous"
+            handle, state = matches[0]
+            if (
+                type(state) is not _HandleState
+                or type(handle) is not CredentialHandle
+                or state.handle is not handle
+                or state.permit_id_snapshot != permit.permit_id
+                or state.permit_digest_snapshot != permit.permit_digest
+                or state.gate_id_snapshot != permit.gate_id
+                or type(state.handle_id) is not UUID
+                or type(state.handle_digest) is not Digest256
+            ):
+                return "ambiguous"
+            if (
+                state.status == "closed"
+                and state.secret is None
+                and state.permit is None
+                and state.gate is None
+                and state.publication_id is None
+            ):
+                return "closed"
+            return "ambiguous"
 
     def _release_info(
         self,
@@ -1419,7 +1484,34 @@ class CredentialResolver:
             or type(publication_id) is not UUID
         ):
             return False
-        return self._ledger._publication_is_closed_for_cleanup(publication_id)
+        return (
+            self._ledger._publication_terminal_state_for_cleanup(
+                permit,
+                publication_id=publication_id,
+            )
+            == "closed"
+        )
+
+    def _published_handle_terminal_state_for_cleanup(
+        self,
+        permit: CredentialResolutionPermit,
+        *,
+        publication_id: UUID,
+        _authority: object | None = None,
+    ) -> str:
+        """Observe ``absent``/``closed`` or fail closed as ``ambiguous``.
+
+        This is intentionally independent from the recovery method's return
+        value.  It consults only resolver-owned immutable publication proof and
+        exact permit/Gate identities; it never returns a handle or secret.
+        """
+
+        if _authority is not _TRANSPORT_ATTEMPT_AUTHORITY:
+            raise TypeError("credential cleanup observation requires transport")
+        return self._ledger._publication_terminal_state_for_cleanup(
+            permit,
+            publication_id=publication_id,
+        )
 
     def _published_handle_is_exact_for_transport(
         self,
