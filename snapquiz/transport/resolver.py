@@ -31,6 +31,7 @@ from snapquiz.domain._validation import (
 from snapquiz.domain.digest import Digest256, canonical_json_bytes, digest256
 from snapquiz.domain.errors import ConfigError, EndpointPolicyError
 from snapquiz.runtime.attempt import _TRANSPORT_ATTEMPT_AUTHORITY
+from snapquiz.transport import _resolver_output_cache as output_cache
 
 
 RESOLVER_HELPER_PROTOCOL_VERSION = "snapquiz.resolver-helper.v2"
@@ -65,6 +66,7 @@ _RESULT_RECEIPT_FACTORY_AUTHORITY = object()
 _READY_PUBLICATION_TICKET_AUTHORITY = object()
 _RESOLVER_LIFECYCLE_AUTHORITY = object()
 _KERNEL_PUBLICATION_AUTHORITY = object()
+_DURABLE_OUTPUT_PUBLICATION_AUTHORITY = object()
 _TERMINAL_GUARD_UUID_NAMESPACE = UUID(
     "4c82487b-3247-52f0-9fb9-7696da7f7471"
 )
@@ -203,6 +205,22 @@ class _ResolutionCandidatePublicationSnapshot(NamedTuple):
     candidate: object
     address_digest: Digest256
     canonical_payload: bytes
+
+
+class _DurableOutputSnapshot(NamedTuple):
+    """Ledger-owned copy of one exact S4d output observation."""
+
+    observation: object
+    epoch_id: UUID
+    operation_id: UUID
+    proxy_id: UUID
+    operation_binding_digest: Digest256
+    delivery_id: UUID
+    sequence: int
+    kind: output_cache._ResolverOutputKind
+    payload: bytes
+    payload_digest: Digest256
+    observation_digest: Digest256
 
 
 class _ResolutionPublicationSnapshot(NamedTuple):
@@ -436,6 +454,118 @@ def _require_hostname(value: object) -> str:
     return hostname
 
 
+def _durable_output_methods(kernel: HelperKernel) -> tuple[object, object] | None:
+    observer = getattr(kernel, "observe_stdout_durable", None)
+    acknowledger = getattr(kernel, "acknowledge_stdout_durable", None)
+    if observer is None and acknowledger is None:
+        return None
+    availability = getattr(kernel, "durable_output_available", None)
+    if callable(availability):
+        try:
+            available = availability()
+        except Exception:
+            raise _lifecycle_error(
+                "resolver durable output availability 无效。"
+            ) from None
+        if type(available) is not bool:
+            raise _lifecycle_error(
+                "resolver durable output availability 合同无效。"
+            )
+        if not available:
+            return None
+    if not callable(observer) or not callable(acknowledger):
+        raise _lifecycle_error("resolver durable output kernel 合同无效。")
+    return observer, acknowledger
+
+
+def _read_durable_output(
+    kernel: HelperKernel,
+    *,
+    ledger: "_ResolverLifecycleLedger",
+    owner: object,
+    phase: str,
+    maximum: int,
+    kind: output_cache._ResolverOutputKind,
+) -> bytes:
+    """Publish locally, ACK exactly, then expose one immutable payload."""
+
+    methods = _durable_output_methods(kernel)
+    if methods is None:
+        raise _lifecycle_error("resolver durable output kernel 尚未启用。")
+    observer, acknowledger = methods
+    checked_phase = require_text(phase, "phase", max_length=64)
+    checked_maximum = require_plain_int(maximum, "maximum", minimum=1)
+    publication = ledger.durable_output_publication(
+        owner,
+        kind=kind,
+        maximum=checked_maximum,
+    )
+    selected = publication.current()
+    while selected is None:
+        wait_slice = ledger.business_wait_slice(owner, checked_phase)
+        try:
+            observation = observer(
+                checked_maximum,
+                publication=publication,
+                max_wait_ns=wait_slice.max_wait_ns,
+            )
+        except BaseException as primary:
+            try:
+                selected = publication.current()
+            except BaseException:
+                raise primary.with_traceback(primary.__traceback__) from None
+            if selected is None:
+                raise
+            # The exact ledger publication is the postcondition.  A wrapper
+            # fault after that commit must not trigger another stream read.
+            observation = selected.observation
+        # The supervisor calls publication.publish before returning.  This
+        # lookup therefore recovers the exact observation even if its return
+        # value was lost before a caller STORE.
+        selected = publication.current()
+        if observation is PENDING:
+            if selected is None:
+                ledger.business_wait_slice(owner, checked_phase)
+                continue
+            # A lower layer may have committed the local publication and then
+            # lost only its return.  The ledger fact is authoritative; do not
+            # ask the destructive source to observe the delivery again.
+        elif selected is None or observation is not selected.observation:
+            raise _lifecycle_error(
+                "resolver durable output publication 未提交。"
+            )
+        ledger.business_wait_slice(owner, checked_phase)
+
+    while not publication.is_acknowledged():
+        wait_slice = ledger.business_wait_slice(owner, checked_phase)
+        try:
+            acked = acknowledger(
+                selected.observation,
+                publication=publication,
+                max_wait_ns=wait_slice.max_wait_ns,
+            )
+        except BaseException as primary:
+            try:
+                committed = publication.is_acknowledged()
+            except BaseException:
+                raise primary.with_traceback(primary.__traceback__) from None
+            if not committed:
+                raise
+            # Recover only an exact local ACK postcondition.  A precommit
+            # primary still escapes unchanged to the cleanup owner.
+            acked = COMPLETE
+        if acked is PENDING:
+            ledger.business_wait_slice(owner, checked_phase)
+            continue
+        if acked is not COMPLETE:
+            raise _lifecycle_error("resolver durable output ACK 合同无效。")
+        # The supervisor normally invokes this sink before returning.  Keep an
+        # idempotent local commit for injected kernels that return COMPLETE.
+        publication.acknowledge(selected.observation)
+        ledger.business_wait_slice(owner, checked_phase)
+    return selected.payload
+
+
 def _read_bounded_frame(
     kernel: HelperKernel,
     *,
@@ -449,6 +579,30 @@ def _read_bounded_frame(
 
     require_plain_int(maximum, "maximum", minimum=1)
     checked_phase = require_text(phase, "phase", max_length=64)
+    durable = _durable_output_methods(kernel)
+    if durable is not None:
+        try:
+            kind = {
+                "READY": output_cache._ResolverOutputKind.READY,
+                "RESULT": output_cache._ResolverOutputKind.RESULT,
+            }[label]
+        except KeyError:
+            raise _lifecycle_error(
+                f"{label} durable output kind 无效。"
+            ) from None
+        frame = _read_durable_output(
+            kernel,
+            ledger=ledger,
+            owner=owner,
+            phase=checked_phase,
+            maximum=maximum,
+            kind=kind,
+        )
+        if not frame or not frame.endswith(b"\n"):
+            raise _lifecycle_error(f"{label} frame 不完整。")
+        if b"\n" in frame[:-1]:
+            raise _lifecycle_error(f"{label} frame 含有尾随数据。")
+        return frame
     buffer = bytearray()
     while True:
         allowance = maximum - len(buffer)
@@ -635,6 +789,10 @@ class _ResolverLifecycleLedger:
         "_issued_receipt",
         "_issued_receipt_snapshot",
         "_issued_resolution_snapshot",
+        "_durable_output_binding",
+        "_durable_output_entries",
+        "_durable_output_acks",
+        "_durable_output_publications",
         "_launch_owner_snapshot",
         "_stop_authority",
         "_on_terminal",
@@ -676,6 +834,19 @@ class _ResolverLifecycleLedger:
         self._issued_receipt: ResolverResultReceipt | None = None
         self._issued_receipt_snapshot: _ResultReceiptIssuanceSnapshot | None = None
         self._issued_resolution_snapshot: _ResolutionPublicationSnapshot | None = None
+        self._durable_output_binding: tuple[object, ...] | None = None
+        self._durable_output_entries: dict[
+            output_cache._ResolverOutputKind,
+            _DurableOutputSnapshot,
+        ] = {}
+        self._durable_output_acks: dict[
+            output_cache._ResolverOutputKind,
+            Digest256,
+        ] = {}
+        self._durable_output_publications: dict[
+            output_cache._ResolverOutputKind,
+            _DurableOutputPublication,
+        ] = {}
         self._launch_owner_snapshot: object | None = None
         self._stop_authority: object | None = capability._stop_authority
         self._on_terminal = on_terminal
@@ -726,7 +897,13 @@ class _ResolverLifecycleLedger:
             stop_authority = self._stop_authority
             if (
                 self._owner is not owner
-                or self._state in ("cleaning", "cleanup_failed", "terminal")
+                or self._state
+                in (
+                    "cleaning",
+                    "cleanup_waiting_supervisor",
+                    "cleanup_failed",
+                    "terminal",
+                )
                 or stop_authority is None
                 or self._capability is None
                 or stop_authority is not self._capability._stop_authority
@@ -855,6 +1032,226 @@ class _ResolverLifecycleLedger:
 
     def mark_ready(self, owner: object) -> None:
         self._cas(owner, expected="spawned", replacement=owner, target="ready")
+
+    @staticmethod
+    def _durable_output_state(kind: output_cache._ResolverOutputKind) -> str:
+        return {
+            output_cache._ResolverOutputKind.READY: "spawned",
+            output_cache._ResolverOutputKind.RESULT: "result_reading",
+            output_cache._ResolverOutputKind.EOF: "result_eof_probing",
+        }[kind]
+
+    @staticmethod
+    def _snapshot_durable_output(
+        observation: object,
+        *,
+        maximum: int,
+        expected_kind: output_cache._ResolverOutputKind,
+    ) -> _DurableOutputSnapshot:
+        checked_maximum = require_plain_int(maximum, "maximum", minimum=1)
+        if type(expected_kind) is not output_cache._ResolverOutputKind:
+            raise _lifecycle_error("resolver durable output kind 无效。")
+        if type(observation) is not output_cache._ResolverOutputObservation:
+            raise _lifecycle_error("resolver durable output observation 类型无效。")
+        try:
+            observation.validate_integrity()
+            snapshot = _DurableOutputSnapshot(
+                observation=observation,
+                epoch_id=require_uuid(observation.epoch_id, "epoch_id"),
+                operation_id=require_uuid(
+                    observation.operation_id,
+                    "operation_id",
+                ),
+                proxy_id=require_uuid(observation.proxy_id, "proxy_id"),
+                operation_binding_digest=require_digest(
+                    observation.operation_binding_digest,
+                    "operation_binding_digest",
+                ),
+                delivery_id=require_uuid(
+                    observation.delivery_id,
+                    "delivery_id",
+                ),
+                sequence=require_plain_int(
+                    observation.sequence,
+                    "sequence",
+                    minimum=0,
+                ),
+                kind=observation.kind,
+                payload=observation.payload,
+                payload_digest=require_digest(
+                    observation.payload_digest,
+                    "payload_digest",
+                ),
+                observation_digest=require_digest(
+                    observation.observation_digest,
+                    "observation_digest",
+                ),
+            )
+        except (AttributeError, TypeError, ValueError):
+            raise _lifecycle_error(
+                "resolver durable output observation proof 无效。"
+            ) from None
+        if (
+            snapshot.kind is not expected_kind
+            or snapshot.sequence
+            != {
+                output_cache._ResolverOutputKind.READY: 0,
+                output_cache._ResolverOutputKind.RESULT: 1,
+                output_cache._ResolverOutputKind.EOF: 2,
+            }[expected_kind]
+            or type(snapshot.payload) is not bytes
+            or len(snapshot.payload) > checked_maximum
+        ):
+            raise _lifecycle_error(
+                "resolver durable output observation binding 无效。"
+            )
+        return snapshot
+
+    def durable_output_publication(
+        self,
+        owner: object,
+        *,
+        kind: output_cache._ResolverOutputKind,
+        maximum: int,
+    ) -> "_DurableOutputPublication":
+        checked_maximum = require_plain_int(maximum, "maximum", minimum=1)
+        if type(kind) is not output_cache._ResolverOutputKind:
+            raise _lifecycle_error("resolver durable output kind 无效。")
+        with self._lock:
+            if (
+                self._owner is not owner
+                or self._kernel is None
+                or self._state != self._durable_output_state(kind)
+            ):
+                raise _lifecycle_error(
+                    "resolver durable output publication 状态无效。"
+                )
+            existing = self._durable_output_publications.get(kind)
+            if existing is not None:
+                if existing.maximum != checked_maximum or existing._owner is not owner:
+                    raise _lifecycle_error(
+                        "resolver durable output publication 已变化。"
+                    )
+                return existing
+            selected = _DurableOutputPublication(
+                ledger=self,
+                owner=owner,
+                kind=kind,
+                maximum=checked_maximum,
+                _authority=_DURABLE_OUTPUT_PUBLICATION_AUTHORITY,
+            )
+            self._durable_output_publications[kind] = selected
+            return selected
+
+    def publish_durable_output(
+        self,
+        publication: "_DurableOutputPublication",
+        observation: object,
+    ) -> object:
+        with self._lock:
+            kind = publication.kind
+            if (
+                self._durable_output_publications.get(kind) is not publication
+                or publication._ledger is not self
+                or self._owner is not publication._owner
+                or self._state != self._durable_output_state(kind)
+            ):
+                raise _lifecycle_error(
+                    "resolver durable output publication owner 无效。"
+                )
+            snapshot = self._snapshot_durable_output(
+                observation,
+                maximum=publication.maximum,
+                expected_kind=kind,
+            )
+            expected_sequence = len(self._durable_output_entries)
+            existing = self._durable_output_entries.get(kind)
+            if existing is not None:
+                if existing != snapshot or existing.observation is not observation:
+                    raise _lifecycle_error(
+                        "resolver durable output observation 已变化。"
+                    )
+                return observation
+            if snapshot.sequence != expected_sequence:
+                raise _lifecycle_error(
+                    "resolver durable output observation 顺序无效。"
+                )
+            binding = (
+                snapshot.epoch_id,
+                snapshot.operation_id,
+                snapshot.proxy_id,
+                snapshot.operation_binding_digest,
+            )
+            if self._durable_output_binding is None:
+                self._durable_output_binding = binding
+            elif self._durable_output_binding != binding:
+                raise _lifecycle_error(
+                    "resolver durable output operation 已变化。"
+                )
+            self._durable_output_entries[kind] = snapshot
+            return observation
+
+    def current_durable_output(
+        self,
+        publication: "_DurableOutputPublication",
+    ) -> _DurableOutputSnapshot | None:
+        with self._lock:
+            kind = publication.kind
+            if (
+                self._durable_output_publications.get(kind) is not publication
+                or publication._ledger is not self
+                or self._owner is not publication._owner
+                or self._state != self._durable_output_state(kind)
+            ):
+                raise _lifecycle_error(
+                    "resolver durable output observation owner 无效。"
+                )
+            selected = self._durable_output_entries.get(kind)
+            if selected is not None:
+                current = self._snapshot_durable_output(
+                    selected.observation,
+                    maximum=publication.maximum,
+                    expected_kind=kind,
+                )
+                if current != selected or current.observation is not selected.observation:
+                    raise _lifecycle_error(
+                        "resolver durable output ledger 已变化。"
+                    )
+            return selected
+
+    def acknowledge_durable_output(
+        self,
+        publication: "_DurableOutputPublication",
+        observation: object,
+    ) -> None:
+        with self._lock:
+            selected = self.current_durable_output(publication)
+            if selected is None or selected.observation is not observation:
+                raise _lifecycle_error(
+                    "resolver durable output ACK observation 无效。"
+                )
+            existing = self._durable_output_acks.get(publication.kind)
+            if existing is not None and existing != selected.observation_digest:
+                raise _lifecycle_error("resolver durable output ACK 已变化。")
+            self._durable_output_acks.setdefault(
+                publication.kind,
+                selected.observation_digest,
+            )
+
+    def durable_output_is_acknowledged(
+        self,
+        publication: "_DurableOutputPublication",
+    ) -> bool:
+        with self._lock:
+            selected = self.current_durable_output(publication)
+            if selected is None:
+                return False
+            acknowledged = self._durable_output_acks.get(publication.kind)
+            if acknowledged is None:
+                return False
+            if acknowledged != selected.observation_digest:
+                raise _lifecycle_error("resolver durable output ACK ledger 已变化。")
+            return True
 
     def require_exact_ready_guard(
         self,
@@ -1565,6 +1962,13 @@ class _ResolverLifecycleLedger:
             ):
                 raise _lifecycle_error("resolver helper 资源终结证明不完整。")
             self._kernel = None
+            # Receipt/resolution snapshots already retain the minimum exact
+            # proof needed by their consumers.  Drop all live S4d observation
+            # objects, payload copies and publication sinks at terminal.
+            self._durable_output_binding = None
+            self._durable_output_entries.clear()
+            self._durable_output_acks.clear()
+            self._durable_output_publications.clear()
             self._stop_authority = None
             self._pre_owner = None
             self._owner = None
@@ -1584,6 +1988,35 @@ class _ResolverLifecycleLedger:
             if self._owner is not owner or self._state != "cleaning":
                 raise _lifecycle_error("resolver helper cleanup 状态已经变化。")
             self._state = "cleanup_failed"
+
+    def mark_cleanup_waiting_supervisor(self, owner: object) -> None:
+        """Retain retryable ownership while a durable supervisor owns cleanup."""
+
+        with self._lock:
+            if (
+                self._owner is not owner
+                or self._state != "cleaning"
+                or not self._cleanup_claimed
+                or not (
+                    self._terminate_pending
+                    or self._reap_pending
+                    or self._pipes_close_pending
+                )
+            ):
+                raise _lifecycle_error(
+                    "resolver helper supervisor cleanup 状态无效。"
+                )
+            # ``claim_cleanup`` reserves all selected actions before any poll.
+            # Once an earlier action exhausts its supervisor queries, later
+            # actions have not run yet but must remain explicitly retryable.
+            if self._terminate_claimed and not self._terminated:
+                self._terminate_pending = True
+            if self._reap_claimed and not self._child_reaped:
+                self._reap_pending = True
+            if self._pipes_close_claimed and not self._helper_pipes_closed:
+                self._pipes_close_pending = True
+            self._cleanup_claimed = False
+            self._state = "cleanup_waiting_supervisor"
 
     def cleanup_is_ready_to_finish(self, owner: object) -> bool:
         """Observe bookkeeping-only cleanup remaining after all resources."""
@@ -1666,7 +2099,76 @@ class _ResolverLifecycleLedger:
                 "child_reaped": self._child_reaped,
                 "child_exit_status": self._child_exit_status,
                 "helper_pipes_closed": self._helper_pipes_closed,
+                "durable_output_count": len(self._durable_output_entries),
+                "durable_output_ack_count": len(self._durable_output_acks),
             }
+
+
+@runtime_final
+class _DurableOutputPublication:
+    """Ledger-owned S4d sink for observation and ACK return windows."""
+
+    __slots__ = ("_ledger", "_owner", "kind", "maximum")
+
+    def __init__(
+        self,
+        *,
+        ledger: _ResolverLifecycleLedger,
+        owner: object,
+        kind: output_cache._ResolverOutputKind,
+        maximum: int,
+        _authority: object | None = None,
+    ) -> None:
+        if _authority is not _DURABLE_OUTPUT_PUBLICATION_AUTHORITY:
+            raise TypeError("durable output publications require the ledger")
+        if type(ledger) is not _ResolverLifecycleLedger:
+            raise TypeError("ledger must be _ResolverLifecycleLedger")
+        if type(kind) is not output_cache._ResolverOutputKind:
+            raise TypeError("kind must be ResolverOutputKind")
+        object.__setattr__(self, "_ledger", ledger)
+        object.__setattr__(self, "_owner", owner)
+        object.__setattr__(self, "kind", kind)
+        object.__setattr__(
+            self,
+            "maximum",
+            require_plain_int(maximum, "maximum", minimum=1),
+        )
+
+    def __setattr__(self, name: str, value: object) -> None:
+        del name, value
+        raise AttributeError("DurableOutputPublication is immutable")
+
+    def validate_integrity(self) -> None:
+        if type(self._ledger) is not _ResolverLifecycleLedger:
+            raise ValueError("durable output publication ledger is invalid")
+        if type(self.kind) is not output_cache._ResolverOutputKind:
+            raise ValueError("durable output publication kind is invalid")
+        require_plain_int(self.maximum, "maximum", minimum=1)
+        with self._ledger._lock:
+            if (
+                self._ledger._durable_output_publications.get(self.kind)
+                is not self
+                or self._ledger._owner is not self._owner
+                or self._ledger._state
+                != self._ledger._durable_output_state(self.kind)
+            ):
+                raise ValueError("durable output publication owner is invalid")
+
+    def publish(self, observation: object) -> object:
+        self.validate_integrity()
+        return self._ledger.publish_durable_output(self, observation)
+
+    def acknowledge(self, observation: object) -> None:
+        self.validate_integrity()
+        self._ledger.acknowledge_durable_output(self, observation)
+
+    def current(self) -> _DurableOutputSnapshot | None:
+        self.validate_integrity()
+        return self._ledger.current_durable_output(self)
+
+    def is_acknowledged(self) -> bool:
+        self.validate_integrity()
+        return self._ledger.durable_output_is_acknowledged(self)
 
 
 @runtime_final
@@ -1786,6 +2288,7 @@ def _cleanup_guard(
         return ledger.retry_finish_cleanup(guard)
 
     cleanup_failed = plan.inherited_failure
+    cleanup_waiting_supervisor = False
     if plan.kernel is not None:
         actions = (
             ("terminate", plan.terminate),
@@ -1796,6 +2299,7 @@ def _cleanup_guard(
             if not selected:
                 continue
             completed = False
+            pending_exhausted = True
             for _ in range(MAX_HELPER_CLEANUP_POLL_STEPS):
                 try:
                     ledger.begin_cleanup_action_poll(guard, action_name)
@@ -1827,9 +2331,32 @@ def _cleanup_guard(
                     completed = True
                     break
                 except BaseException:
+                    pending_exhausted = False
                     break
             if not completed:
+                waiting_observer = getattr(
+                    plan.kernel,
+                    "_cleanup_waiting_supervisor",
+                    None,
+                )
+                if pending_exhausted and callable(waiting_observer):
+                    try:
+                        cleanup_waiting_supervisor = (
+                            waiting_observer() is True
+                        )
+                    except BaseException:
+                        cleanup_waiting_supervisor = False
+                if cleanup_waiting_supervisor:
+                    break
                 cleanup_failed = True
+    if cleanup_waiting_supervisor:
+        try:
+            ledger.mark_cleanup_waiting_supervisor(guard)
+        except BaseException:
+            cleanup_waiting_supervisor = False
+            cleanup_failed = True
+        if cleanup_waiting_supervisor:
+            return False
     if cleanup_failed:
         try:
             ledger.mark_cleanup_failed(guard)
@@ -2666,32 +3193,49 @@ class AttemptTerminalGuard:
                 raise _lifecycle_error("RESULT transcript 超过上限。")
 
             eof_kernel = self._ledger.claim_stdout_eof_probe(self)
-            while True:
-                wait_slice = self._ledger.business_wait_slice(
-                    self,
-                    HELPER_PHASE_RESULT_EOF,
+            if _durable_output_methods(eof_kernel) is not None:
+                trailing = _read_durable_output(
+                    eof_kernel,
+                    ledger=self._ledger,
+                    owner=self,
+                    phase=HELPER_PHASE_RESULT_EOF,
+                    maximum=1,
+                    kind=output_cache._ResolverOutputKind.EOF,
                 )
-                trailing = eof_kernel.read_stdout(
-                    1,
-                    max_wait_ns=wait_slice.max_wait_ns,
-                )
-                if trailing is PENDING:
+                if trailing:
+                    raise _lifecycle_error("RESULT 后存在第二帧或尾随输出。")
+                self._ledger.commit_stdout_eof(self)
+            else:
+                while True:
+                    wait_slice = self._ledger.business_wait_slice(
+                        self,
+                        HELPER_PHASE_RESULT_EOF,
+                    )
+                    trailing = eof_kernel.read_stdout(
+                        1,
+                        max_wait_ns=wait_slice.max_wait_ns,
+                    )
+                    if trailing is PENDING:
+                        self._ledger.business_wait_slice(
+                            self,
+                            HELPER_PHASE_RESULT_EOF,
+                        )
+                        continue
+                    if type(trailing) is not bytes or len(trailing) > 1:
+                        raise _lifecycle_error(
+                            "RESULT EOF probe 读取合同无效。"
+                        )
+                    if not trailing:
+                        self._ledger.commit_stdout_eof(self)
                     self._ledger.business_wait_slice(
                         self,
                         HELPER_PHASE_RESULT_EOF,
                     )
-                    continue
-                if type(trailing) is not bytes or len(trailing) > 1:
-                    raise _lifecycle_error("RESULT EOF probe 读取合同无效。")
-                if not trailing:
-                    self._ledger.commit_stdout_eof(self)
-                self._ledger.business_wait_slice(
-                    self,
-                    HELPER_PHASE_RESULT_EOF,
-                )
-                if trailing:
-                    raise _lifecycle_error("RESULT 后存在第二帧或尾随输出。")
-                break
+                    if trailing:
+                        raise _lifecycle_error(
+                            "RESULT 后存在第二帧或尾随输出。"
+                        )
+                    break
 
             reap_kernel = self._ledger.claim_result_reap(self)
             while True:

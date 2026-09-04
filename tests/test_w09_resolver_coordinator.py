@@ -7,13 +7,14 @@ import copy
 import inspect
 import json
 import pickle
+import sys
 from threading import Barrier, Event, Thread
 import unittest
 from unittest.mock import patch
 from uuid import UUID
 
 from snapquiz.config.profiles import GLM_NETWORK_POLICY_VERSION
-from snapquiz.domain.digest import canonical_json_bytes, digest256
+from snapquiz.domain.digest import Digest256, canonical_json_bytes, digest256
 from snapquiz.domain.errors import (
     CancelledError,
     ConfigError,
@@ -29,6 +30,7 @@ from snapquiz.runtime.attempt import (
 )
 from snapquiz.runtime.context import CallContextLedger, CancellationReason
 import snapquiz.transport.resolver as resolver_module
+from snapquiz.transport import _resolver_output_cache as output_cache
 import snapquiz.transport.http as http_module
 from snapquiz.transport.address_policy import (
     INTERNET_PUBLIC_ADDRESS_POLICY_DIGEST,
@@ -184,6 +186,107 @@ class _FakeKernel:
         return COMPLETE
 
 
+class _DurableFakeKernel(_FakeKernel):
+    """In-memory native-owner shape: select, publish, then exact ACK."""
+
+    def __init__(
+        self,
+        *args,
+        drop_ack_once=(),
+        drop_observe_once=(),
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.output_cache = output_cache._new_resolver_output_cache(
+            epoch_id=UUID("71000000-0000-0000-0000-000000000091"),
+            operation_id=UUID("71000000-0000-0000-0000-000000000092"),
+            proxy_id=UUID("71000000-0000-0000-0000-000000000093"),
+            operation_binding_digest=Digest256("9" * 64),
+        )
+        self.output_observe_calls = []
+        self.output_observe_effects = []
+        self.output_ack_calls = []
+        self.output_ack_effects = []
+        self.drop_ack_once = list(drop_ack_once)
+        self.drop_observe_once = list(drop_observe_once)
+
+    def durable_output_available(self):
+        return True
+
+    def read_stdout(self, max_bytes: int, *, max_wait_ns: int):
+        del max_bytes, max_wait_ns
+        raise AssertionError("durable coordinator used destructive read_stdout")
+
+    def observe_stdout_durable(
+        self,
+        max_bytes,
+        *,
+        publication,
+        max_wait_ns,
+    ):
+        self.wait_limits.append(("observe_stdout_durable", max_wait_ns))
+        sequence = self.output_cache.safe_metadata()["next_sequence"]
+        kind = {
+            0: output_cache._ResolverOutputKind.READY,
+            1: output_cache._ResolverOutputKind.RESULT,
+            2: output_cache._ResolverOutputKind.EOF,
+        }[sequence]
+        self.output_observe_calls.append(kind.value)
+        child_publication = self.output_cache.new_publication(
+            sequence=sequence,
+            kind=kind,
+        )
+        observation = self.output_cache.current(child_publication)
+        if observation is None:
+            if kind is output_cache._ResolverOutputKind.EOF:
+                payload = b""
+                self.events.append("result_eof")
+            else:
+                if not self._chunks:
+                    return PENDING
+                payload = self._chunks[0]
+                self.events.append(
+                    "ready_read"
+                    if kind is output_cache._ResolverOutputKind.READY
+                    else "result_read"
+                )
+            if len(payload) > max_bytes:
+                raise AssertionError("durable test payload exceeds poll")
+            observation = child_publication.publish(payload)
+            self.output_observe_effects.append(observation.delivery_id)
+        publication.publish(observation)
+        if (
+            self.drop_observe_once
+            and self.drop_observe_once[0] == observation.kind.value
+        ):
+            self.drop_observe_once.pop(0)
+            return PENDING
+        return observation
+
+    def acknowledge_stdout_durable(
+        self,
+        observation,
+        *,
+        publication,
+        max_wait_ns,
+    ):
+        self.wait_limits.append(("acknowledge_stdout_durable", max_wait_ns))
+        self.output_ack_calls.append(observation.kind.value)
+        tombstone = self.output_cache.acknowledged(observation)
+        if tombstone is None:
+            if observation.kind is not output_cache._ResolverOutputKind.EOF:
+                if not self._chunks or self._chunks[0] != observation.payload:
+                    raise AssertionError("durable test source changed")
+                self._chunks.pop(0)
+            self.output_cache.acknowledge(observation)
+            self.output_ack_effects.append(observation.kind.value)
+        if self.drop_ack_once and self.drop_ack_once[0] == observation.kind.value:
+            self.drop_ack_once.pop(0)
+            return PENDING
+        publication.acknowledge(observation)
+        return COMPLETE
+
+
 class _FakeSpawner:
     def __init__(self, kernel: _FakeKernel, events: list[str]) -> None:
         self.kernel = kernel
@@ -268,14 +371,21 @@ def _components(
     source_value=VALID_SECRET,
     cleanup_fault: BaseException | None = None,
     close_fault: BaseException | None = None,
+    durable_output: bool = False,
+    durable_drop_ack_once=(),
+    durable_drop_observe_once=(),
 ):
     events: list[str] = []
-    kernel = _FakeKernel(
-        events,
-        result_address=result_address,
-        cleanup_fault=cleanup_fault,
-        close_fault=close_fault,
-    )
+    kernel_type = _DurableFakeKernel if durable_output else _FakeKernel
+    kernel_kwargs = {
+        "result_address": result_address,
+        "cleanup_fault": cleanup_fault,
+        "close_fault": close_fault,
+    }
+    if durable_output:
+        kernel_kwargs["drop_ack_once"] = durable_drop_ack_once
+        kernel_kwargs["drop_observe_once"] = durable_drop_observe_once
+    kernel = kernel_type(events, **kernel_kwargs)
     spawner = _FakeSpawner(kernel, events)
     launcher = ResolverHelperLauncher(spawner, executable=EXECUTABLE)
     source = _FakeSource(events, source_value)
@@ -474,7 +584,10 @@ class W09ResolverCoordinatorTest(unittest.TestCase):
         )
         self.assertEqual(prepared.result_receipt.dns_start_id, DNS_START_ID)
         self.assertEqual(start["transport_claim_id"], str(TRANSPORT_CLAIM_ID))
-        self.assertEqual(start["terminal_guard_id"], str(prepared.terminal_guard_id))
+        self.assertEqual(
+            start["terminal_guard_id"],
+            str(prepared.terminal_guard_id),
+        )
         self.assertEqual(start["dns_start_id"], str(DNS_START_ID))
         self.assertEqual(
             start["network_policy_ref"],
@@ -486,10 +599,7 @@ class W09ResolverCoordinatorTest(unittest.TestCase):
             prepared.resolution_set.selected.canonical_text,
             "8.8.8.8",
         )
-        self.assertIs(
-            prepared.attempt_permit._attempt_gate,
-            gate,
-        )
+        self.assertIs(prepared.attempt_permit._attempt_gate, gate)
         self.assertFalse(prepared.is_closed)
         self.assertEqual(_cleanup_counts(kernel), (0, 1, 1))
         self.assertTrue(prepared.result_receipt.stdout_eof)
@@ -538,6 +648,643 @@ class W09ResolverCoordinatorTest(unittest.TestCase):
             gate._helper_stop_authority_is_released(
                 stop_authority,
                 _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+            )
+        )
+
+    def test_durable_output_is_ledger_owned_before_ack_and_never_naked_read(self):
+        _, gate, credential = _make_authorized_credential()
+        launcher, selected_resolver, _, _, kernel, events = _components(
+            durable_output=True,
+        )
+
+        prepared = self._coordinate(
+            launcher,
+            selected_resolver,
+            gate,
+            credential,
+        )
+
+        self.assertIs(type(prepared), PreparedResolverAttempt)
+        self.assertEqual(
+            events[:8],
+            [
+                "spawn",
+                "ready_read",
+                "credential_read",
+                "start_write",
+                "result_read",
+                "result_eof",
+                "reap",
+                "close_pipes",
+            ],
+        )
+        ledger = prepared._terminal_guard._ledger
+        metadata = ledger.safe_metadata()
+        self.assertEqual(metadata["durable_output_count"], 3)
+        self.assertEqual(metadata["durable_output_ack_count"], 3)
+        self.assertEqual(
+            kernel.output_ack_effects,
+            ["READY", "RESULT", "EOF"],
+        )
+        self.assertEqual(len(set(kernel.output_observe_effects)), 3)
+        self.assertEqual(kernel.output_cache.safe_metadata()["acked_count"], 3)
+        self.assertTrue(prepared.result_receipt.stdout_eof)
+        self.assertTrue(prepared.close())
+        terminal_metadata = ledger.safe_metadata()
+        self.assertEqual(terminal_metadata["durable_output_count"], 0)
+        self.assertEqual(terminal_metadata["durable_output_ack_count"], 0)
+        self.assertEqual(ledger._durable_output_publications, {})
+
+    def test_durable_output_ack_loss_retries_tombstone_without_source_replay(self):
+        _, gate, credential = _make_authorized_credential()
+        launcher, selected_resolver, _, _, kernel, _ = _components(
+            durable_output=True,
+            durable_drop_ack_once=("RESULT",),
+        )
+
+        prepared = self._coordinate(
+            launcher,
+            selected_resolver,
+            gate,
+            credential,
+        )
+
+        self.assertIs(type(prepared), PreparedResolverAttempt)
+        self.assertEqual(kernel.output_ack_calls.count("RESULT"), 2)
+        self.assertEqual(kernel.output_ack_effects.count("RESULT"), 1)
+        self.assertEqual(
+            prepared._terminal_guard._ledger.safe_metadata()[
+                "durable_output_ack_count"
+            ],
+            3,
+        )
+
+    def test_durable_output_return_loss_recovers_from_local_publication(self):
+        _, gate, credential = _make_authorized_credential()
+        launcher, selected_resolver, _, _, kernel, _ = _components(
+            durable_output=True,
+            durable_drop_observe_once=("RESULT",),
+        )
+
+        prepared = self._coordinate(
+            launcher,
+            selected_resolver,
+            gate,
+            credential,
+        )
+
+        self.assertIs(type(prepared), PreparedResolverAttempt)
+        self.assertEqual(
+            kernel.output_observe_calls,
+            ["READY", "RESULT", "EOF"],
+        )
+        self.assertEqual(len(set(kernel.output_observe_effects)), 3)
+        self.assertEqual(
+            kernel.output_ack_effects,
+            ["READY", "RESULT", "EOF"],
+        )
+        self.assertTrue(prepared.result_receipt.stdout_eof)
+
+    def test_durable_output_postcommit_faults_recover_exact_local_facts(self):
+        _, gate, credential = _make_authorized_credential()
+        launcher, selected_resolver, _, _, kernel, _ = _components(
+            durable_output=True,
+        )
+        original_observe = kernel.observe_stdout_durable
+        original_acknowledge = kernel.acknowledge_stdout_durable
+        observe_fault_pending = True
+        ack_fault_pending = True
+
+        def observe_then_raise(*args, **kwargs):
+            nonlocal observe_fault_pending
+            selected = original_observe(*args, **kwargs)
+            if observe_fault_pending and selected is not PENDING:
+                observe_fault_pending = False
+                raise RuntimeError("synthetic observe postcommit")
+            return selected
+
+        def acknowledge_then_raise(*args, **kwargs):
+            nonlocal ack_fault_pending
+            selected = original_acknowledge(*args, **kwargs)
+            if ack_fault_pending and selected is COMPLETE:
+                ack_fault_pending = False
+                raise RuntimeError("synthetic ACK postcommit")
+            return selected
+
+        kernel.observe_stdout_durable = observe_then_raise
+        kernel.acknowledge_stdout_durable = acknowledge_then_raise
+        prepared = self._coordinate(
+            launcher,
+            selected_resolver,
+            gate,
+            credential,
+        )
+
+        self.assertIs(type(prepared), PreparedResolverAttempt)
+        self.assertFalse(observe_fault_pending)
+        self.assertFalse(ack_fault_pending)
+        self.assertEqual(
+            kernel.output_observe_calls,
+            ["READY", "RESULT", "EOF"],
+        )
+        self.assertEqual(kernel.output_ack_calls, ["READY", "RESULT", "EOF"])
+
+    def test_durable_output_precommit_primary_escapes_and_cleanup_owns_kernel(self):
+        primary = RuntimeError("synthetic durable precommit primary")
+        _, gate, credential = _make_authorized_credential()
+        launcher, selected_resolver, source, _, kernel, _ = _components(
+            durable_output=True,
+        )
+
+        def fail_before_publication(*args, **kwargs):
+            del args, kwargs
+            raise primary
+
+        kernel.observe_stdout_durable = fail_before_publication
+        with self.assertRaises(RuntimeError) as raised:
+            self._coordinate(
+                launcher,
+                selected_resolver,
+                gate,
+                credential,
+            )
+
+        self.assertIs(raised.exception, primary)
+        self.assertEqual(_cleanup_counts(kernel), (1, 1, 1))
+        self.assertEqual(source.calls, [])
+        self.assertEqual(kernel.output_observe_effects, [])
+
+    def test_transport_claim_excludes_cleanup_until_exact_finish(self):
+        runtime, gate, credential = _make_authorized_credential()
+        launcher, resolver, _, _, kernel, _ = _components()
+        ticket = issue_resolver_cleanup_ticket()
+        prepared = self._coordinate(
+            launcher,
+            resolver,
+            gate,
+            credential,
+            cleanup_ticket=ticket,
+        )
+        owner = object()
+
+        prepared._claim_transport(
+            owner,
+            _authority=http_module._TRANSPORT_PREPARED_AUTHORITY,
+        )
+        self.assertTrue(
+            prepared._transport_claim_is_exact(
+                owner,
+                _authority=http_module._TRANSPORT_PREPARED_AUTHORITY,
+            )
+        )
+        self.assertEqual(ticket.safe_metadata()["state"], "transporting")
+        self.assertFalse(ticket.retry_cleanup())
+        inputs = prepared._transport_inputs(
+            owner,
+            _authority=http_module._TRANSPORT_PREPARED_AUTHORITY,
+        )
+        self.assertIs(inputs[0], gate)
+        self.assertIs(inputs[1], resolver)
+        self.assertIs(inputs[2], prepared.credential_handle)
+        self.assertIs(inputs[3], prepared.attempt_permit)
+        self.assertIs(inputs[4], prepared.result_receipt)
+        self.assertIs(inputs[5], prepared.resolution_set)
+        self.assertIs(inputs[6], runtime.prepared)
+        with self.assertRaises(EndpointPolicyError):
+            prepared._transport_inputs(
+                object(),
+                _authority=http_module._TRANSPORT_PREPARED_AUTHORITY,
+            )
+        with self.assertRaises(EndpointPolicyError):
+            prepared.close()
+        self.assertTrue(
+            prepared._finish_transport(
+                owner,
+                _authority=http_module._TRANSPORT_PREPARED_AUTHORITY,
+            )
+        )
+        self.assertTrue(ticket.is_terminal)
+        self.assertTrue(prepared.is_closed)
+        self.assertEqual(_cleanup_counts(kernel), (0, 1, 1))
+        self.assertEqual(
+            runtime.context_ledger.safe_metadata()["in_flight_attempt_count"],
+            0,
+        )
+
+    def test_transport_claim_commit_then_raise_is_observable_without_replay(self):
+        _, gate, credential = _make_authorized_credential()
+        launcher, resolver, _, _, _, _ = _components()
+        prepared = self._coordinate(launcher, resolver, gate, credential)
+        owner = object()
+        ledger_type = http_module._ResolverCoordinationRecoveryLedger
+        original = ledger_type.claim_transport
+        primary = RuntimeError("synthetic transport claim postcommit")
+
+        def commit_then_raise(selected, candidate, selected_owner):
+            original(selected, candidate, selected_owner)
+            raise primary
+
+        with patch.object(
+            ledger_type,
+            "claim_transport",
+            new=commit_then_raise,
+        ):
+            with self.assertRaises(RuntimeError) as raised:
+                prepared._claim_transport(
+                    owner,
+                    _authority=http_module._TRANSPORT_PREPARED_AUTHORITY,
+                )
+        self.assertIs(raised.exception, primary)
+        self.assertTrue(
+            prepared._transport_claim_is_exact(
+                owner,
+                _authority=http_module._TRANSPORT_PREPARED_AUTHORITY,
+            )
+        )
+        with self.assertRaises(EndpointPolicyError):
+            prepared._claim_transport(
+                object(),
+                _authority=http_module._TRANSPORT_PREPARED_AUTHORITY,
+            )
+        self.assertTrue(
+            prepared._finish_transport(
+                owner,
+                _authority=http_module._TRANSPORT_PREPARED_AUTHORITY,
+            )
+        )
+
+    def test_async_interrupt_around_transport_claim_recovers_exact_state(self):
+        for phase in ("before_ledger", "after_ledger"):
+            with self.subTest(phase=phase):
+                _, gate, credential = _make_authorized_credential()
+                launcher, resolver, _, _, _, _ = _components()
+                prepared = self._coordinate(
+                    launcher,
+                    resolver,
+                    gate,
+                    credential,
+                )
+                owner = object()
+                ledger = prepared._recovery_ledger_snapshot
+                primary = KeyboardInterrupt(f"synthetic claim {phase}")
+
+                def interrupt_claim(frame, event, arg):
+                    del arg
+                    if (
+                        event == "line"
+                        and frame.f_code
+                        is PreparedResolverAttempt._claim_transport.__code__
+                        and prepared._status == "claiming_transport"
+                    ):
+                        exact = ledger.transport_claim_is_exact(
+                            prepared,
+                            owner,
+                        )
+                        claimable = ledger.prepared_transport_is_claimable(
+                            prepared,
+                        )
+                        if (
+                            phase == "before_ledger"
+                            and claimable
+                            or phase == "after_ledger"
+                            and exact
+                        ):
+                            sys.settrace(None)
+                            raise primary
+                    return interrupt_claim
+
+                sys.settrace(interrupt_claim)
+                try:
+                    with self.assertRaises(KeyboardInterrupt) as raised:
+                        prepared._claim_transport(
+                            owner,
+                            _authority=(
+                                http_module._TRANSPORT_PREPARED_AUTHORITY
+                            ),
+                        )
+                finally:
+                    sys.settrace(None)
+                self.assertIs(raised.exception, primary)
+                if phase == "before_ledger":
+                    self.assertEqual(
+                        prepared.safe_metadata()["state"],
+                        "active",
+                    )
+                    prepared._claim_transport(
+                        owner,
+                        _authority=http_module._TRANSPORT_PREPARED_AUTHORITY,
+                    )
+                else:
+                    self.assertEqual(
+                        prepared.safe_metadata()["state"],
+                        "transporting",
+                    )
+                    self.assertTrue(
+                        prepared._transport_claim_is_exact(
+                            owner,
+                            _authority=(
+                                http_module._TRANSPORT_PREPARED_AUTHORITY
+                            ),
+                        )
+                    )
+                self.assertTrue(
+                    prepared._finish_transport(
+                        owner,
+                        _authority=http_module._TRANSPORT_PREPARED_AUTHORITY,
+                    )
+                )
+
+    def test_transport_claim_noop_does_not_strand_prepared_owner(self):
+        _, gate, credential = _make_authorized_credential()
+        launcher, resolver, _, _, _, _ = _components()
+        ticket = issue_resolver_cleanup_ticket()
+        prepared = self._coordinate(
+            launcher,
+            resolver,
+            gate,
+            credential,
+            cleanup_ticket=ticket,
+        )
+        ledger_type = http_module._ResolverCoordinationRecoveryLedger
+        with patch.object(ledger_type, "claim_transport", return_value=None):
+            with self.assertRaises(EndpointPolicyError):
+                prepared._claim_transport(
+                    object(),
+                    _authority=http_module._TRANSPORT_PREPARED_AUTHORITY,
+                )
+        self.assertEqual(prepared.safe_metadata()["state"], "active")
+        self.assertTrue(ticket.retry_cleanup())
+        self.assertTrue(prepared.is_closed)
+
+    def test_transport_finish_return_value_cannot_override_observed_state(self):
+        ledger_type = http_module._ResolverCoordinationRecoveryLedger
+        for reported in (False, True):
+            with self.subTest(reported=reported):
+                _, gate, credential = _make_authorized_credential()
+                launcher, resolver, _, _, _, _ = _components()
+                prepared = self._coordinate(
+                    launcher,
+                    resolver,
+                    gate,
+                    credential,
+                )
+                owner = object()
+                prepared._claim_transport(
+                    owner,
+                    _authority=http_module._TRANSPORT_PREPARED_AUTHORITY,
+                )
+                with patch.object(
+                    ledger_type,
+                    "finish_transport",
+                    return_value=reported,
+                ):
+                    with self.assertRaises(EndpointPolicyError):
+                        prepared._finish_transport(
+                            owner,
+                            _authority=(
+                                http_module._TRANSPORT_PREPARED_AUTHORITY
+                            ),
+                        )
+                self.assertEqual(
+                    prepared.safe_metadata()["state"],
+                    "transporting",
+                )
+                self.assertTrue(
+                    prepared._transport_claim_is_exact(
+                        owner,
+                        _authority=http_module._TRANSPORT_PREPARED_AUTHORITY,
+                    )
+                )
+                self.assertTrue(
+                    prepared._finish_transport(
+                        owner,
+                        _authority=http_module._TRANSPORT_PREPARED_AUTHORITY,
+                    )
+                )
+
+    def test_transport_finish_precommit_raise_preserves_owner_and_primary(self):
+        _, gate, credential = _make_authorized_credential()
+        launcher, resolver, _, _, _, _ = _components()
+        prepared = self._coordinate(launcher, resolver, gate, credential)
+        owner = object()
+        prepared._claim_transport(
+            owner,
+            _authority=http_module._TRANSPORT_PREPARED_AUTHORITY,
+        )
+        primary = RuntimeError("synthetic finish precommit")
+        ledger_type = http_module._ResolverCoordinationRecoveryLedger
+        with patch.object(
+            ledger_type,
+            "finish_transport",
+            side_effect=primary,
+        ):
+            with self.assertRaises(RuntimeError) as raised:
+                prepared._finish_transport(
+                    owner,
+                    _authority=http_module._TRANSPORT_PREPARED_AUTHORITY,
+                )
+        self.assertIs(raised.exception, primary)
+        self.assertEqual(prepared.safe_metadata()["state"], "transporting")
+        self.assertTrue(
+            prepared._finish_transport(
+                owner,
+                _authority=http_module._TRANSPORT_PREPARED_AUTHORITY,
+            )
+        )
+
+    def test_consumed_transport_can_only_retry_cleanup_never_replay(self):
+        _, gate, credential = _make_authorized_credential()
+        launcher, resolver, _, _, _, _ = _components()
+        ticket = issue_resolver_cleanup_ticket()
+        prepared = self._coordinate(
+            launcher,
+            resolver,
+            gate,
+            credential,
+            cleanup_ticket=ticket,
+        )
+        owner = object()
+        prepared._claim_transport(
+            owner,
+            _authority=http_module._TRANSPORT_PREPARED_AUTHORITY,
+        )
+        with patch.object(
+            AttemptGate,
+            "_recover_attempt_for_cleanup",
+            return_value=False,
+        ):
+            with self.assertRaises(EndpointPolicyError):
+                prepared._finish_transport(
+                    owner,
+                    _authority=http_module._TRANSPORT_PREPARED_AUTHORITY,
+                )
+        self.assertEqual(
+            prepared.safe_metadata()["state"],
+            "cleanup_pending",
+        )
+        self.assertEqual(ticket.safe_metadata()["state"], "recoverable")
+        with self.assertRaises(EndpointPolicyError):
+            prepared._claim_transport(
+                object(),
+                _authority=http_module._TRANSPORT_PREPARED_AUTHORITY,
+            )
+        self.assertEqual(
+            prepared.safe_metadata()["state"],
+            "cleanup_pending",
+        )
+        self.assertTrue(prepared.close())
+        self.assertTrue(ticket.is_terminal)
+
+    def test_transport_finish_commit_then_raise_is_terminal_and_not_replayed(self):
+        _, gate, credential = _make_authorized_credential()
+        launcher, resolver, _, _, _, _ = _components()
+        ticket = issue_resolver_cleanup_ticket()
+        prepared = self._coordinate(
+            launcher,
+            resolver,
+            gate,
+            credential,
+            cleanup_ticket=ticket,
+        )
+        owner = object()
+        prepared._claim_transport(
+            owner,
+            _authority=http_module._TRANSPORT_PREPARED_AUTHORITY,
+        )
+        ledger_type = http_module._ResolverCoordinationRecoveryLedger
+        original = ledger_type.finish_transport
+        primary = RuntimeError("synthetic finish postcommit")
+
+        def finish_then_raise(selected, candidate, selected_owner):
+            original(selected, candidate, selected_owner)
+            raise primary
+
+        with patch.object(
+            ledger_type,
+            "finish_transport",
+            new=finish_then_raise,
+        ):
+            with self.assertRaises(RuntimeError) as raised:
+                prepared._finish_transport(
+                    owner,
+                    _authority=http_module._TRANSPORT_PREPARED_AUTHORITY,
+                )
+        self.assertIs(raised.exception, primary)
+        self.assertTrue(prepared.is_closed)
+        self.assertTrue(ticket.is_terminal)
+        self.assertTrue(
+            prepared._finish_transport(
+                object(),
+                _authority=http_module._TRANSPORT_PREPARED_AUTHORITY,
+            )
+        )
+
+    def test_async_interrupt_around_transport_finish_recovers_exact_state(self):
+        for phase in ("before_ledger", "after_ledger"):
+            with self.subTest(phase=phase):
+                _, gate, credential = _make_authorized_credential()
+                launcher, resolver, _, _, _, _ = _components()
+                prepared = self._coordinate(
+                    launcher,
+                    resolver,
+                    gate,
+                    credential,
+                )
+                owner = object()
+                ledger = prepared._recovery_ledger_snapshot
+                prepared._claim_transport(
+                    owner,
+                    _authority=http_module._TRANSPORT_PREPARED_AUTHORITY,
+                )
+                primary = KeyboardInterrupt(f"synthetic finish {phase}")
+
+                def interrupt_finish(frame, event, arg):
+                    del arg
+                    if (
+                        event == "line"
+                        and frame.f_code
+                        is PreparedResolverAttempt._finish_transport.__code__
+                        and prepared._status == "finishing_transport"
+                    ):
+                        exact = ledger.transport_claim_is_exact(
+                            prepared,
+                            owner,
+                        )
+                        terminal = ledger.is_terminal()
+                        if (
+                            phase == "before_ledger"
+                            and exact
+                            or phase == "after_ledger"
+                            and terminal
+                        ):
+                            sys.settrace(None)
+                            raise primary
+                    return interrupt_finish
+
+                sys.settrace(interrupt_finish)
+                try:
+                    with self.assertRaises(KeyboardInterrupt) as raised:
+                        prepared._finish_transport(
+                            owner,
+                            _authority=(
+                                http_module._TRANSPORT_PREPARED_AUTHORITY
+                            ),
+                        )
+                finally:
+                    sys.settrace(None)
+                self.assertIs(raised.exception, primary)
+                if phase == "before_ledger":
+                    self.assertEqual(
+                        prepared.safe_metadata()["state"],
+                        "transporting",
+                    )
+                    self.assertTrue(
+                        prepared._finish_transport(
+                            owner,
+                            _authority=(
+                                http_module._TRANSPORT_PREPARED_AUTHORITY
+                            ),
+                        )
+                    )
+                else:
+                    self.assertTrue(prepared.is_closed)
+
+    def test_concurrent_transport_claim_has_one_winner(self):
+        _, gate, credential = _make_authorized_credential()
+        launcher, resolver, _, _, _, _ = _components()
+        prepared = self._coordinate(launcher, resolver, gate, credential)
+        barrier = Barrier(3)
+        owners = (object(), object())
+        outcomes: list[tuple[str, object]] = []
+
+        def worker(owner: object) -> None:
+            barrier.wait()
+            try:
+                prepared._claim_transport(
+                    owner,
+                    _authority=http_module._TRANSPORT_PREPARED_AUTHORITY,
+                )
+            except EndpointPolicyError:
+                outcomes.append(("rejected", owner))
+            else:
+                outcomes.append(("claimed", owner))
+
+        threads = [Thread(target=worker, args=(owner,)) for owner in owners]
+        for thread in threads:
+            thread.start()
+        barrier.wait()
+        for thread in threads:
+            thread.join(timeout=5)
+            self.assertFalse(thread.is_alive())
+        self.assertEqual(
+            sorted(outcome for outcome, _ in outcomes),
+            ["claimed", "rejected"],
+        )
+        winner = next(owner for outcome, owner in outcomes if outcome == "claimed")
+        self.assertTrue(
+            prepared._finish_transport(
+                winner,
+                _authority=http_module._TRANSPORT_PREPARED_AUTHORITY,
             )
         )
 
@@ -3724,6 +4471,7 @@ class W09ResolverCoordinatorTest(unittest.TestCase):
             ("begin_attempt_publication", 1, 0),
             ("record_attempt", 1, 1),
             ("record_terminal_guard", 1, 1),
+            ("register_prepared", 1, 1),
             ("publish_recoverable", 1, 1),
         )
         ledger_type = http_module._ResolverCoordinationRecoveryLedger
@@ -3752,7 +4500,10 @@ class W09ResolverCoordinatorTest(unittest.TestCase):
                     _consumed_budgets(runtime),
                     (consumed_budget, consumed_budget, consumed_budget),
                 )
-                if method_name != "publish_recoverable":
+                if method_name not in (
+                    "register_prepared",
+                    "publish_recoverable",
+                ):
                     self.assertNotIn("start_write", events)
                 self.assertTrue(ticket.is_terminal)
                 self.assertEqual(
@@ -3780,6 +4531,7 @@ class W09ResolverCoordinatorTest(unittest.TestCase):
             ("begin_attempt_publication", 1, 0),
             ("record_attempt", 1, 1),
             ("record_terminal_guard", 1, 1),
+            ("register_prepared", 1, 1),
             ("publish_recoverable", 1, 1),
         )
         ledger_type = http_module._ResolverCoordinationRecoveryLedger

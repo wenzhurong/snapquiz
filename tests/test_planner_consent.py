@@ -602,23 +602,23 @@ class ConsentAuthorizationContractTest(unittest.TestCase):
 
         self.assertEqual(
             str(planned.plan.plan_id),
-            "759d3730-e78d-553f-be84-f414a03281ba",
+            "02a40bb4-c811-55ce-930b-59c00a920667",
         )
         self.assertEqual(
             str(planned.plan.stages[0].stage_id),
-            "9f05b219-ee0b-56a7-a829-8046926a14b5",
+            "4ea9f149-5d08-5a04-a75c-70bacbf66b2b",
         )
         self.assertEqual(
             str(operation.operation_id),
-            "89dd2a02-63b1-5878-916e-0fe015b53647",
+            "aa4d6b07-6798-5201-9347-f7a3028bbbe9",
         )
         self.assertEqual(
             str(planned.plan.plan_digest),
-            "3634912d99c4bd4eb3e5a347729b6162099a429dff7dc247ed6ca206fb61bd0e",
+            "3da8071d7b9b6617ef171dd7e40e61be262d958080607a9bd8d006d8bb1a9671",
         )
         self.assertEqual(
             str(planned.planned_execution_digest),
-            "50370adce28b90a424d00f6d1d3a4795cc2982ddcc731277dfdbd6e208f06aa7",
+            "710282a4bbab4635a43ceafee47d4d516ffa3e973a751eb92e858d271479328b",
         )
         self.assertEqual(
             str(consent_operation.contract_digest()),
@@ -626,19 +626,19 @@ class ConsentAuthorizationContractTest(unittest.TestCase):
         )
         self.assertEqual(
             str(grant.grant_terms_digest),
-            "ce34265da15e3cc3d74ffeae195d560cea812f024648b44bd614900ee2b02887",
+            "8eee1138dc29cfb263d26518b414d1f38591c3fb3c08a0e2b4dc3bb2659a7d81",
         )
         self.assertEqual(
             str(grant.grant_digest),
-            "ef8e168d0da80a3d5d145416f8af2800a80675a6e453342b6e15641262db7428",
+            "46415bc86484452ad4bffa73f46342cdf593d31d16734f66195bba419f8dc0e2",
         )
         self.assertEqual(
             str(authorization.authorization_id),
-            "07f7f6d4-2ce9-5bdb-a47c-147a9f16f9ea",
+            "7851039d-a827-529b-978b-93b57ec24934",
         )
         self.assertEqual(
             str(authorization.authorization_digest),
-            "695889a32002b56bc440c05b2430b01747674916735f836b456d05c407c031e3",
+            "8e185f6f2e879fe7e063054435cafa8bf9c979c7ec94eba2c1516e895ee35663",
         )
 
     def test_exact_unknown_confirmations_issue_and_authorize(self):

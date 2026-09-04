@@ -1100,23 +1100,23 @@ class W06GoldenVectorTest(unittest.TestCase):
                 "9862e8ecb6fe63e2d1d9f5dd970755ad"
             ),
             "capture_authorization_id": (
-                "65559638-a4fe-5a04-be45-97dec454291b"
+                "cc8edea2-7c54-54b1-813d-4f289466cc3a"
             ),
             "capture_authorization_digest": (
-                "5d8feede1f21c7e79be5a83d70ce2e1e"
-                "88be75510b3534fec5ef1eae5643d420"
+                "a6b586e5cb840b178c215f9a5c36de2e"
+                "18cf7847d9f8268831d2a44d3408974e"
             ),
             "consumption_digest": (
-                "6b23c7ce37a3e8fa264fa5db9c4b0e69"
-                "c05f04edc71c90d620cbe2ef3b39bea7"
+                "4af2693dd28468da697cb7a9f3148894"
+                "c5ac10082ae452f5b747d537ce037548"
             ),
             "artifact_sha256": (
                 "5589c8bdac912d404d5fb722a09eefad"
                 "0a68bae711f7d5748508bacc0fbdb50c"
             ),
             "validation_digest": (
-                "0d0ab8a8ac7792535c0f51a330e75fe4"
-                "5a0d6278abcfbc0789f4080a94d092bc"
+                "ff9a3aa2f2916536ab19ac3025fdf031"
+                "95f9239cfcc894c6964cd70988ac27de"
             ),
         }
         actual = {

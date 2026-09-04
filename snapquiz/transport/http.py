@@ -9,11 +9,13 @@ perform process, credential, DNS, socket, TLS, or HTTP I/O.
 from __future__ import annotations
 
 from threading import RLock
+from typing import Callable
 from uuid import UUID, uuid4
 
 from snapquiz.domain._validation import require_uuid, runtime_final
 from snapquiz.domain.digest import Digest256
 from snapquiz.domain.errors import EndpointPolicyError
+from snapquiz.domain.outbound import PreparedOutbound
 from snapquiz.runtime.attempt import (
     AttemptGate,
     AttemptPermit,
@@ -47,6 +49,7 @@ RESOLVER_COORDINATOR_POLICY_VERSION = "snapquiz.resolver-coordinator.v1"
 
 _PREPARED_RESOLVER_ATTEMPT_AUTHORITY = object()
 _RESOLVER_CLEANUP_TICKET_AUTHORITY = object()
+_TRANSPORT_PREPARED_AUTHORITY = object()
 
 
 def _coordinator_error(message: str) -> EndpointPolicyError:
@@ -89,6 +92,10 @@ class _ResolverCoordinationRecoveryLedger:
         "_claim_id",
         "_terminal_guard_id",
         "_terminal_guard_digest",
+        "_prepared",
+        "_transport_owner",
+        "_transport_cleanup",
+        "_transport_consumed",
         "_prepared_published",
         "_resources_terminal_proven",
     )
@@ -116,6 +123,17 @@ class _ResolverCoordinationRecoveryLedger:
         self._claim_id: UUID | None = None
         self._terminal_guard_id: UUID | None = None
         self._terminal_guard_digest: Digest256 | None = None
+        self._prepared: PreparedResolverAttempt | None = None
+        self._transport_owner: object | None = None
+        self._transport_cleanup: (
+            tuple[
+                Callable[[], None],
+                Callable[[], bool],
+                Callable[[], bool],
+            ]
+            | None
+        ) = None
+        self._transport_consumed = False
         self._prepared_published = False
         self._resources_terminal_proven = False
 
@@ -463,16 +481,283 @@ class _ResolverCoordinationRecoveryLedger:
             self._prepared_published = True
             self._state = "recoverable"
 
+    def register_prepared(
+        self,
+        owner: object,
+        prepared: "PreparedResolverAttempt",
+    ) -> None:
+        """Anchor the exact future transport owner before publication."""
+
+        with self._lock:
+            self._require_coordinating_locked(owner)
+            if (
+                type(prepared) is not PreparedResolverAttempt
+                or prepared._recovery_ledger_snapshot is not self
+                or self._prepared is not None
+                or self._prepared_published
+            ):
+                raise _coordinator_error("resolver prepared owner snapshot 无效。")
+            self._prepared = prepared
+
+    def prepared_owner_is_exact(
+        self,
+        owner: object,
+        prepared: "PreparedResolverAttempt",
+    ) -> bool:
+        with self._lock:
+            return (
+                self._coordination_owner is owner
+                and self._state == "coordinating"
+                and self._prepared is prepared
+                and prepared._recovery_ledger_snapshot is self
+                and not self._prepared_published
+            )
+
     def prepared_publication_is_committed(self, owner: object) -> bool:
         with self._lock:
             return (
                 self._prepared_published
                 and self._state in ("recoverable", "terminal")
                 and (
+                    self._state == "terminal"
+                    or type(self._prepared) is PreparedResolverAttempt
+                )
+                and (
                     self._coordination_owner is owner
                     or self._state == "terminal"
                 )
             )
+
+    def claim_transport(
+        self,
+        prepared: "PreparedResolverAttempt",
+        owner: object,
+        *,
+        cleanup_action: Callable[[], None] | None = None,
+        cleanup_terminal: Callable[[], bool] | None = None,
+        cleanup_released: Callable[[], bool] | None = None,
+    ) -> None:
+        """Linearize exclusive transport use against every cleanup caller."""
+
+        if owner is None:
+            raise TypeError("transport owner must be an identity object")
+        callbacks = (cleanup_action, cleanup_terminal, cleanup_released)
+        if any(item is None for item in callbacks) and not all(
+            item is None for item in callbacks
+        ):
+            raise TypeError("transport cleanup callbacks must be supplied together")
+        if cleanup_action is not None and not all(
+            callable(item) for item in callbacks
+        ):
+            raise TypeError("transport cleanup callbacks must be callable")
+        with self._lock:
+            if (
+                self._state != "recoverable"
+                or not self._prepared_published
+                or self._prepared is not prepared
+                or prepared._recovery_ledger_snapshot is not self
+                or self._transport_owner is not None
+                or self._transport_cleanup is not None
+                or self._transport_consumed
+                or self._resources_terminal_proven
+            ):
+                raise _coordinator_error("resolver attempt 当前不能交给 Transport。")
+            try:
+                self._transport_cleanup = (
+                    None
+                    if cleanup_action is None
+                    or cleanup_terminal is None
+                    or cleanup_released is None
+                    else (
+                        cleanup_action,
+                        cleanup_terminal,
+                        cleanup_released,
+                    )
+                )
+                self._transport_owner = owner
+                self._transport_consumed = True
+                self._state = "transporting"
+            except BaseException:
+                if (
+                    self._state == "recoverable"
+                    and self._prepared is prepared
+                    and (
+                        self._transport_owner is None
+                        or self._transport_owner is owner
+                    )
+                ):
+                    self._transport_owner = None
+                    self._transport_cleanup = None
+                    self._transport_consumed = False
+                raise
+
+    def transport_claim_is_exact(
+        self,
+        prepared: "PreparedResolverAttempt",
+        owner: object,
+    ) -> bool:
+        with self._lock:
+            return (
+                self._state == "transporting"
+                and self._prepared_published
+                and self._prepared is prepared
+                and self._transport_owner is owner
+                and self._transport_consumed
+                and prepared._recovery_ledger_snapshot is self
+                and not self._resources_terminal_proven
+            )
+
+    def prepared_transport_is_claimable(
+        self,
+        prepared: "PreparedResolverAttempt",
+    ) -> bool:
+        """Observe the exact never-consumed state for claim recovery."""
+
+        with self._lock:
+            return (
+                self._state == "recoverable"
+                and self._prepared_published
+                and self._prepared is prepared
+                and self._transport_owner is None
+                and not self._transport_consumed
+                and prepared._recovery_ledger_snapshot is self
+                and not self._resources_terminal_proven
+            )
+
+    def prepared_cleanup_is_recoverable(
+        self,
+        prepared: "PreparedResolverAttempt",
+    ) -> bool:
+        """Observe a consumed Transport owner now restricted to cleanup."""
+
+        with self._lock:
+            return (
+                self._state == "recoverable"
+                and self._prepared_published
+                and self._prepared is prepared
+                and self._transport_owner is None
+                and self._transport_consumed
+                and prepared._recovery_ledger_snapshot is self
+            )
+
+    def finish_transport(
+        self,
+        prepared: "PreparedResolverAttempt",
+        owner: object,
+    ) -> bool:
+        """Return the exact transport owner and run the shared cleanup path."""
+
+        with self._lock:
+            if self._state == "terminal":
+                return True
+            if (
+                self._state != "transporting"
+                or self._prepared is not prepared
+                or self._transport_owner is not owner
+            ):
+                return False
+            try:
+                self._transport_owner = None
+                self._state = "recoverable"
+                return self._retry_locked(raise_errors=True)
+            except BaseException:
+                # If interruption happened before the state transition, the
+                # exact Transport owner still has the only retry authority.
+                # Once ``recoverable`` is visible, the consumed owner is
+                # cleanup-only and can never be claimed for a second wire run.
+                if (
+                    self._state == "transporting"
+                    and self._prepared is prepared
+                    and self._transport_owner is None
+                    and self._transport_consumed
+                ):
+                    self._transport_owner = owner
+                raise
+
+    def _transport_terminal_locked(
+        self,
+        errors: list[BaseException],
+    ) -> bool:
+        """Close a released Transport before Attempt/credential cleanup.
+
+        The callbacks are anchored at the transport claim.  Their independent
+        observer, rather than the close wrapper's return value, is the only
+        authority that permits the ledger to release these owner references.
+        """
+
+        cleanup = self._transport_cleanup
+        if cleanup is None:
+            return True
+        if type(cleanup) is not tuple or len(cleanup) != 3:
+            return False
+        action, observer, _ = cleanup
+        if not callable(action) or not callable(observer):
+            return False
+
+        committed = False
+        try:
+            selected = observer()
+            committed = type(selected) is bool and selected
+        except BaseException as error:
+            errors.append(error)
+        if not committed:
+            try:
+                result = action()
+                if result is not None:
+                    errors.append(
+                        _coordinator_error(
+                            "Transport cleanup action 返回值无效。"
+                        )
+                    )
+            except BaseException as error:
+                errors.append(error)
+            try:
+                selected = observer()
+                committed = type(selected) is bool and selected
+            except BaseException as error:
+                errors.append(error)
+                committed = False
+        if committed:
+            self._transport_cleanup = None
+        return committed
+
+    def recover_released_transport(
+        self,
+        prepared: "PreparedResolverAttempt",
+    ) -> bool:
+        """Move a finished caller into cleanup-only recovery without replay."""
+
+        with self._lock:
+            if self._state in ("recoverable", "terminal"):
+                return True
+            cleanup = self._transport_cleanup
+            if (
+                self._state != "transporting"
+                or self._prepared is not prepared
+                or self._transport_owner is None
+                or not self._transport_consumed
+                or type(cleanup) is not tuple
+                or len(cleanup) != 3
+            ):
+                return False
+            released = cleanup[2]
+            if not callable(released):
+                return False
+            try:
+                selected = released()
+            except BaseException:
+                return False
+            if type(selected) is not bool or not selected:
+                return False
+            owner = self._transport_owner
+            try:
+                self._transport_owner = None
+                self._state = "recoverable"
+            except BaseException:
+                if self._state == "transporting" and self._transport_owner is None:
+                    self._transport_owner = owner
+                raise
+            return True
 
     def _helper_terminal_locked(self, errors: list[BaseException]) -> bool:
         launcher = self._launcher
@@ -663,6 +948,9 @@ class _ResolverCoordinationRecoveryLedger:
         self._claim_id = None
         self._terminal_guard_id = None
         self._terminal_guard_digest = None
+        self._prepared = None
+        self._transport_owner = None
+        self._transport_cleanup = None
 
     def _resource_refs_are_released_locked(self) -> bool:
         return self._resources_terminal_proven and all(
@@ -686,6 +974,9 @@ class _ResolverCoordinationRecoveryLedger:
                 self._claim_id,
                 self._terminal_guard_id,
                 self._terminal_guard_digest,
+                self._prepared,
+                self._transport_owner,
+                self._transport_cleanup,
             )
         )
 
@@ -695,18 +986,22 @@ class _ResolverCoordinationRecoveryLedger:
         try:
             all_terminal = self._resources_terminal_proven
             if not all_terminal:
-                helper_terminal = self._helper_terminal_locked(errors)
+                transport_terminal = self._transport_terminal_locked(errors)
+                helper_terminal = False
                 attempt_terminal = False
                 credential_terminal = False
-                if helper_terminal:
+                if transport_terminal:
+                    helper_terminal = self._helper_terminal_locked(errors)
+                if transport_terminal and helper_terminal:
                     attempt_terminal = self._attempt_terminal_locked(errors)
-                if helper_terminal and attempt_terminal:
+                if transport_terminal and helper_terminal and attempt_terminal:
                     credential_terminal = self._credential_terminal_locked(
                         errors,
                         raise_errors=raise_errors,
                     )
                 all_terminal = (
-                    helper_terminal
+                    transport_terminal
+                    and helper_terminal
                     and attempt_terminal
                     and credential_terminal
                 )
@@ -752,7 +1047,18 @@ class _ResolverCoordinationRecoveryLedger:
                 return False
             if self._state == "terminal":
                 return True
-            if self._state in ("issued", "coordinating", "retrying"):
+            if self._state == "transporting":
+                prepared = self._prepared
+                if (
+                    type(prepared) is not PreparedResolverAttempt
+                    or not self.recover_released_transport(prepared)
+                ):
+                    return False
+            if self._state in (
+                "issued",
+                "coordinating",
+                "retrying",
+            ):
                 return False
             if self._state != "recoverable":
                 return False
@@ -904,6 +1210,8 @@ class PreparedResolverAttempt:
         "_credential_handle_snapshot",
         "_credential_handle_id_snapshot",
         "_credential_handle_digest_snapshot",
+        "_result_receipt_snapshot",
+        "_resolution_set_snapshot",
         "_recovery_ledger_snapshot",
         "_status",
         "_lock",
@@ -1036,6 +1344,8 @@ class PreparedResolverAttempt:
                 "_credential_handle_digest_snapshot",
                 credential_handle.handle_digest,
             ),
+            ("_result_receipt_snapshot", result_receipt),
+            ("_resolution_set_snapshot", resolution_set),
             ("_recovery_ledger_snapshot", recovery_ledger),
             ("_status", "active"),
             ("_lock", RLock()),
@@ -1078,6 +1388,238 @@ class PreparedResolverAttempt:
             and self._recovery_ledger_snapshot.is_terminal()
         ):
             object.__setattr__(self, "_status", "closed")
+        elif (
+            self._status != "closed"
+            and self._recovery_ledger_snapshot.prepared_cleanup_is_recoverable(
+                self
+            )
+        ):
+            object.__setattr__(self, "_status", "cleanup_pending")
+
+    def _claim_transport(
+        self,
+        owner: object,
+        *,
+        cleanup_action: Callable[[], None] | None = None,
+        cleanup_terminal: Callable[[], bool] | None = None,
+        cleanup_released: Callable[[], bool] | None = None,
+        _authority: object | None = None,
+    ) -> None:
+        """Exclusively transfer this prepared owner to exact Transport code."""
+
+        if _authority is not _TRANSPORT_PREPARED_AUTHORITY:
+            raise TypeError("prepared transport claim requires transport authority")
+        if owner is None:
+            raise TypeError("transport owner must be an identity object")
+
+        def observed_status() -> str:
+            if self._recovery_ledger_snapshot.is_terminal():
+                return "closed"
+            if self._recovery_ledger_snapshot.transport_claim_is_exact(
+                self,
+                owner,
+            ):
+                return "transporting"
+            if (
+                self._recovery_ledger_snapshot
+                .prepared_cleanup_is_recoverable(self)
+            ):
+                return "cleanup_pending"
+            if self._recovery_ledger_snapshot.prepared_transport_is_claimable(
+                self,
+            ):
+                return "active"
+            return "claiming_transport"
+
+        with self._lock:
+            self._sync_terminal_state_locked()
+            if self._status != "active":
+                raise _coordinator_error("resolver attempt 已终结或正在使用。")
+            try:
+                object.__setattr__(self, "_status", "claiming_transport")
+                if (
+                    cleanup_action is None
+                    and cleanup_terminal is None
+                    and cleanup_released is None
+                ):
+                    self._recovery_ledger_snapshot.claim_transport(self, owner)
+                else:
+                    self._recovery_ledger_snapshot.claim_transport(
+                        self,
+                        owner,
+                        cleanup_action=cleanup_action,
+                        cleanup_terminal=cleanup_terminal,
+                        cleanup_released=cleanup_released,
+                    )
+                status = observed_status()
+                object.__setattr__(self, "_status", status)
+                if status != "transporting":
+                    raise _coordinator_error(
+                        "resolver Transport claim 未提交。"
+                    )
+            except BaseException:
+                try:
+                    status = observed_status()
+                except BaseException:
+                    status = "claiming_transport"
+                object.__setattr__(self, "_status", status)
+                raise
+
+    def _transport_claim_is_exact(
+        self,
+        owner: object,
+        *,
+        _authority: object | None = None,
+    ) -> bool:
+        if _authority is not _TRANSPORT_PREPARED_AUTHORITY:
+            raise TypeError("prepared transport observation requires authority")
+        with self._lock:
+            self._sync_terminal_state_locked()
+            return (
+                self._status == "transporting"
+                and self._recovery_ledger_snapshot.transport_claim_is_exact(
+                    self,
+                    owner,
+                )
+            )
+
+    def _transport_inputs(
+        self,
+        owner: object,
+        *,
+        _authority: object | None = None,
+    ) -> tuple[
+        AttemptGate,
+        CredentialResolver,
+        CredentialHandle,
+        AttemptPermit,
+        ResolverResultReceipt,
+        ResolutionSet,
+        PreparedOutbound,
+    ]:
+        """Return exact frozen inputs only to the current Transport owner."""
+
+        if _authority is not _TRANSPORT_PREPARED_AUTHORITY:
+            raise TypeError("prepared transport inputs require authority")
+        with self._lock:
+            if (
+                self._status != "transporting"
+                or not self._recovery_ledger_snapshot.transport_claim_is_exact(
+                    self,
+                    owner,
+                )
+                or self.attempt_permit is not self._attempt_permit_snapshot
+                or self.credential_handle is not self._credential_handle_snapshot
+                or self.result_receipt is not self._result_receipt_snapshot
+                or self.resolution_set is not self._resolution_set_snapshot
+                or self._gate is not self.attempt_permit._attempt_gate
+                or self._credential_permit_snapshot
+                is not self.attempt_permit._credential_permit
+                or self.transport_claim_id
+                != self.resolution_set.transport_claim_id
+                or self.terminal_guard_id
+                != self.resolution_set.terminal_guard_id
+                or self.terminal_guard_digest
+                != self.resolution_set.terminal_guard_digest
+                or self.dns_start_id != self.resolution_set.dns_start_id
+                or self._credential_handle_id_snapshot
+                != self.credential_handle.handle_id
+                or self._credential_handle_digest_snapshot
+                != self.credential_handle.handle_digest
+            ):
+                raise _coordinator_error("resolver Transport 输入 owner 已变化。")
+            prepared = self._credential_permit_snapshot._prepared
+            if (
+                type(prepared) is not PreparedOutbound
+                or prepared.request_envelope_digest
+                != self.attempt_permit.request_envelope_digest
+            ):
+                raise _coordinator_error("resolver Transport request binding 无效。")
+            try:
+                self.attempt_permit.validate_integrity()
+                self.credential_handle.validate_integrity()
+                self.result_receipt._validate_exact_issuance(
+                    _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+                )
+                self.resolution_set.validate_binding(
+                    self.attempt_permit,
+                    self.result_receipt,
+                )
+                prepared.validate_integrity()
+            except (AttributeError, TypeError, ValueError):
+                raise _coordinator_error(
+                    "resolver Transport 输入完整性校验失败。"
+                ) from None
+            return (
+                self._gate,
+                self._credential_resolver,
+                self.credential_handle,
+                self.attempt_permit,
+                self.result_receipt,
+                self.resolution_set,
+                prepared,
+            )
+
+    def _finish_transport(
+        self,
+        owner: object,
+        *,
+        _authority: object | None = None,
+    ) -> bool:
+        """Relinquish transport ownership and exactly-once clean all owners."""
+
+        if _authority is not _TRANSPORT_PREPARED_AUTHORITY:
+            raise TypeError("prepared transport finish requires authority")
+
+        def observed_status() -> str:
+            if self._recovery_ledger_snapshot.is_terminal():
+                return "closed"
+            if self._recovery_ledger_snapshot.transport_claim_is_exact(
+                self,
+                owner,
+            ):
+                return "transporting"
+            if (
+                self._recovery_ledger_snapshot
+                .prepared_cleanup_is_recoverable(self)
+            ):
+                return "cleanup_pending"
+            return "finishing_transport"
+
+        with self._lock:
+            self._sync_terminal_state_locked()
+            if self._status == "closed":
+                return True
+            if (
+                self._status != "transporting"
+                or not self._recovery_ledger_snapshot.transport_claim_is_exact(
+                    self,
+                    owner,
+                )
+            ):
+                return False
+            try:
+                object.__setattr__(self, "_status", "finishing_transport")
+                self._recovery_ledger_snapshot.finish_transport(
+                    self,
+                    owner,
+                )
+            except BaseException:
+                try:
+                    status = observed_status()
+                except BaseException:
+                    status = "finishing_transport"
+                object.__setattr__(self, "_status", status)
+                raise
+            status = observed_status()
+            object.__setattr__(self, "_status", status)
+            if status == "closed":
+                return True
+            if status == "transporting":
+                raise _coordinator_error("Transport finish 未提交。")
+            if status == "cleanup_pending":
+                raise _coordinator_error("Transport 未能证明完整终结。")
+            raise _coordinator_error("Transport finish 状态无法证明。")
 
     def _sync_terminal_state(
         self,
@@ -1120,6 +1662,20 @@ class PreparedResolverAttempt:
             self._sync_terminal_state_locked()
             if self._status == "closed":
                 return False
+            if self._status in ("transporting", "finishing_transport"):
+                recovered = (
+                    self._recovery_ledger_snapshot.recover_released_transport(
+                        self
+                    )
+                )
+                if recovered:
+                    object.__setattr__(self, "_status", "cleanup_pending")
+            if self._status in (
+                "claiming_transport",
+                "transporting",
+                "finishing_transport",
+            ):
+                raise _coordinator_error("resolver attempt 正由 Transport 使用。")
             if self._status == "closing":
                 raise _coordinator_error("resolver attempt 正在终结。")
             object.__setattr__(self, "_status", "closing")
@@ -1634,6 +2190,12 @@ def coordinate_resolver_attempt(
             coordination_owner=coordination_owner,
             _authority=_PREPARED_RESOLVER_ATTEMPT_AUTHORITY,
         )
+        recovery_ledger.register_prepared(coordination_owner, prepared)
+        if not recovery_ledger.prepared_owner_is_exact(
+            coordination_owner,
+            prepared,
+        ):
+            raise _coordinator_error("resolver prepared owner recovery 未提交。")
         recovery_ledger.publish_recoverable(coordination_owner)
         if not recovery_ledger.prepared_publication_is_committed(
             coordination_owner

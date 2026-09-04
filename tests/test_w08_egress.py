@@ -172,15 +172,15 @@ class ApprovalContractTest(unittest.TestCase):
         approval = authorities.approval
         self.assertEqual(
             str(approval.approval_id),
-            "f7749597-13c7-5770-97c1-1639f045fa9f",
+            "5359e8c1-bdc4-5053-bb1b-24b98520468e",
         )
         self.assertEqual(
             str(approval.approval_terms_digest),
-            "4ba8812c99c3b59fe279bd89e20aba89d9b76b664df75c49241fd5fc7478c968",
+            "94c825b2f7111ee80c9bc0dad46d458082b84ad47aa603e2d27e33322d9b36a6",
         )
         self.assertEqual(
             str(approval.approval_digest),
-            "8f08a2477af5b6620aed2e6376676be7e72753a9124d4662595aa2ea0452da4d",
+            "a20bc7777075e90b6358a3519c0df5e8151621774112323c7bb739c68dbe382e",
         )
         self.assertEqual(approval.request_id, authorities.invocation.request_id)
         self.assertEqual(approval.invocation_id, authorities.invocation.invocation_id)

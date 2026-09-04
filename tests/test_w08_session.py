@@ -132,19 +132,19 @@ class W08StaticSendSessionTest(unittest.TestCase):
 
         self.assertEqual(
             str(session.session_id),
-            "244ba3b8-8cbf-574e-acbd-1977a3ea66a2",
+            "35d7ee45-ad32-51f4-ad14-59d665b8745b",
         )
         self.assertEqual(
             str(session.consumed_approval_digest),
-            "5e4948b24602695b552f48edc943925880416469a8ae93519249dd3bd448f44d",
+            "9a79ecbdff0b3dff3062c0b37f08bcab9071d52ae32fcdd30a109148eb013e59",
         )
         self.assertEqual(
             str(session.session_terms_digest),
-            "c7ea9a79fd17b4efa6ddfd0598171e9476f7a7ec30a18644097e314d51ab5b13",
+            "2b1ae58ffbac939b92dc2d00cc48af479a20028ed10f7ef26c63c024992a9605",
         )
         self.assertEqual(
             str(session.session_digest),
-            "ab9f4b9a9814a05749f3620d818d1a26f8fd5612a9a8e392880cf3837ee4d0e4",
+            "f5c0d953c9b4097e6f0c435696ec557c278b47c0f136d20716a3f585fb24564c",
         )
 
     def test_session_is_factory_only_immutable_redacted_and_has_no_w09_state(self):

@@ -7,6 +7,7 @@ from datetime import timedelta
 import os
 import pickle
 import socket
+import sys
 from threading import Barrier, Event, Lock, Thread
 from types import TracebackType
 import unittest
@@ -21,7 +22,11 @@ from snapquiz.domain.errors import (
     TimeoutError as SnapTimeoutError,
 )
 from snapquiz.privacy.egress import EgressApprovalLedger, EgressGate
-from snapquiz.runtime.attempt import AttemptGate, _TRANSPORT_ATTEMPT_AUTHORITY
+from snapquiz.runtime.attempt import (
+    AttemptGate,
+    _CREDENTIAL_RESOLVER_AUTHORITY,
+    _TRANSPORT_ATTEMPT_AUTHORITY,
+)
 from snapquiz.runtime.context import CancellationReason
 from snapquiz.transport.credentials import (
     CredentialHandle,
@@ -34,6 +39,7 @@ from snapquiz.transport.session import SendSessionFactory, SendSessionLedger
 from tests.w06_helpers import NOW
 from tests.w08_helpers import FixedPreviewController
 from tests.w09_helpers import make_w09_runtime
+from tests.test_w09_attempt import _claim_id, _handle_proof
 
 
 SESSION_ISSUED_AT = NOW + timedelta(seconds=5)
@@ -195,6 +201,500 @@ class W09CredentialResolverTest(unittest.TestCase):
             runtime.context_ledger.safe_metadata()["active_gate_activity_count"],
             0,
         )
+
+    def test_async_interrupts_rollback_credential_claim_and_fail(self):
+        for phase in ("status_only", "owner_bound"):
+            with self.subTest(operation="claim", phase=phase):
+                runtime = _make_runtime()
+                gate = AttemptGate()
+                credential = _authorize(runtime, gate)
+                claim_id = _claim_id(credential)
+                primary = KeyboardInterrupt(f"synthetic credential claim {phase}")
+
+                def interrupt_claim(frame, event, arg):
+                    del arg
+                    if (
+                        event == "line"
+                        and frame.f_code
+                        is AttemptGate._claim_credential_resolution.__code__
+                    ):
+                        state = gate._credential_permits[credential.permit_id]
+                        owner_matches = (
+                            state.resolver_claim_id is None
+                            if phase == "status_only"
+                            else state.resolver_claim_id == claim_id
+                        )
+                        if state.status == "claiming" and owner_matches:
+                            sys.settrace(None)
+                            raise primary
+                    return interrupt_claim
+
+                sys.settrace(interrupt_claim)
+                try:
+                    with self.assertRaises(KeyboardInterrupt) as raised:
+                        gate._claim_credential_resolution(
+                            credential,
+                            claim_id=claim_id,
+                            _authority=_CREDENTIAL_RESOLVER_AUTHORITY,
+                        )
+                finally:
+                    sys.settrace(None)
+                self.assertIs(raised.exception, primary)
+                state = gate._credential_permits[credential.permit_id]
+                self.assertEqual(state.status, "authorized")
+                self.assertIsNone(state.resolver_claim_id)
+                gate._claim_credential_resolution(
+                    credential,
+                    claim_id=claim_id,
+                    _authority=_CREDENTIAL_RESOLVER_AUTHORITY,
+                )
+                self.assertTrue(
+                    gate._fail_credential_resolution(
+                        credential,
+                        claim_id=claim_id,
+                        _authority=_CREDENTIAL_RESOLVER_AUTHORITY,
+                    )
+                )
+
+        runtime = _make_runtime()
+        gate = AttemptGate()
+        credential = _authorize(runtime, gate)
+        claim_id = _claim_id(credential)
+        gate._claim_credential_resolution(
+            credential,
+            claim_id=claim_id,
+            _authority=_CREDENTIAL_RESOLVER_AUTHORITY,
+        )
+        primary = KeyboardInterrupt("synthetic credential fail")
+
+        def interrupt_fail(frame, event, arg):
+            del arg
+            state = gate._credential_permits[credential.permit_id]
+            if (
+                event == "line"
+                and frame.f_code
+                is AttemptGate._fail_credential_resolution.__code__
+                and state.status == "failing"
+            ):
+                sys.settrace(None)
+                raise primary
+            return interrupt_fail
+
+        sys.settrace(interrupt_fail)
+        try:
+            with self.assertRaises(KeyboardInterrupt) as raised:
+                gate._fail_credential_resolution(
+                    credential,
+                    claim_id=claim_id,
+                    _authority=_CREDENTIAL_RESOLVER_AUTHORITY,
+                )
+        finally:
+            sys.settrace(None)
+        self.assertIs(raised.exception, primary)
+        state = gate._credential_permits[credential.permit_id]
+        self.assertEqual(state.status, "resolving")
+        self.assertEqual(state.resolver_claim_id, claim_id)
+        self.assertTrue(
+            gate._fail_credential_resolution(
+                credential,
+                claim_id=claim_id,
+                _authority=_CREDENTIAL_RESOLVER_AUTHORITY,
+            )
+        )
+
+    def test_async_interrupts_rollback_credential_confirmation_partial(self):
+        phases = (
+            "status_only",
+            "binding_bound",
+            "handle_bound",
+            "claim_released",
+        )
+        for phase in phases:
+            with self.subTest(phase=phase):
+                runtime = _make_runtime()
+                gate = AttemptGate()
+                credential = _authorize(runtime, gate)
+                claim_id = _claim_id(credential)
+                handle_id, handle_digest = _handle_proof(credential)
+                gate._claim_credential_resolution(
+                    credential,
+                    claim_id=claim_id,
+                    _authority=_CREDENTIAL_RESOLVER_AUTHORITY,
+                )
+                primary = KeyboardInterrupt(
+                    f"synthetic credential confirmation {phase}"
+                )
+
+                def interrupt_confirm(frame, event, arg):
+                    del arg
+                    if (
+                        event == "line"
+                        and (
+                            frame.f_code
+                            is AttemptGate._confirm_credential_resolution.__code__
+                            or frame.f_code.co_name == "confirm"
+                        )
+                    ):
+                        state = gate._credential_permits[credential.permit_id]
+                        phase_matches = (
+                            phase == "status_only"
+                            and state.resolved_binding is None
+                            or phase == "binding_bound"
+                            and state.resolved_binding
+                            == credential.credential_binding_digest
+                            and state.credential_handle_id is None
+                            or phase == "handle_bound"
+                            and state.credential_handle_id == handle_id
+                            and state.resolved_publication_id is None
+                            or phase == "claim_released"
+                            and state.resolver_claim_id is None
+                        )
+                        if state.status == "confirming" and phase_matches:
+                            sys.settrace(None)
+                            raise primary
+                    return interrupt_confirm
+
+                arguments = {
+                    "claim_id": claim_id,
+                    "resolved_binding_digest": (
+                        credential.credential_binding_digest
+                    ),
+                    "handle_id": handle_id,
+                    "handle_digest": handle_digest,
+                    "_authority": _CREDENTIAL_RESOLVER_AUTHORITY,
+                }
+                sys.settrace(interrupt_confirm)
+                try:
+                    with self.assertRaises(KeyboardInterrupt) as raised:
+                        gate._confirm_credential_resolution(
+                            credential,
+                            **arguments,
+                        )
+                finally:
+                    sys.settrace(None)
+                self.assertIs(raised.exception, primary)
+                state = gate._credential_permits[credential.permit_id]
+                self.assertEqual(state.status, "resolving")
+                self.assertEqual(state.resolver_claim_id, claim_id)
+                self.assertIsNone(state.resolved_binding)
+                self.assertIsNone(state.credential_handle_id)
+                self.assertIsNone(state.credential_handle_digest)
+                self.assertIsNone(state.resolved_publication_id)
+                gate._confirm_credential_resolution(
+                    credential,
+                    **arguments,
+                )
+                self.assertTrue(
+                    gate._abandon_resolved_credential_resolution(
+                        credential,
+                        handle_id=handle_id,
+                        handle_digest=handle_digest,
+                        _authority=_CREDENTIAL_RESOLVER_AUTHORITY,
+                    )
+                )
+
+    def test_async_interrupt_rolls_back_invalid_confirmation_failure(self):
+        runtime = _make_runtime()
+        gate = AttemptGate()
+        credential = _authorize(runtime, gate)
+        claim_id = _claim_id(credential)
+        handle_id, handle_digest = _handle_proof(credential)
+        gate._claim_credential_resolution(
+            credential,
+            claim_id=claim_id,
+            _authority=_CREDENTIAL_RESOLVER_AUTHORITY,
+        )
+        primary = KeyboardInterrupt("synthetic invalid confirmation")
+
+        def interrupt_failure(frame, event, arg):
+            del arg
+            state = gate._credential_permits[credential.permit_id]
+            if (
+                event == "line"
+                and frame.f_code
+                is AttemptGate._confirm_credential_resolution.__code__
+                and state.status == "failing"
+            ):
+                sys.settrace(None)
+                raise primary
+            return interrupt_failure
+
+        sys.settrace(interrupt_failure)
+        try:
+            with self.assertRaises(KeyboardInterrupt) as raised:
+                gate._confirm_credential_resolution(
+                    credential,
+                    claim_id=claim_id,
+                    resolved_binding_digest=object(),
+                    handle_id=handle_id,
+                    handle_digest=handle_digest,
+                    _authority=_CREDENTIAL_RESOLVER_AUTHORITY,
+                )
+        finally:
+            sys.settrace(None)
+        self.assertIs(raised.exception, primary)
+        state = gate._credential_permits[credential.permit_id]
+        self.assertEqual(state.status, "resolving")
+        self.assertEqual(state.resolver_claim_id, claim_id)
+        self.assertTrue(
+            gate._fail_credential_resolution(
+                credential,
+                claim_id=claim_id,
+                _authority=_CREDENTIAL_RESOLVER_AUTHORITY,
+            )
+        )
+
+    def test_async_interrupts_leave_credential_cleanup_retryable(self):
+        for operation in ("resolved", "claimed"):
+            with self.subTest(operation=operation):
+                runtime = _make_runtime()
+                gate = AttemptGate()
+                credential = _authorize(runtime, gate)
+                claim_id = _claim_id(credential)
+                handle_id, handle_digest = _handle_proof(credential)
+                gate._claim_credential_resolution(
+                    credential,
+                    claim_id=claim_id,
+                    _authority=_CREDENTIAL_RESOLVER_AUTHORITY,
+                )
+                if operation == "resolved":
+                    gate._confirm_credential_resolution(
+                        credential,
+                        claim_id=claim_id,
+                        resolved_binding_digest=(
+                            credential.credential_binding_digest
+                        ),
+                        handle_id=handle_id,
+                        handle_digest=handle_digest,
+                        _authority=_CREDENTIAL_RESOLVER_AUTHORITY,
+                    )
+                    transient = "abandoning"
+                    target_code = (
+                        AttemptGate._recover_resolved_credential_state_for_cleanup.__code__
+                    )
+                else:
+                    transient = "failing"
+                    target_code = (
+                        AttemptGate._recover_claimed_credential_state_for_cleanup.__code__
+                    )
+                primary = KeyboardInterrupt(
+                    f"synthetic {operation} credential cleanup"
+                )
+
+                def interrupt_cleanup(frame, event, arg):
+                    del arg
+                    state = gate._credential_permits[credential.permit_id]
+                    if (
+                        event == "line"
+                        and frame.f_code is target_code
+                        and state.status == transient
+                    ):
+                        sys.settrace(None)
+                        raise primary
+                    return interrupt_cleanup
+
+                sys.settrace(interrupt_cleanup)
+                try:
+                    if operation == "resolved":
+                        self.assertFalse(
+                            gate._recover_resolved_credential_for_cleanup(
+                                credential,
+                                publication_id=claim_id,
+                                handle_id=handle_id,
+                                handle_digest=handle_digest,
+                                _authority=_CREDENTIAL_RESOLVER_AUTHORITY,
+                            )
+                        )
+                    else:
+                        self.assertFalse(
+                            gate._recover_claimed_credential_for_cleanup(
+                                credential,
+                                claim_id=claim_id,
+                                _authority=_CREDENTIAL_RESOLVER_AUTHORITY,
+                            )
+                        )
+                finally:
+                    sys.settrace(None)
+                state = gate._credential_permits[credential.permit_id]
+                self.assertEqual(
+                    state.status,
+                    "resolved" if operation == "resolved" else "resolving",
+                )
+                if operation == "resolved":
+                    self.assertTrue(
+                        gate._recover_resolved_credential_for_cleanup(
+                            credential,
+                            publication_id=claim_id,
+                            handle_id=handle_id,
+                            handle_digest=handle_digest,
+                            _authority=_CREDENTIAL_RESOLVER_AUTHORITY,
+                        )
+                    )
+                else:
+                    self.assertTrue(
+                        gate._recover_claimed_credential_for_cleanup(
+                            credential,
+                            claim_id=claim_id,
+                            _authority=_CREDENTIAL_RESOLVER_AUTHORITY,
+                        )
+                    )
+
+    def test_async_interrupt_during_resolved_abandon_is_retryable(self):
+        runtime = _make_runtime()
+        gate = AttemptGate()
+        credential = _authorize(runtime, gate)
+        claim_id = _claim_id(credential)
+        handle_id, handle_digest = _handle_proof(credential)
+        gate._claim_credential_resolution(
+            credential,
+            claim_id=claim_id,
+            _authority=_CREDENTIAL_RESOLVER_AUTHORITY,
+        )
+        gate._confirm_credential_resolution(
+            credential,
+            claim_id=claim_id,
+            resolved_binding_digest=credential.credential_binding_digest,
+            handle_id=handle_id,
+            handle_digest=handle_digest,
+            _authority=_CREDENTIAL_RESOLVER_AUTHORITY,
+        )
+        primary = KeyboardInterrupt("synthetic resolved abandon")
+
+        def interrupt_abandon(frame, event, arg):
+            del arg
+            state = gate._credential_permits[credential.permit_id]
+            if (
+                event == "line"
+                and frame.f_code
+                is AttemptGate._abandon_resolved_credential_resolution.__code__
+                and state.status == "abandoning"
+            ):
+                sys.settrace(None)
+                raise primary
+            return interrupt_abandon
+
+        sys.settrace(interrupt_abandon)
+        try:
+            with self.assertRaises(KeyboardInterrupt) as raised:
+                gate._abandon_resolved_credential_resolution(
+                    credential,
+                    handle_id=handle_id,
+                    handle_digest=handle_digest,
+                    _authority=_CREDENTIAL_RESOLVER_AUTHORITY,
+                )
+        finally:
+            sys.settrace(None)
+        self.assertIs(raised.exception, primary)
+        state = gate._credential_permits[credential.permit_id]
+        self.assertEqual(state.status, "resolved")
+        self.assertTrue(
+            gate._abandon_resolved_credential_resolution(
+                credential,
+                handle_id=handle_id,
+                handle_digest=handle_digest,
+                _authority=_CREDENTIAL_RESOLVER_AUTHORITY,
+            )
+        )
+
+    def test_async_interrupts_rollback_reserve_and_attempt_abandon(self):
+        for phase in ("reserving", "attempt_published"):
+            with self.subTest(operation="reserve", phase=phase):
+                runtime = _make_runtime()
+                gate = AttemptGate()
+                credential = _authorize(runtime, gate)
+                claim_id = _claim_id(credential)
+                handle_id, handle_digest = _handle_proof(credential)
+                gate._claim_credential_resolution(
+                    credential,
+                    claim_id=claim_id,
+                    _authority=_CREDENTIAL_RESOLVER_AUTHORITY,
+                )
+                gate._confirm_credential_resolution(
+                    credential,
+                    claim_id=claim_id,
+                    resolved_binding_digest=(
+                        credential.credential_binding_digest
+                    ),
+                    handle_id=handle_id,
+                    handle_digest=handle_digest,
+                    _authority=_CREDENTIAL_RESOLVER_AUTHORITY,
+                )
+                primary = KeyboardInterrupt(f"synthetic reserve {phase}")
+
+                def interrupt_reserve(frame, event, arg):
+                    del arg
+                    state = gate._credential_permits[credential.permit_id]
+                    if event == "line" and state.status == "reserving":
+                        phase_matches = (
+                            phase == "reserving"
+                            and frame.f_code.co_name == "reserve"
+                            and not gate._attempt_permits
+                            or phase == "attempt_published"
+                            and frame.f_code.co_name == "build"
+                            and bool(gate._attempt_permits)
+                        )
+                        if phase_matches:
+                            sys.settrace(None)
+                            raise primary
+                    return interrupt_reserve
+
+                sys.settrace(interrupt_reserve)
+                try:
+                    with self.assertRaises(KeyboardInterrupt) as raised:
+                        gate.reserve_attempt(
+                            credential_permit=credential,
+                            credential_handle_id=handle_id,
+                            credential_handle_digest=handle_digest,
+                        )
+                finally:
+                    sys.settrace(None)
+                self.assertIs(raised.exception, primary)
+                state = gate._credential_permits[credential.permit_id]
+                self.assertEqual(state.status, "resolved")
+                self.assertEqual(gate._attempt_permits, {})
+                attempt = gate.reserve_attempt(
+                    credential_permit=credential,
+                    credential_handle_id=handle_id,
+                    credential_handle_digest=handle_digest,
+                )
+                abandon_primary = KeyboardInterrupt(
+                    "synthetic attempt abandon"
+                )
+
+                def interrupt_abandon(frame, event, arg):
+                    del arg
+                    attempt_state = gate._attempt_permits[
+                        attempt.attempt_permit_id
+                    ]
+                    if (
+                        event == "line"
+                        and frame.f_code is AttemptGate.abandon_attempt.__code__
+                        and attempt_state.status == "abandoning"
+                    ):
+                        sys.settrace(None)
+                        raise abandon_primary
+                    return interrupt_abandon
+
+                sys.settrace(interrupt_abandon)
+                try:
+                    with self.assertRaises(KeyboardInterrupt) as raised:
+                        gate.abandon_attempt(
+                            attempt,
+                            _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+                        )
+                finally:
+                    sys.settrace(None)
+                self.assertIs(raised.exception, abandon_primary)
+                attempt_state = gate._attempt_permits[
+                    attempt.attempt_permit_id
+                ]
+                self.assertEqual(attempt_state.status, "active")
+                self.assertTrue(
+                    gate.abandon_attempt(
+                        attempt,
+                        _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+                    )
+                )
 
     def test_exact_one_read_binds_handle_proof_into_attempt(self):
         runtime = _make_runtime()
@@ -739,6 +1239,152 @@ class W09CredentialResolverTest(unittest.TestCase):
             )
         )
 
+    def test_transport_borrow_owner_is_exact_and_only_active_in_callback(self):
+        runtime = _make_runtime()
+        gate = AttemptGate()
+        credential = _authorize(runtime, gate)
+        resolver = CredentialResolver(_FakeSource(bytearray(_VALID_SECRET)))
+        handle = resolver.resolve(credential)
+        attempt = gate.reserve_attempt(
+            credential_permit=credential,
+            credential_handle_id=handle.handle_id,
+            credential_handle_digest=handle.handle_digest,
+        )
+        claim_id = _transport_claim_id(attempt)
+        gate._claim_attempt(
+            attempt,
+            claim_id=claim_id,
+            _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+        )
+        observed: list[UUID] = []
+
+        def consume(view: memoryview, borrow_id: UUID) -> str:
+            self.assertTrue(view.readonly)
+            self.assertEqual(bytes(view), _VALID_SECRET)
+            self.assertIs(type(borrow_id), UUID)
+            self.assertTrue(
+                gate._credential_borrow_is_active(
+                    attempt,
+                    borrow_id=borrow_id,
+                    handle_id=handle.handle_id,
+                    handle_digest=handle.handle_digest,
+                    _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+                )
+            )
+            observed.append(borrow_id)
+            return "consumed"
+
+        self.assertEqual(
+            resolver._borrow_once_with_owner(
+                handle,
+                attempt,
+                consume,
+                _authority=_TRANSPORT_CREDENTIAL_AUTHORITY,
+            ),
+            "consumed",
+        )
+        self.assertEqual(len(observed), 1)
+        self.assertFalse(
+            gate._credential_borrow_is_active(
+                attempt,
+                borrow_id=observed[0],
+                handle_id=handle.handle_id,
+                handle_digest=handle.handle_digest,
+                _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+            )
+        )
+        self.assertTrue(_is_closed(handle))
+        self.assertTrue(
+            gate.finish_attempt(
+                attempt,
+                claim_id=claim_id,
+                _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+            )
+        )
+
+    def test_async_interrupt_at_borrow_transition_detaches_and_zeros_secret(self):
+        runtime = _make_runtime()
+        gate = AttemptGate()
+        credential = _authorize(runtime, gate)
+        source = _FakeSource(bytearray(_VALID_SECRET))
+        resolver = CredentialResolver(source)
+        handle = resolver.resolve(credential)
+        attempt = gate.reserve_attempt(
+            credential_permit=credential,
+            credential_handle_id=handle.handle_id,
+            credential_handle_digest=handle.handle_digest,
+        )
+        claim_id = _transport_claim_id(attempt)
+        gate._claim_attempt(
+            attempt,
+            claim_id=claim_id,
+            _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+        )
+        callback_called = False
+        primary = KeyboardInterrupt("synthetic borrow transition")
+
+        def consume(view: memoryview, borrow_id: UUID) -> None:
+            nonlocal callback_called
+            del view, borrow_id
+            callback_called = True
+
+        def interrupt_transition(frame, event, arg):
+            del arg
+            if (
+                event == "line"
+                and frame.f_code.co_name == "borrow_secret"
+            ):
+                local_secret = frame.f_locals.get("secret")
+                state = resolver._ledger._states[handle]
+                if (
+                    local_secret is state.secret
+                    and type(local_secret) is bytearray
+                    and state.status == "active"
+                ):
+                    sys.settrace(None)
+                    raise primary
+            return interrupt_transition
+
+        sys.settrace(interrupt_transition)
+        try:
+            with self.assertRaises(KeyboardInterrupt) as raised:
+                resolver._borrow_once_with_owner(
+                    handle,
+                    attempt,
+                    consume,
+                    _authority=_TRANSPORT_CREDENTIAL_AUTHORITY,
+                )
+        finally:
+            sys.settrace(None)
+
+        self.assertIs(raised.exception, primary)
+        self.assertFalse(callback_called)
+        state = resolver._ledger._states[handle]
+        self.assertEqual(state.status, "closed")
+        self.assertIsNone(state.secret)
+        self.assertEqual(source.returned_buffers, [bytearray()])
+        attempt_state = gate._attempt_permits[attempt.attempt_permit_id]
+        self.assertIsNone(attempt_state.credential_borrow_id)
+        traceback = raised.exception.__traceback__
+        while traceback is not None:
+            for value in traceback.tb_frame.f_locals.values():
+                if type(value) is bytearray:
+                    self.assertFalse(any(value))
+                elif type(value) is memoryview:
+                    try:
+                        retained = value.tobytes()
+                    except ValueError:
+                        continue
+                    self.assertFalse(any(retained))
+            traceback = traceback.tb_next
+        self.assertTrue(
+            gate.finish_attempt(
+                attempt,
+                claim_id=claim_id,
+                _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+            )
+        )
+
     def test_consumed_handle_rejects_resolver_close_until_attempt_terminal(self):
         runtime = _make_runtime()
         gate = AttemptGate()
@@ -1170,6 +1816,178 @@ class W09CredentialResolverTest(unittest.TestCase):
                         _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
                     )
                 )
+
+    def test_close_cleanup_faults_do_not_replace_gate_primary(self):
+        runtime = _make_runtime()
+        gate = AttemptGate()
+        credential = _authorize(runtime, gate)
+        resolver = CredentialResolver(_FakeSource(bytearray(_VALID_SECRET)))
+        handle = resolver.resolve(credential)
+        primary = _FatalValidationError("synthetic Gate primary")
+        cleanup = RuntimeError("synthetic restore cleanup")
+
+        with patch.object(
+            AttemptGate,
+            "_abandon_resolved_credential_resolution",
+            side_effect=primary,
+        ), patch.object(
+            _CredentialLedger,
+            "_restore_active_after_gate_failure",
+            side_effect=cleanup,
+        ):
+            with self.assertRaises(_FatalValidationError) as raised:
+                resolver.close(handle)
+        self.assertIs(raised.exception, primary)
+        state = resolver._ledger._states[handle]
+        self.assertEqual(state.status, "active")
+        self.assertEqual(bytes(state.secret), _VALID_SECRET)
+        self.assertTrue(resolver.close(handle))
+
+    def test_async_interrupt_around_close_claim_is_recovered_exactly(self):
+        for phase in ("after_claim", "after_gate"):
+            with self.subTest(phase=phase):
+                runtime = _make_runtime()
+                gate = AttemptGate()
+                credential = _authorize(runtime, gate)
+                source = _FakeSource(bytearray(_VALID_SECRET))
+                resolver = CredentialResolver(source)
+                handle = resolver.resolve(credential)
+                primary = KeyboardInterrupt(f"synthetic close {phase}")
+
+                def interrupt_close(frame, event, arg):
+                    del arg
+                    state = resolver._ledger._states[handle]
+                    gate_state = gate._credential_permits[credential.permit_id]
+                    target_matches = (
+                        phase == "after_claim"
+                        and frame.f_code is _CredentialLedger._release_info.__code__
+                        and gate_state.status == "resolved"
+                        or phase == "after_gate"
+                        and frame.f_code
+                        is CredentialResolver._close_claimed.__code__
+                        and gate_state.status
+                        in ("abandoned", "finished")
+                    )
+                    if (
+                        event == "line"
+                        and state.status == "closing"
+                        and target_matches
+                    ):
+                        sys.settrace(None)
+                        raise primary
+                    return interrupt_close
+
+                sys.settrace(interrupt_close)
+                try:
+                    with self.assertRaises(KeyboardInterrupt) as raised:
+                        resolver.close(handle)
+                finally:
+                    sys.settrace(None)
+                self.assertIs(raised.exception, primary)
+                state = resolver._ledger._states[handle]
+                if phase == "after_claim":
+                    self.assertEqual(state.status, "active")
+                    self.assertEqual(bytes(state.secret), _VALID_SECRET)
+                    self.assertTrue(resolver.close(handle))
+                else:
+                    self.assertEqual(state.status, "closed")
+                    self.assertIsNone(state.secret)
+                    self.assertEqual(source.returned_buffers, [bytearray()])
+
+    def test_close_force_fault_does_not_replace_postcommit_gate_primary(self):
+        runtime = _make_runtime()
+        gate = AttemptGate()
+        credential = _authorize(runtime, gate)
+        source = _FakeSource(bytearray(_VALID_SECRET))
+        resolver = CredentialResolver(source)
+        handle = resolver.resolve(credential)
+        primary = _FatalValidationError("synthetic Gate postcommit primary")
+        cleanup = RuntimeError("synthetic force-close cleanup")
+        original = AttemptGate._abandon_resolved_credential_resolution
+
+        def commit_then_raise(selected, *args, **kwargs):
+            original(selected, *args, **kwargs)
+            raise primary
+
+        with patch.object(
+            AttemptGate,
+            "_abandon_resolved_credential_resolution",
+            new=commit_then_raise,
+        ), patch.object(
+            _CredentialLedger,
+            "_force_close_after_gate",
+            side_effect=cleanup,
+        ):
+            with self.assertRaises(_FatalValidationError) as raised:
+                resolver.close(handle)
+        self.assertIs(raised.exception, primary)
+        state = resolver._ledger._states[handle]
+        self.assertEqual(state.status, "closed")
+        self.assertIsNone(state.secret)
+        self.assertEqual(source.returned_buffers, [bytearray()])
+
+    def test_borrow_cleanup_faults_do_not_replace_callback_primary(self):
+        runtime = _make_runtime()
+        gate = AttemptGate()
+        credential = _authorize(runtime, gate)
+        source = _FakeSource(bytearray(_VALID_SECRET))
+        resolver = CredentialResolver(source)
+        handle = resolver.resolve(credential)
+        attempt = gate.reserve_attempt(
+            credential_permit=credential,
+            credential_handle_id=handle.handle_id,
+            credential_handle_digest=handle.handle_digest,
+        )
+        claim_id = _transport_claim_id(attempt)
+        gate._claim_attempt(
+            attempt,
+            claim_id=claim_id,
+            _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+        )
+        primary = _FatalValidationError("synthetic callback primary")
+        cleanup = RuntimeError("synthetic borrow cleanup")
+
+        def fail(_view):
+            raise primary
+
+        with patch.object(
+            _CredentialLedger,
+            "_finish_borrow",
+            side_effect=cleanup,
+        ), patch.object(
+            _CredentialLedger,
+            "_force_finish_borrow",
+            side_effect=cleanup,
+        ), patch.object(
+            AttemptGate,
+            "_finish_credential_borrow",
+            side_effect=cleanup,
+        ), patch.object(
+            AttemptGate,
+            "_force_finish_credential_borrow",
+            side_effect=cleanup,
+        ):
+            with self.assertRaises(_FatalValidationError) as raised:
+                resolver._borrow_once(
+                    handle,
+                    attempt,
+                    fail,
+                    _authority=_TRANSPORT_CREDENTIAL_AUTHORITY,
+                )
+        self.assertIs(raised.exception, primary)
+        state = resolver._ledger._states[handle]
+        self.assertEqual(state.status, "closed")
+        self.assertIsNone(state.secret)
+        self.assertEqual(source.returned_buffers, [bytearray()])
+        attempt_state = gate._attempt_permits[attempt.attempt_permit_id]
+        self.assertIsNone(attempt_state.credential_borrow_id)
+        self.assertTrue(
+            gate.finish_attempt(
+                attempt,
+                claim_id=claim_id,
+                _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+            )
+        )
 
     def test_wrong_resolver_and_slot_clone_cannot_close_exact_handle(self):
         runtime = _make_runtime()

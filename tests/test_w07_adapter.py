@@ -152,19 +152,19 @@ class RequestInvocationContractTest(unittest.TestCase):
         )
         self.assertEqual(
             str(authorities.planned.planned_execution_digest),
-            "9653fc96b8fed95ed32936be9473cd584f05841d0dcaa3dab6df3c97fa711e8e",
+            "912533e37c69379860ab471a3fdc92210fbe52daea0105d7414674d2b35fa2aa",
         )
         self.assertEqual(
             str(authorities.solve_request.solve_request_digest),
-            "7ddc092547ff0157055de75275c1a4c0db76261ff8edd2543c1e73bd479bc6fe",
+            "3ef559b02a2366dbe86bed624c52c950e34d0775a83ae8cf9829ecf7027a8e53",
         )
         self.assertEqual(
             str(authorities.invocation.invocation_id),
-            "6166071f-14ff-590e-9e2c-356d9238747e",
+            "a1ff3ce7-d965-5fad-80ae-9a0c3e7f8182",
         )
         self.assertEqual(
             str(authorities.invocation.invocation_digest),
-            "058052c484226774fa2083a7eb25a0e6b03f26234e01a765f07ed3a6cb10402b",
+            "05ab00a503987d34e03f0af31320195cb8d807b1f7f345fdc890df5236a3173c",
         )
 
     def test_request_and_invocation_are_private_immutable_and_redacted(self):
@@ -249,7 +249,7 @@ class PrepareContractTest(unittest.TestCase):
         )
         self.assertEqual(
             str(prepared.request_envelope_digest),
-            "0a6cba2d01d34886a93054a26d20b9b1c85fed0cf5075d3e78ef693bba20dbbd",
+            "aa0e10e3cf04a0a04132593b5ecc5ddbea98e59115db6bdec74a201a0cc4780c",
         )
         self.assertEqual(
             prepared.source_ids,

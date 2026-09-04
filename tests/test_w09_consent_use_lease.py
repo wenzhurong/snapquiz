@@ -230,19 +230,19 @@ class W09ConsentUseLeaseTest(unittest.TestCase):
         self.assertIs(lease._session, runtime.session)
         self.assertEqual(
             str(lease.lease_id),
-            "784c31d9-f8f4-5a82-897e-7bd588d08da0",
+            "845609dd-b08d-5545-89fc-ccb02d401ce8",
         )
         self.assertEqual(
             str(lease.lease_terms_digest),
-            "3da33c5640471a50db052abc23c301c32847fb28f47b100060b263617e71e468",
+            "40cbbafdd8bd5172186bf766ff8278a400afd1dcd0462bf5b776be09fa4deb4d",
         )
         self.assertEqual(
             str(lease.lease_digest),
-            "e4a7bb4c533706cffc2b623ba53bc4acc427054b8c439485f62f72a87b6d5042",
+            "357890bbb65d169e9fbae615705b23c923ed2ec3bbde23fec79fe75da6404409",
         )
         self.assertEqual(
             str(current.grant_digest),
-            "cf4a9947fbc7d254866357cb521ee310b6316e3e5acb1cf120abbb154fa6aaa9",
+            "3cec6b344107b7904498d4dcf8dd4d1a1a08456df9c4760aa23952bea8d4f246",
         )
         self.assertEqual(
             runtime.consent_ledger.safe_metadata()["use_lease_count"],

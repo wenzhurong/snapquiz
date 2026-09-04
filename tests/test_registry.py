@@ -61,7 +61,7 @@ from snapquiz.routing.registry import (
 
 
 REGISTRY_GOLDEN_DIGEST = (
-    "9a04c537f6119e49a0bf4a84e476dd8c832321573779fbb9583856ea845aa112"
+    "e0107435d053d24625493be960f7cf79affa17d2fb295228ee9dd8bce0a9588a"
 )
 
 
@@ -77,6 +77,14 @@ class BuiltinRegistryContractTest(unittest.TestCase):
         self.binding = self.pipeline.stage_bindings[0]
 
     def test_builtin_registry_has_the_frozen_exact_glm_binding(self):
+        self.assertEqual(
+            BUILTIN_REGISTRY_REVISION,
+            "snapquiz.builtin-registry@2026-09-03-w09",
+        )
+        self.assertEqual(
+            GLM_TLS_POLICY_REF,
+            "snapquiz.tls.system-default-h1.v1",
+        )
         self.assertEqual(self.registry.registry_revision, BUILTIN_REGISTRY_REVISION)
         self.assertEqual(self.registry.published_at, BUILTIN_REGISTRY_PUBLISHED_AT)
         self.assertIs(self.registry.authority, RegistryAuthority.BUILTIN)

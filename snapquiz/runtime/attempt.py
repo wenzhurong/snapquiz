@@ -1505,6 +1505,9 @@ class _AttemptPermitState:
         "terminal_guard_digest",
         "dns_start_id",
         "credential_borrow_id",
+        "wire_commit_id",
+        "wire_evidence_digest",
+        "wire_borrow_id",
         "resolver_completion_status",
         "resolver_completion_authority_id",
         "resolver_completion_claim_id",
@@ -1532,6 +1535,9 @@ class _AttemptPermitState:
         self.terminal_guard_digest: Digest256 | None = None
         self.dns_start_id: UUID | None = None
         self.credential_borrow_id: UUID | None = None
+        self.wire_commit_id: UUID | None = None
+        self.wire_evidence_digest: Digest256 | None = None
+        self.wire_borrow_id: UUID | None = None
         self.resolver_completion_status = "uncommitted"
         self.resolver_completion_authority_id: UUID | None = None
         self.resolver_completion_claim_id: UUID | None = None
@@ -2295,7 +2301,13 @@ class AttemptGate:
             and type(handle_id) is UUID
             and type(handle_digest) is Digest256
         )
+        confirmation_is_valid = (
+            binding_is_valid
+            and proof_is_valid
+            and resolved_binding_digest == permit.credential_binding_digest
+        )
         preconfirm_snapshot: tuple[object, object, object, object] | None = None
+        bindings: tuple[object, ...] | None = None
         with self._lock:
             state = self._require_credential_state_locked(permit)
             if (
@@ -2303,13 +2315,7 @@ class AttemptGate:
                 or state.resolver_claim_id != claim_id
             ):
                 raise _attempt_error("凭据解析授权未被 resolver 独占。")
-            if (
-                not binding_is_valid
-                or not proof_is_valid
-                or resolved_binding_digest != permit.credential_binding_digest
-            ):
-                state.status = "failing"
-            else:
+            if confirmation_is_valid:
                 bindings = (
                     permit._planned,
                     permit._invocation,
@@ -2329,62 +2335,77 @@ class AttemptGate:
                     state.credential_handle_digest,
                     state.resolved_publication_id,
                 )
-                state.status = "confirming"
-        if state.status == "failing":
-            try:
+
+        transition_started = False
+        try:
+            # Cover the first visible transition.  The exact resolver owner is
+            # revalidated under the lock so an asynchronous BaseException can
+            # restore only this transaction's partial state.
+            with self._lock:
+                current = self._require_credential_state_locked(permit)
+                if (
+                    current is not state
+                    or current.status != "resolving"
+                    or current.resolver_claim_id != claim_id
+                ):
+                    raise _attempt_error(
+                        "凭据解析确认状态已经变化。"
+                    )
+                transition_started = True
+                current.status = (
+                    "confirming" if confirmation_is_valid else "failing"
+                )
+
+            if not confirmation_is_valid:
                 self._finish_credential_activity(
                     permit,
                     required_status="failing",
                     terminal_status="abandoned",
                 )
-            except BaseException:
-                with self._lock:
-                    current = self._lookup_credential_state_locked(permit)
-                    if current.status == "failing":
-                        current.status = "resolving"
-                raise
-            raise _attempt_error("凭据解析结果或句柄证明与批准内容不匹配。")
+                raise _attempt_error(
+                    "凭据解析结果或句柄证明与批准内容不匹配。"
+                )
 
-        (
-            planned,
-            invocation,
-            prepared,
-            authorization,
-            consent_ledger,
-            session,
-            approval_ledger,
-            session_ledger,
-            authority_ledger,
-            context,
-            context_ledger,
-        ) = bindings
+            assert bindings is not None
+            (
+                planned,
+                invocation,
+                prepared,
+                authorization,
+                consent_ledger,
+                session,
+                approval_ledger,
+                session_ledger,
+                authority_ledger,
+                context,
+                context_ledger,
+            ) = bindings
 
-        def confirm(
-            stage: ExecutionPlanStage,
-            operation: ExecutionPlanNetworkOperation,
-            sample: ClockSample,
-        ) -> None:
-            del stage, operation
-            if (
-                sample.wall_time < session.issued_at
-                or sample.wall_time >= session.valid_until
-            ):
-                raise _attempt_error("发送会话已经过期或尚未生效。")
-            with self._lock:
-                current = self._require_credential_state_locked(permit)
+            def confirm(
+                stage: ExecutionPlanStage,
+                operation: ExecutionPlanNetworkOperation,
+                sample: ClockSample,
+            ) -> None:
+                del stage, operation
                 if (
-                    current.status != "confirming"
-                    or current.resolver_claim_id != claim_id
+                    sample.wall_time < session.issued_at
+                    or sample.wall_time >= session.valid_until
                 ):
-                    raise _attempt_error("凭据解析确认状态已经变化。")
-                current.resolved_binding = resolved_binding_digest
-                current.credential_handle_id = handle_id
-                current.credential_handle_digest = handle_digest
-                current.resolved_publication_id = effective_publication_id
-                current.resolver_claim_id = None
-                current.status = "resolved"
+                    raise _attempt_error("发送会话已经过期或尚未生效。")
+                with self._lock:
+                    current = self._require_credential_state_locked(permit)
+                    if (
+                        current.status != "confirming"
+                        or current.resolver_claim_id != claim_id
+                    ):
+                        raise _attempt_error("凭据解析确认状态已经变化。")
+                    current.resolved_binding = resolved_binding_digest
+                    current.credential_handle_id = handle_id
+                    current.credential_handle_digest = handle_digest
+                    current.resolved_publication_id = effective_publication_id
+                    current.resolver_claim_id = None
+                    current.status = "resolved"
 
-        try:
             self._run_authority_path(
                 planned=planned,
                 invocation=invocation,
@@ -2415,11 +2436,35 @@ class AttemptGate:
                     == current.permit_id
                 )
                 if not committed:
+                    raise _attempt_error(
+                        "credential confirmation transaction 未提交。"
+                    )
+        except BaseException:
+            with self._lock:
+                current = self._lookup_credential_state_locked(permit)
+                if transition_started and current is state:
                     if (
-                        current is state
+                        not confirmation_is_valid
+                        and current.status == "failing"
+                        and current.resolver_claim_id == claim_id
+                    ):
+                        current.status = "resolving"
+                    elif (
+                        confirmation_is_valid
                         and preconfirm_snapshot is not None
-                        and current.status in ("confirming", "resolved")
+                        and current.status == "confirming"
                         and current.resolver_claim_id in (claim_id, None)
+                        and current.resolved_binding
+                        in (preconfirm_snapshot[0], resolved_binding_digest)
+                        and current.credential_handle_id
+                        in (preconfirm_snapshot[1], handle_id)
+                        and current.credential_handle_digest
+                        in (preconfirm_snapshot[2], handle_digest)
+                        and current.resolved_publication_id
+                        in (
+                            preconfirm_snapshot[3],
+                            effective_publication_id,
+                        )
                         and self._active_by_session.get(current.session_id)
                         == current.permit_id
                     ):
@@ -2431,17 +2476,6 @@ class AttemptGate:
                         ) = preconfirm_snapshot
                         current.resolver_claim_id = claim_id
                         current.status = "resolving"
-                    raise _attempt_error(
-                        "credential confirmation transaction 未提交。"
-                    )
-        except BaseException:
-            with self._lock:
-                current = self._lookup_credential_state_locked(permit)
-                if (
-                    current.status == "confirming"
-                    and current.resolver_claim_id == claim_id
-                ):
-                    current.status = "resolving"
             raise
 
     def _finish_credential_activity(
@@ -2514,8 +2548,22 @@ class AttemptGate:
                 or state.resolver_claim_id != claim_id
             ):
                 raise _attempt_error("只能终止 resolver 已独占的凭据授权。")
-            state.status = "failing"
+        transition_started = False
         try:
+            with self._lock:
+                current = self._lookup_credential_state_locked(permit)
+                if (
+                    current is not state
+                    or current.status != "resolving"
+                    or current.resolver_claim_id != claim_id
+                    or self._active_by_session.get(current.session_id)
+                    != current.permit_id
+                ):
+                    raise _attempt_error(
+                        "凭据解析失败状态已经变化。"
+                    )
+                transition_started = True
+                current.status = "failing"
             self._finish_credential_activity(
                 permit,
                 required_status="failing",
@@ -2525,7 +2573,9 @@ class AttemptGate:
             with self._lock:
                 current = self._lookup_credential_state_locked(permit)
                 if (
-                    current.status == "failing"
+                    transition_started
+                    and current is state
+                    and current.status == "failing"
                     and current.resolver_claim_id == claim_id
                 ):
                     current.status = "resolving"
@@ -2685,8 +2735,6 @@ class AttemptGate:
                 permit._context,
                 permit._context_ledger,
             )
-            initial_state.resolver_claim_id = claim_id
-            initial_state.status = "claiming"
         (
             planned,
             invocation,
@@ -2722,7 +2770,21 @@ class AttemptGate:
                 state.status = "resolving"
                 return permit
 
+        transition_started = False
         try:
+            with self._lock:
+                current = self._require_credential_state_locked(permit)
+                if (
+                    current is not initial_state
+                    or current.status != "authorized"
+                    or current.resolver_claim_id is not None
+                ):
+                    raise _attempt_error(
+                        "凭据解析授权已被其他 resolver 领取。"
+                    )
+                transition_started = True
+                current.status = "claiming"
+                current.resolver_claim_id = claim_id
             self._run_authority_path(
                 planned=planned,
                 invocation=invocation,
@@ -2754,8 +2816,13 @@ class AttemptGate:
                 if (
                     self._credential_permits.get(initial_state.permit_id)
                     is initial_state
-                    and initial_state.status == "claiming"
-                    and initial_state.resolver_claim_id == claim_id
+                    and transition_started
+                    and (
+                        initial_state.status == "claiming"
+                        and initial_state.resolver_claim_id in (None, claim_id)
+                        or initial_state.status == "authorized"
+                        and initial_state.resolver_claim_id == claim_id
+                    )
                 ):
                     initial_state.status = "authorized"
                     initial_state.resolver_claim_id = None
@@ -2807,8 +2874,21 @@ class AttemptGate:
                 or state.credential_handle_digest != handle_digest
             ):
                 raise _attempt_error("凭据句柄证明与 resolver 状态不匹配。")
-            state.status = "abandoning"
+        transition_started = False
         try:
+            with self._lock:
+                current = self._lookup_credential_state_locked(permit)
+                if (
+                    current is not state
+                    or current.status != "resolved"
+                    or current.credential_handle_id != handle_id
+                    or current.credential_handle_digest != handle_digest
+                ):
+                    raise _attempt_error(
+                        "凭据句柄证明与 resolver 状态不匹配。"
+                    )
+                transition_started = True
+                current.status = "abandoning"
             self._finish_credential_activity(
                 permit,
                 required_status="abandoning",
@@ -2817,7 +2897,13 @@ class AttemptGate:
         except BaseException:
             with self._lock:
                 current = self._lookup_credential_state_locked(permit)
-                if current.status == "abandoning":
+                if (
+                    transition_started
+                    and current is state
+                    and current.status == "abandoning"
+                    and current.credential_handle_id == handle_id
+                    and current.credential_handle_digest == handle_digest
+                ):
                     current.status = "resolved"
             raise
         return True
@@ -3202,7 +3288,7 @@ class AttemptGate:
             if state.status in ("abandoned", "finished"):
                 return True
             if (
-                state.status != "resolved"
+                state.status not in ("resolved", "abandoning")
                 or state.resolver_claim_id is not None
                 or state.credential_handle_id != handle_id
                 or state.credential_handle_digest != handle_digest
@@ -3213,7 +3299,8 @@ class AttemptGate:
                 or state.context_ledger is None
             ):
                 return False
-            state.status = "abandoning"
+            context = state.context
+            context_ledger = state.context_ledger
 
         def terminal() -> None:
             with self._lock:
@@ -3232,9 +3319,26 @@ class AttemptGate:
                     state=state,
                 )
 
+        transition_started = False
         try:
-            state.context_ledger._finish_gate_activity(
-                context=state.context,
+            with self._lock:
+                if (
+                    self._credential_permits.get(state.permit_id) is not state
+                    or state.status not in ("resolved", "abandoning")
+                    or state.resolver_claim_id is not None
+                    or state.credential_handle_id != handle_id
+                    or state.credential_handle_digest != handle_digest
+                    or state.resolved_publication_id != publication_id
+                    or self._active_by_session.get(state.session_id)
+                    != state.permit_id
+                    or state.context is not context
+                    or state.context_ledger is not context_ledger
+                ):
+                    return False
+                transition_started = True
+                state.status = "abandoning"
+            context_ledger._finish_gate_activity(
+                context=context,
                 attempt_gate=self,
                 activity_id=state.permit_id,
                 action=terminal,
@@ -3242,11 +3346,11 @@ class AttemptGate:
             )
         except BaseException:
             with self._lock:
-                if state.status == "abandoning":
+                if transition_started and state.status == "abandoning":
                     state.status = "resolved"
         else:
             with self._lock:
-                if state.status == "abandoning":
+                if transition_started and state.status == "abandoning":
                     state.status = "resolved"
         with self._lock:
             return (
@@ -3302,7 +3406,8 @@ class AttemptGate:
             if state.status in ("abandoned", "finished"):
                 return True
             if (
-                state.status not in ("claiming", "resolving", "confirming")
+                state.status
+                not in ("claiming", "resolving", "confirming", "failing")
                 or state.resolver_claim_id != claim_id
                 or self._active_by_session.get(state.session_id)
                 != state.permit_id
@@ -3310,8 +3415,11 @@ class AttemptGate:
                 or state.context_ledger is None
             ):
                 return False
-            previous_status = state.status
-            state.status = "failing"
+            previous_status = (
+                "resolving" if state.status == "failing" else state.status
+            )
+            context = state.context
+            context_ledger = state.context_ledger
 
         def terminal() -> None:
             with self._lock:
@@ -3328,9 +3436,27 @@ class AttemptGate:
                     state=state,
                 )
 
+        transition_started = False
         try:
-            state.context_ledger._finish_gate_activity(
-                context=state.context,
+            with self._lock:
+                if (
+                    self._credential_permits.get(state.permit_id) is not state
+                    or state.status
+                    not in (
+                        previous_status,
+                        "failing",
+                    )
+                    or state.resolver_claim_id != claim_id
+                    or self._active_by_session.get(state.session_id)
+                    != state.permit_id
+                    or state.context is not context
+                    or state.context_ledger is not context_ledger
+                ):
+                    return False
+                transition_started = True
+                state.status = "failing"
+            context_ledger._finish_gate_activity(
+                context=context,
                 attempt_gate=self,
                 activity_id=state.permit_id,
                 action=terminal,
@@ -3339,14 +3465,16 @@ class AttemptGate:
         except BaseException:
             with self._lock:
                 if (
-                    state.status == "failing"
+                    transition_started
+                    and state.status == "failing"
                     and state.resolver_claim_id == claim_id
                 ):
                     state.status = previous_status
         else:
             with self._lock:
                 if (
-                    state.status == "failing"
+                    transition_started
+                    and state.status == "failing"
                     and state.resolver_claim_id == claim_id
                 ):
                     state.status = previous_status
@@ -3380,6 +3508,9 @@ class AttemptGate:
         old_terminal_guard_digest = state.terminal_guard_digest
         old_dns_start_id = state.dns_start_id
         old_credential_borrow_id = state.credential_borrow_id
+        old_wire_commit_id = state.wire_commit_id
+        old_wire_evidence_digest = state.wire_evidence_digest
+        old_wire_borrow_id = state.wire_borrow_id
         old_credential_status = credential_state.status
         old_credential_publication_id = (
             credential_state.resolved_publication_id
@@ -3416,6 +3547,9 @@ class AttemptGate:
             state.terminal_guard_digest = None
             state.dns_start_id = None
             state.credential_borrow_id = None
+            state.wire_commit_id = None
+            state.wire_evidence_digest = None
+            state.wire_borrow_id = None
             credential_state.status = "finished"
             credential_state.resolved_publication_id = None
             if (
@@ -3441,6 +3575,9 @@ class AttemptGate:
             state.terminal_guard_digest = old_terminal_guard_digest
             state.dns_start_id = old_dns_start_id
             state.credential_borrow_id = old_credential_borrow_id
+            state.wire_commit_id = old_wire_commit_id
+            state.wire_evidence_digest = old_wire_evidence_digest
+            state.wire_borrow_id = old_wire_borrow_id
             credential_state.status = old_credential_status
             credential_state.resolved_publication_id = (
                 old_credential_publication_id
@@ -3531,64 +3668,97 @@ class AttemptGate:
                 or sample.wall_time >= session.valid_until
             ):
                 raise _attempt_error("发送会话已经过期或尚未生效。")
-            with self._lock:
-                state = self._require_credential_state_locked(
-                    credential_permit
-                )
-                if (
-                    state.status != "resolved"
-                    or state.resolved_binding
-                    != credential_permit.credential_binding_digest
-                    or state.credential_handle_id != credential_handle_id
-                    or state.credential_handle_digest
-                    != credential_handle_digest
-                ):
-                    raise _attempt_error(
-                        "凭据尚未按批准 binding 和调用方句柄证明解析。"
-                    )
-                # Context lock is already held by _run_authority_path.  Marking
-                # this state before budget reservation makes abandon-vs-reserve
-                # linearizable without reversing the Context -> AttemptGate
-                # order.
-                state.status = "reserving"
-
-            def build(reservation: AttemptBudgetReservation) -> AttemptPermit:
+            transition_started = False
+            try:
                 with self._lock:
-                    current = self._require_credential_state_locked(
+                    state = self._require_credential_state_locked(
                         credential_permit
                     )
-                    if current.status != "reserving":
-                        raise _attempt_error("凭据解析授权已经消费。")
-                    permit = AttemptPermit(
-                        credential_permit=credential_permit,
-                        credential_handle_id=current.credential_handle_id,
-                        credential_handle_digest=current.credential_handle_digest,
-                        reservation=reservation,
-                        attempt_gate=self,
-                        _authority=_PERMIT_FACTORY_AUTHORITY,
-                    )
-                    attempt_state = _AttemptPermitState(permit)
-                    try:
-                        self._attempt_permits[permit.attempt_permit_id] = (
-                            attempt_state
+                    if (
+                        state is not initial_state
+                        or state.status != "resolved"
+                        or state.resolved_binding
+                        != credential_permit.credential_binding_digest
+                        or state.credential_handle_id != credential_handle_id
+                        or state.credential_handle_digest
+                        != credential_handle_digest
+                    ):
+                        raise _attempt_error(
+                            "凭据尚未按批准 binding 和调用方句柄证明解析。"
                         )
-                    except BaseException:
-                        if (
-                            self._attempt_permits.get(permit.attempt_permit_id)
-                            is attempt_state
-                        ):
-                            del self._attempt_permits[permit.attempt_permit_id]
-                        permit._release_authority_refs(
-                            _authority=_PERMIT_RELEASE_AUTHORITY,
-                        )
-                        raise
-                    # Publishing the exact AttemptPermit state succeeds before
-                    # this final commit marker.  Any publication fault therefore
-                    # leaves the credential in reserving for the outer rollback.
-                    current.status = "consumed"
-                    return permit
+                    # Context lock is already held by _run_authority_path.  The
+                    # rollback handler begins before this first visible write.
+                    transition_started = True
+                    state.status = "reserving"
 
-            try:
+                def build(
+                    reservation: AttemptBudgetReservation,
+                ) -> AttemptPermit:
+                    candidate_permit: AttemptPermit | None = None
+                    candidate_state: _AttemptPermitState | None = None
+                    try:
+                        with self._lock:
+                            current = self._require_credential_state_locked(
+                                credential_permit
+                            )
+                            if (
+                                current is not initial_state
+                                or current.status != "reserving"
+                            ):
+                                raise _attempt_error(
+                                    "凭据解析授权已经消费。"
+                                )
+                            candidate_permit = AttemptPermit(
+                                credential_permit=credential_permit,
+                                credential_handle_id=(
+                                    current.credential_handle_id
+                                ),
+                                credential_handle_digest=(
+                                    current.credential_handle_digest
+                                ),
+                                reservation=reservation,
+                                attempt_gate=self,
+                                _authority=_PERMIT_FACTORY_AUTHORITY,
+                            )
+                            candidate_state = _AttemptPermitState(
+                                candidate_permit
+                            )
+                            self._attempt_permits[
+                                candidate_permit.attempt_permit_id
+                            ] = candidate_state
+                            # ``consumed`` is the publication marker.  Any
+                            # exception before the callback returns removes the
+                            # exact candidate and restores ``reserving`` so the
+                            # enclosing Context transaction can roll back.
+                            current.status = "consumed"
+                            return candidate_permit
+                    except BaseException:
+                        with self._lock:
+                            if (
+                                candidate_permit is not None
+                                and candidate_state is not None
+                                and self._attempt_permits.get(
+                                    candidate_permit.attempt_permit_id
+                                )
+                                is candidate_state
+                            ):
+                                del self._attempt_permits[
+                                    candidate_permit.attempt_permit_id
+                                ]
+                            if (
+                                self._credential_permits.get(
+                                    initial_state.permit_id
+                                )
+                                is initial_state
+                                and initial_state.status == "consumed"
+                            ):
+                                initial_state.status = "reserving"
+                            if candidate_permit is not None:
+                                candidate_permit._release_authority_refs(
+                                    _authority=_PERMIT_RELEASE_AUTHORITY,
+                                )
+                        raise
+
                 candidate = context_ledger._reserve_attempt_budgets(
                     context=context,
                     session_id=credential_permit.session_id,
@@ -3633,7 +3803,10 @@ class AttemptGate:
             except BaseException:
                 with self._lock:
                     if (
-                        self._credential_permits.get(initial_state.permit_id)
+                        transition_started
+                        and self._credential_permits.get(
+                            initial_state.permit_id
+                        )
                         is initial_state
                         and initial_state.status == "reserving"
                     ):
@@ -3717,6 +3890,7 @@ class AttemptGate:
                 or candidate_state.terminal_guard_digest is not None
                 or candidate_state.dns_start_id is not None
                 or candidate_state.credential_borrow_id is not None
+                or not self._wire_state_is_well_formed(candidate_state)
                 or candidate_state.resolver_completion_status != "uncommitted"
                 or not self._resolver_completion_proof_is_well_formed(
                     candidate_state,
@@ -3764,6 +3938,9 @@ class AttemptGate:
         old_terminal_guard_digest = state.terminal_guard_digest
         old_dns_start_id = state.dns_start_id
         old_credential_borrow_id = state.credential_borrow_id
+        old_wire_commit_id = state.wire_commit_id
+        old_wire_evidence_digest = state.wire_evidence_digest
+        old_wire_borrow_id = state.wire_borrow_id
         old_credential_status = credential_state.status
         old_publication_id = credential_state.resolved_publication_id
         old_recovery_refs = state.recovery_refs()
@@ -3798,6 +3975,9 @@ class AttemptGate:
             state.terminal_guard_digest = None
             state.dns_start_id = None
             state.credential_borrow_id = None
+            state.wire_commit_id = None
+            state.wire_evidence_digest = None
+            state.wire_borrow_id = None
             credential_state.status = "finished"
             credential_state.resolved_publication_id = None
             if (
@@ -3823,6 +4003,9 @@ class AttemptGate:
             state.terminal_guard_digest = old_terminal_guard_digest
             state.dns_start_id = old_dns_start_id
             state.credential_borrow_id = old_credential_borrow_id
+            state.wire_commit_id = old_wire_commit_id
+            state.wire_evidence_digest = old_wire_evidence_digest
+            state.wire_borrow_id = old_wire_borrow_id
             credential_state.status = old_credential_status
             credential_state.resolved_publication_id = old_publication_id
             state.restore_recovery_refs(old_recovery_refs)
@@ -3851,6 +4034,7 @@ class AttemptGate:
                 or state.terminal_guard_digest is not None
                 or state.dns_start_id is not None
                 or state.credential_borrow_id is not None
+                or not self._wire_state_is_well_formed(state)
                 or state.resolver_completion_status != "uncommitted"
                 or not self._resolver_completion_proof_is_well_formed(
                     state,
@@ -3858,25 +4042,57 @@ class AttemptGate:
                 )
             ):
                 raise _attempt_error("attempt cleanup recovery 状态无效。")
-            state.status = "abandoning"
-
-        def terminal() -> None:
+        transition_started = False
+        try:
             with self._lock:
                 if (
-                    self._attempt_permits.get(state.attempt_permit_id) is not state
-                    or state.status != "abandoning"
-                    or self._credential_permits.get(state.credential_permit_id)
+                    self._attempt_permits.get(state.attempt_permit_id)
+                    is not state
+                    or state.permit is not permit
+                    or state.status != "active"
+                    or state.transport_claim_id is not None
+                    or state.terminal_guard_id is not None
+                    or state.terminal_guard_digest is not None
+                    or state.dns_start_id is not None
+                    or state.credential_borrow_id is not None
+                    or not self._wire_state_is_well_formed(state)
+                    or state.resolver_completion_status != "uncommitted"
+                    or not self._resolver_completion_proof_is_well_formed(
+                        state,
+                        allow_committing=False,
+                    )
+                    or self._credential_permits.get(
+                        state.credential_permit_id
+                    )
                     is not credential_state
                 ):
-                    raise _attempt_error("attempt cleanup recovery 状态已经变化。")
-                self._commit_recovered_attempt_terminal_locked(
-                    permit=permit,
-                    state=state,
-                    credential_state=credential_state,
-                    terminal_status="abandoned",
-                )
+                    raise _attempt_error(
+                        "attempt cleanup recovery 状态无效。"
+                    )
+                transition_started = True
+                state.status = "abandoning"
 
-        try:
+            def terminal() -> None:
+                with self._lock:
+                    if (
+                        self._attempt_permits.get(state.attempt_permit_id)
+                        is not state
+                        or state.status != "abandoning"
+                        or self._credential_permits.get(
+                            state.credential_permit_id
+                        )
+                        is not credential_state
+                    ):
+                        raise _attempt_error(
+                            "attempt cleanup recovery 状态已经变化。"
+                        )
+                    self._commit_recovered_attempt_terminal_locked(
+                        permit=permit,
+                        state=state,
+                        credential_state=credential_state,
+                        terminal_status="abandoned",
+                    )
+
             state.context_ledger._finish_attempt_and_activity(
                 context=state.context,
                 reservation=state.reservation,
@@ -3887,11 +4103,11 @@ class AttemptGate:
             )
         except BaseException:
             with self._lock:
-                if state.status == "abandoning":
+                if transition_started and state.status == "abandoning":
                     state.status = "active"
             raise
         with self._lock:
-            if state.status == "abandoning":
+            if transition_started and state.status == "abandoning":
                 state.status = "active"
                 raise _attempt_error(
                     "attempt cleanup transaction 未提交。"
@@ -3956,6 +4172,7 @@ class AttemptGate:
                     and credential_state.status == "finished"
                     and credential_state.context is None
                     and credential_state.context_ledger is None
+                    and self._wire_state_is_well_formed(state)
                     and state.session_id not in self._active_by_session
                 )
             if state.credential_permit is not credential_permit:
@@ -3967,6 +4184,7 @@ class AttemptGate:
                     or state.terminal_guard_digest is not None
                     or state.dns_start_id is not None
                     or state.credential_borrow_id is not None
+                    or not self._wire_state_is_well_formed(state)
                     or state.resolver_completion_status != "uncommitted"
                     or not self._resolver_completion_proof_is_well_formed(
                         state,
@@ -3980,6 +4198,7 @@ class AttemptGate:
                     state.status not in ("io_claimed", "wire_committed")
                     or state.transport_claim_id != claim_id
                     or state.credential_borrow_id is not None
+                    or not self._wire_state_is_well_formed(state)
                     or not self._resolver_completion_proof_is_well_formed(
                         state,
                         allow_committing=False,
@@ -4011,6 +4230,7 @@ class AttemptGate:
             with self._lock:
                 if (
                     state.status not in ("io_claimed", "wire_committed")
+                    or not self._wire_state_is_well_formed(state)
                     or not self._resolver_completion_proof_is_well_formed(
                         state,
                         allow_committing=False,
@@ -4018,43 +4238,59 @@ class AttemptGate:
                 ):
                     return state.status in ("finished", "abandoned")
                 previous_status = state.status
-                state.status = "finishing"
-
-            def terminal() -> None:
+            transition_started = False
+            try:
                 with self._lock:
                     if (
                         self._attempt_permits.get(state.attempt_permit_id)
                         is not state
-                        or state.status != "finishing"
+                        or state.status != previous_status
                         or state.transport_claim_id != claim_id
-                        or self._credential_permits.get(
-                            state.credential_permit_id
+                        or state.credential_borrow_id is not None
+                        or not self._wire_state_is_well_formed(state)
+                        or not self._resolver_completion_proof_is_well_formed(
+                            state,
+                            allow_committing=False,
                         )
-                        is not credential_state
                     ):
-                        raise _attempt_error(
-                            "attempt cleanup recovery 状态已经变化。"
-                        )
-                    if state.terminal_guard_id is None:
-                        if state.terminal_guard_digest is not None:
-                            raise _attempt_error(
-                                "attempt cleanup recovery guard 无效。"
-                            )
-                    elif (
-                        state.terminal_guard_id != guard_id
-                        or state.terminal_guard_digest != guard_digest
-                    ):
-                        raise _attempt_error(
-                            "attempt cleanup recovery guard 已变化。"
-                        )
-                    self._commit_recovered_attempt_terminal_locked(
-                        permit=permit,
-                        state=state,
-                        credential_state=credential_state,
-                        terminal_status="finished",
-                    )
+                        return state.status in ("finished", "abandoned")
+                    transition_started = True
+                    state.status = "finishing"
 
-            try:
+                def terminal() -> None:
+                    with self._lock:
+                        if (
+                            self._attempt_permits.get(state.attempt_permit_id)
+                            is not state
+                            or state.status != "finishing"
+                            or state.transport_claim_id != claim_id
+                            or self._credential_permits.get(
+                                state.credential_permit_id
+                            )
+                            is not credential_state
+                        ):
+                            raise _attempt_error(
+                                "attempt cleanup recovery 状态已经变化。"
+                            )
+                        if state.terminal_guard_id is None:
+                            if state.terminal_guard_digest is not None:
+                                raise _attempt_error(
+                                    "attempt cleanup recovery guard 无效。"
+                                )
+                        elif (
+                            state.terminal_guard_id != guard_id
+                            or state.terminal_guard_digest != guard_digest
+                        ):
+                            raise _attempt_error(
+                                "attempt cleanup recovery guard 已变化。"
+                            )
+                        self._commit_recovered_attempt_terminal_locked(
+                            permit=permit,
+                            state=state,
+                            credential_state=credential_state,
+                            terminal_status="finished",
+                        )
+
                 state.context_ledger._finish_attempt_and_activity(
                     context=state.context,
                     reservation=state.reservation,
@@ -4063,17 +4299,18 @@ class AttemptGate:
                     action=terminal,
                     _authority=_ATTEMPT_BUDGET_AUTHORITY,
                 )
-            except BaseException:
                 with self._lock:
                     if (
-                        state.status == "finishing"
+                        transition_started
+                        and state.status == "finishing"
                         and state.transport_claim_id == claim_id
                     ):
                         state.status = previous_status
-            else:
+            except BaseException:
                 with self._lock:
                     if (
-                        state.status == "finishing"
+                        transition_started
+                        and state.status == "finishing"
                         and state.transport_claim_id == claim_id
                     ):
                         state.status = previous_status
@@ -4086,6 +4323,7 @@ class AttemptGate:
                 and state.terminal_guard_digest is None
                 and state.dns_start_id is None
                 and state.credential_borrow_id is None
+                and self._wire_state_is_well_formed(state)
                 and credential_state.status == "finished"
                 and credential_state.resolved_publication_id is None
                 and state.session_id not in self._active_by_session
@@ -4146,6 +4384,7 @@ class AttemptGate:
                 and state.terminal_guard_digest is None
                 and state.dns_start_id is None
                 and state.credential_borrow_id is None
+                and self._wire_state_is_well_formed(state)
                 and self._credential_permits.get(credential_permit_id)
                 is credential_state
                 and credential_state.permit is credential_permit
@@ -4297,6 +4536,7 @@ class AttemptGate:
                 and attempt_state.terminal_guard_digest is None
                 and attempt_state.dns_start_id is None
                 and attempt_state.credential_borrow_id is None
+                and self._wire_state_is_well_formed(attempt_state)
                 and self._resolver_completion_proof_is_well_formed(
                     attempt_state,
                     allow_committing=False,
@@ -4330,6 +4570,7 @@ class AttemptGate:
                     "active",
                     "claiming",
                     "io_claimed",
+                    "guard_binding",
                     "dns_starting",
                     "wire_committing",
                     "wire_committed",
@@ -4343,6 +4584,7 @@ class AttemptGate:
                 and attempt_state.context is not None
                 and attempt_state.context_ledger is not None
                 and attempt_state.reservation is not None
+                and self._wire_state_is_well_formed(attempt_state)
                 and self._resolver_completion_proof_is_well_formed(
                     attempt_state,
                     allow_committing=False,
@@ -4485,6 +4727,27 @@ class AttemptGate:
         ):
             raise _attempt_error("attempt 的 terminal guard 证明不匹配。")
 
+    @staticmethod
+    def _wire_state_is_well_formed(state: _AttemptPermitState) -> bool:
+        values = (
+            state.wire_commit_id,
+            state.wire_evidence_digest,
+            state.wire_borrow_id,
+        )
+        if state.status in ("wire_committing", "wire_committed"):
+            return (
+                type(values[0]) is UUID
+                and type(values[1]) is Digest256
+                and type(values[2]) is UUID
+            )
+        if state.status == "finishing":
+            return values == (None, None, None) or (
+                type(values[0]) is UUID
+                and type(values[1]) is Digest256
+                and type(values[2]) is UUID
+            )
+        return values == (None, None, None)
+
     def _claim_attempt(
         self,
         permit: AttemptPermit,
@@ -4536,6 +4799,7 @@ class AttemptGate:
                 or initial_state.terminal_guard_digest is not None
                 or initial_state.dns_start_id is not None
                 or initial_state.credential_borrow_id is not None
+                or not self._wire_state_is_well_formed(initial_state)
             ):
                 raise _attempt_error("attempt permit 已被领取或终结。")
             credential = self._require_attempt_credential_proof_locked(permit)
@@ -4552,8 +4816,6 @@ class AttemptGate:
                 credential._context,
                 credential._context_ledger,
             )
-            initial_state.transport_claim_id = claim_id
-            initial_state.status = "claiming"
         (
             planned,
             invocation,
@@ -4585,6 +4847,7 @@ class AttemptGate:
                     state.status != "claiming"
                     or state.transport_claim_id != claim_id
                     or state.credential_borrow_id is not None
+                    or not self._wire_state_is_well_formed(state)
                 ):
                     raise _attempt_error("attempt permit 已被领取或终结。")
                 if expected_binding_supplied and (
@@ -4601,7 +4864,38 @@ class AttemptGate:
                 state.status = "io_claimed"
                 return permit
 
+        transition_started = False
         try:
+            with self._lock:
+                current = self._lookup_attempt_state_locked(permit)
+                if (
+                    current is not initial_state
+                    or current.status != "active"
+                    or current.transport_claim_id is not None
+                    or current.terminal_guard_id is not None
+                    or current.terminal_guard_digest is not None
+                    or current.dns_start_id is not None
+                    or current.credential_borrow_id is not None
+                    or not self._wire_state_is_well_formed(current)
+                ):
+                    raise _attempt_error(
+                        "attempt permit 已被领取或终结。"
+                    )
+                if expected_binding_supplied and (
+                    current.credential_permit
+                    is not expected_credential_permit
+                    or current.credential_handle_id
+                    != expected_credential_handle_id
+                    or current.credential_handle_digest
+                    != expected_credential_handle_digest
+                ):
+                    raise _attempt_error(
+                        "attempt expected credential proof 已变化。"
+                    )
+                self._require_attempt_credential_proof_locked(permit)
+                transition_started = True
+                current.status = "claiming"
+                current.transport_claim_id = claim_id
             self._run_authority_path(
                 planned=planned,
                 invocation=invocation,
@@ -4623,6 +4917,7 @@ class AttemptGate:
                     or current.status != "io_claimed"
                     or current.transport_claim_id != claim_id
                     or current.credential_borrow_id is not None
+                    or not self._wire_state_is_well_formed(current)
                 ):
                     raise _attempt_error(
                         "attempt claim transaction 未提交。"
@@ -4646,8 +4941,13 @@ class AttemptGate:
                         initial_state.attempt_permit_id
                     )
                     is initial_state
-                    and initial_state.status == "claiming"
-                    and initial_state.transport_claim_id == claim_id
+                    and transition_started
+                    and (
+                        initial_state.status == "claiming"
+                        and initial_state.transport_claim_id in (None, claim_id)
+                        or initial_state.status == "active"
+                        and initial_state.transport_claim_id == claim_id
+                    )
                 ):
                     initial_state.status = "active"
                     initial_state.transport_claim_id = None
@@ -4691,6 +4991,7 @@ class AttemptGate:
             if (
                 state.status != "io_claimed"
                 or state.transport_claim_id != claim_id
+                or not self._wire_state_is_well_formed(state)
                 or state.credential_permit is not credential_permit
                 or state.credential_handle_id != credential_handle_id
                 or state.credential_handle_digest != credential_handle_digest
@@ -4720,6 +5021,7 @@ class AttemptGate:
             state = self._lookup_attempt_state_locked(permit)
             return (
                 state.transport_claim_id == claim_id
+                and self._wire_state_is_well_formed(state)
                 and state.status
                 in (
                     "claiming",
@@ -4757,6 +5059,7 @@ class AttemptGate:
                 or state.dns_start_id is not None
                 or state.credential_borrow_id is not None
                 or state.resolver_completion_status != "uncommitted"
+                or not self._wire_state_is_well_formed(state)
                 or not self._resolver_completion_proof_is_well_formed(
                     state,
                     allow_committing=False,
@@ -4765,8 +5068,63 @@ class AttemptGate:
                 raise _attempt_error("attempt 当前不能绑定 terminal guard。")
             self._require_transport_owner_locked(state, claim_id)
             self._require_attempt_credential_proof_locked(permit)
-            state.terminal_guard_id = guard_id
-            state.terminal_guard_digest = guard_digest
+        transition_started = False
+        try:
+            with self._lock:
+                current = self._lookup_attempt_state_locked(permit)
+                if (
+                    current is not state
+                    or current.status != "io_claimed"
+                    or current.terminal_guard_id is not None
+                    or current.terminal_guard_digest is not None
+                    or current.dns_start_id is not None
+                    or current.credential_borrow_id is not None
+                    or current.resolver_completion_status != "uncommitted"
+                    or not self._wire_state_is_well_formed(current)
+                    or not self._resolver_completion_proof_is_well_formed(
+                        current,
+                        allow_committing=False,
+                    )
+                ):
+                    raise _attempt_error(
+                        "attempt 当前不能绑定 terminal guard。"
+                    )
+                self._require_transport_owner_locked(current, claim_id)
+                self._require_attempt_credential_proof_locked(permit)
+                transition_started = True
+                current.status = "guard_binding"
+                current.terminal_guard_id = guard_id
+                current.terminal_guard_digest = guard_digest
+                current.status = "io_claimed"
+            with self._lock:
+                current = self._lookup_attempt_state_locked(permit)
+                if (
+                    current is not state
+                    or current.status != "io_claimed"
+                    or current.transport_claim_id != claim_id
+                    or current.terminal_guard_id != guard_id
+                    or current.terminal_guard_digest != guard_digest
+                ):
+                    raise _attempt_error(
+                        "terminal guard binding transaction 未提交。"
+                    )
+        except BaseException:
+            with self._lock:
+                if (
+                    transition_started
+                    and self._attempt_permits.get(state.attempt_permit_id)
+                    is state
+                    and state.status == "guard_binding"
+                    and state.transport_claim_id == claim_id
+                    and state.terminal_guard_id in (None, guard_id)
+                    and state.terminal_guard_digest in (None, guard_digest)
+                    and state.dns_start_id is None
+                    and state.credential_borrow_id is None
+                ):
+                    state.terminal_guard_id = None
+                    state.terminal_guard_digest = None
+                    state.status = "io_claimed"
+            raise
 
     def _terminal_guard_is_bound(
         self,
@@ -4793,6 +5151,7 @@ class AttemptGate:
                 state.transport_claim_id == claim_id
                 and state.terminal_guard_id == guard_id
                 and state.terminal_guard_digest == guard_digest
+                and self._wire_state_is_well_formed(state)
                 and state.status
                 in (
                     "io_claimed",
@@ -4831,6 +5190,7 @@ class AttemptGate:
                 initial_state.status != "io_claimed"
                 or initial_state.dns_start_id is not None
                 or initial_state.credential_borrow_id is not None
+                or not self._wire_state_is_well_formed(initial_state)
             ):
                 raise _attempt_error("attempt 当前不能提交 DNS START。")
             self._require_transport_owner_locked(initial_state, claim_id)
@@ -4853,8 +5213,6 @@ class AttemptGate:
                 credential._context,
                 credential._context_ledger,
             )
-            initial_state.dns_start_id = start_id
-            initial_state.status = "dns_starting"
         (
             planned,
             invocation,
@@ -4887,6 +5245,7 @@ class AttemptGate:
                     or state.transport_claim_id != claim_id
                     or state.dns_start_id != start_id
                     or state.credential_borrow_id is not None
+                    or not self._wire_state_is_well_formed(state)
                 ):
                     raise _attempt_error("DNS START 提交状态已经变化。")
                 self._require_terminal_guard_proof_locked(
@@ -4897,7 +5256,30 @@ class AttemptGate:
                 self._require_attempt_credential_proof_locked(permit)
                 state.status = "io_claimed"
 
+        transition_started = False
         try:
+            with self._lock:
+                current = self._lookup_attempt_state_locked(permit)
+                if (
+                    current is not initial_state
+                    or current.status != "io_claimed"
+                    or current.dns_start_id is not None
+                    or current.credential_borrow_id is not None
+                    or not self._wire_state_is_well_formed(current)
+                ):
+                    raise _attempt_error(
+                        "attempt 当前不能提交 DNS START。"
+                    )
+                self._require_transport_owner_locked(current, claim_id)
+                self._require_terminal_guard_proof_locked(
+                    current,
+                    guard_id=guard_id,
+                    guard_digest=guard_digest,
+                )
+                self._require_attempt_credential_proof_locked(permit)
+                transition_started = True
+                current.status = "dns_starting"
+                current.dns_start_id = start_id
             self._run_authority_path(
                 planned=planned,
                 invocation=invocation,
@@ -4920,6 +5302,7 @@ class AttemptGate:
                     or current.transport_claim_id != claim_id
                     or current.dns_start_id != start_id
                     or current.credential_borrow_id is not None
+                    or not self._wire_state_is_well_formed(current)
                 ):
                     raise _attempt_error(
                         "DNS START transaction 未提交。"
@@ -4937,9 +5320,10 @@ class AttemptGate:
                         initial_state.attempt_permit_id
                     )
                     is initial_state
+                    and transition_started
                     and initial_state.status == "dns_starting"
                     and initial_state.transport_claim_id == claim_id
-                    and initial_state.dns_start_id == start_id
+                    and initial_state.dns_start_id in (None, start_id)
                 ):
                     initial_state.status = "io_claimed"
                     initial_state.dns_start_id = None
@@ -4975,6 +5359,7 @@ class AttemptGate:
                 and state.terminal_guard_id == guard_id
                 and state.terminal_guard_digest == guard_digest
                 and state.dns_start_id == start_id
+                and self._wire_state_is_well_formed(state)
             )
 
     def _commit_resolver_completion(
@@ -5023,6 +5408,7 @@ class AttemptGate:
                 or attempt_state.terminal_guard_digest != guard_digest
                 or attempt_state.dns_start_id != start_id
                 or attempt_state.credential_borrow_id is not None
+                or not self._wire_state_is_well_formed(attempt_state)
                 or attempt_state.resolver_completion_status != "uncommitted"
                 or attempt_state.resolver_completion_authority_id is not None
                 or attempt_state.resolver_completion_claim_id is not None
@@ -5047,7 +5433,6 @@ class AttemptGate:
                 stop_state.context,
                 stop_state.context_ledger,
             )
-            attempt_state.resolver_completion_status = "committing"
         (
             planned,
             invocation,
@@ -5090,6 +5475,7 @@ class AttemptGate:
                     or current_attempt.terminal_guard_digest != guard_digest
                     or current_attempt.dns_start_id != start_id
                     or current_attempt.credential_borrow_id is not None
+                    or not self._wire_state_is_well_formed(current_attempt)
                     or current_attempt.resolver_completion_status
                     != "committing"
                     or current_attempt.resolver_completion_authority_id
@@ -5122,7 +5508,44 @@ class AttemptGate:
                 current_stop.completion_receipt_digest = result_receipt_digest
                 current_attempt.resolver_completion_status = "committed"
 
+        transition_started = False
         try:
+            with self._lock:
+                current_stop = self._require_helper_stop_state_locked(
+                    authority
+                )
+                current_attempt = self._lookup_attempt_state_locked(permit)
+                if (
+                    current_stop is not stop_state
+                    or current_attempt is not attempt_state
+                    or current_stop.credential_permit is not credential
+                    or current_attempt.status != "io_claimed"
+                    or current_attempt.transport_claim_id != claim_id
+                    or current_attempt.terminal_guard_id != guard_id
+                    or current_attempt.terminal_guard_digest != guard_digest
+                    or current_attempt.dns_start_id != start_id
+                    or current_attempt.credential_borrow_id is not None
+                    or not self._wire_state_is_well_formed(current_attempt)
+                    or current_attempt.resolver_completion_status
+                    != "uncommitted"
+                    or current_attempt.resolver_completion_authority_id
+                    is not None
+                    or current_attempt.resolver_completion_claim_id is not None
+                    or current_attempt.resolver_completion_guard_id is not None
+                    or current_attempt.resolver_completion_guard_digest
+                    is not None
+                    or current_attempt.resolver_completion_start_id is not None
+                    or current_attempt.resolver_completion_receipt_digest
+                    is not None
+                    or current_stop.completion_attempt_id is not None
+                    or current_stop.completion_receipt_digest is not None
+                ):
+                    raise _attempt_error(
+                        "resolver completion owner 或状态无效。"
+                    )
+                self._require_attempt_credential_proof_locked(permit)
+                transition_started = True
+                current_attempt.resolver_completion_status = "committing"
             self._run_authority_path(
                 planned=planned,
                 invocation=invocation,
@@ -5156,7 +5579,24 @@ class AttemptGate:
                 if (
                     self._attempt_permits.get(attempt_state.attempt_permit_id)
                     is attempt_state
+                    and transition_started
                     and attempt_state.resolver_completion_status == "committing"
+                    and attempt_state.resolver_completion_authority_id
+                    in (None, authority.authority_id)
+                    and attempt_state.resolver_completion_claim_id
+                    in (None, claim_id)
+                    and attempt_state.resolver_completion_guard_id
+                    in (None, guard_id)
+                    and attempt_state.resolver_completion_guard_digest
+                    in (None, guard_digest)
+                    and attempt_state.resolver_completion_start_id
+                    in (None, start_id)
+                    and attempt_state.resolver_completion_receipt_digest
+                    in (None, result_receipt_digest)
+                    and stop_state.completion_attempt_id
+                    in (None, permit.attempt_permit_id)
+                    and stop_state.completion_receipt_digest
+                    in (None, result_receipt_digest)
                 ):
                     attempt_state.resolver_completion_status = "uncommitted"
                     attempt_state.resolver_completion_authority_id = None
@@ -5165,6 +5605,8 @@ class AttemptGate:
                     attempt_state.resolver_completion_guard_digest = None
                     attempt_state.resolver_completion_start_id = None
                     attempt_state.resolver_completion_receipt_digest = None
+                    stop_state.completion_attempt_id = None
+                    stop_state.completion_receipt_digest = None
             raise
 
     def _resolver_completion_is_committed_locked(
@@ -5290,6 +5732,465 @@ class AttemptGate:
                 result_receipt_digest=result_receipt_digest,
             )
 
+    @staticmethod
+    def _resolver_completion_matches_wire_locked(
+        state: _AttemptPermitState,
+        *,
+        claim_id: UUID,
+        guard_id: UUID,
+        guard_digest: Digest256,
+        start_id: UUID,
+        result_receipt_digest: Digest256,
+    ) -> bool:
+        return (
+            state.resolver_completion_status == "committed"
+            and type(state.resolver_completion_authority_id) is UUID
+            and state.resolver_completion_claim_id == claim_id
+            and state.resolver_completion_guard_id == guard_id
+            and state.resolver_completion_guard_digest == guard_digest
+            and state.resolver_completion_start_id == start_id
+            and state.resolver_completion_receipt_digest
+            == result_receipt_digest
+        )
+
+    def _commit_wire_start(
+        self,
+        permit: AttemptPermit,
+        *,
+        claim_id: UUID,
+        guard_id: UUID,
+        guard_digest: Digest256,
+        start_id: UUID,
+        result_receipt_digest: Digest256,
+        borrow_id: UUID,
+        wire_commit_id: UUID,
+        wire_evidence_digest: Digest256,
+        _authority: object | None = None,
+    ) -> None:
+        """Linearize the only provider-wire start under all five ledgers.
+
+        The caller must already hold an exact credential borrow and must supply
+        a digest of the validated numeric peer/TLS evidence.  This transition
+        happens after DNS, numeric connect, and TLS, but before the first HTTP
+        request byte.  A committed state is never rolled back after an outer
+        wrapper fault; callers must use ``_wire_start_is_committed`` to recover
+        that outcome without replaying bytes.
+        """
+
+        if _authority is not _TRANSPORT_ATTEMPT_AUTHORITY:
+            raise TypeError("wire start commit requires trusted transport")
+        if (
+            type(permit) is not AttemptPermit
+            or type(claim_id) is not UUID
+            or type(guard_id) is not UUID
+            or type(guard_digest) is not Digest256
+            or type(start_id) is not UUID
+            or type(result_receipt_digest) is not Digest256
+            or type(borrow_id) is not UUID
+            or type(wire_commit_id) is not UUID
+            or type(wire_evidence_digest) is not Digest256
+        ):
+            raise _attempt_error("wire start proof 无效。")
+        with self._lock:
+            initial_state = self._lookup_attempt_state_locked(permit)
+            if (
+                initial_state.status != "io_claimed"
+                or initial_state.transport_claim_id != claim_id
+                or initial_state.terminal_guard_id != guard_id
+                or initial_state.terminal_guard_digest != guard_digest
+                or initial_state.dns_start_id != start_id
+                or initial_state.credential_borrow_id != borrow_id
+                or not self._wire_state_is_well_formed(initial_state)
+                or not self._resolver_completion_matches_wire_locked(
+                    initial_state,
+                    claim_id=claim_id,
+                    guard_id=guard_id,
+                    guard_digest=guard_digest,
+                    start_id=start_id,
+                    result_receipt_digest=result_receipt_digest,
+                )
+            ):
+                raise _attempt_error("attempt 当前不能提交 provider wire。")
+            credential = self._require_attempt_credential_proof_locked(permit)
+            bindings = (
+                credential._planned,
+                credential._invocation,
+                credential._prepared,
+                credential._authorization,
+                credential._consent_ledger,
+                credential._session,
+                credential._approval_ledger,
+                credential._session_ledger,
+                credential._authority_ledger,
+                credential._context,
+                credential._context_ledger,
+            )
+        (
+            planned,
+            invocation,
+            prepared,
+            authorization,
+            consent_ledger,
+            session,
+            approval_ledger,
+            session_ledger,
+            authority_ledger,
+            context,
+            context_ledger,
+        ) = bindings
+        transition_started = False
+        try:
+            # The rollback handler must cover the first mutable write.  In
+            # particular, an asynchronous BaseException between ``status``
+            # and the three proof fields must not strand an active credential
+            # borrow in an unobservable ``wire_committing`` state.
+            with self._lock:
+                current = self._lookup_attempt_state_locked(permit)
+                if (
+                    current is not initial_state
+                    or current.status != "io_claimed"
+                    or current.transport_claim_id != claim_id
+                    or current.terminal_guard_id != guard_id
+                    or current.terminal_guard_digest != guard_digest
+                    or current.dns_start_id != start_id
+                    or current.credential_borrow_id != borrow_id
+                    or not self._wire_state_is_well_formed(current)
+                    or not self._resolver_completion_matches_wire_locked(
+                        current,
+                        claim_id=claim_id,
+                        guard_id=guard_id,
+                        guard_digest=guard_digest,
+                        start_id=start_id,
+                        result_receipt_digest=result_receipt_digest,
+                    )
+                ):
+                    raise _attempt_error(
+                        "wire start transaction 状态已变化。"
+                    )
+                self._require_attempt_credential_proof_locked(permit)
+                transition_started = True
+                current.status = "wire_committing"
+                current.wire_commit_id = wire_commit_id
+                current.wire_evidence_digest = wire_evidence_digest
+                current.wire_borrow_id = borrow_id
+
+            def commit(
+                stage: ExecutionPlanStage,
+                operation: ExecutionPlanNetworkOperation,
+                sample: ClockSample,
+            ) -> None:
+                del stage, operation
+                if (
+                    sample.wall_time < session.issued_at
+                    or sample.wall_time >= session.valid_until
+                ):
+                    raise _attempt_error("发送会话已经过期或尚未生效。")
+                with self._lock:
+                    current = self._lookup_attempt_state_locked(permit)
+                    if (
+                        current is not initial_state
+                        or current.status != "wire_committing"
+                        or current.transport_claim_id != claim_id
+                        or current.terminal_guard_id != guard_id
+                        or current.terminal_guard_digest != guard_digest
+                        or current.dns_start_id != start_id
+                        or current.credential_borrow_id != borrow_id
+                        or current.wire_commit_id != wire_commit_id
+                        or current.wire_evidence_digest
+                        != wire_evidence_digest
+                        or current.wire_borrow_id != borrow_id
+                        or not self._wire_state_is_well_formed(current)
+                        or not self._resolver_completion_matches_wire_locked(
+                            current,
+                            claim_id=claim_id,
+                            guard_id=guard_id,
+                            guard_digest=guard_digest,
+                            start_id=start_id,
+                            result_receipt_digest=result_receipt_digest,
+                        )
+                    ):
+                        raise _attempt_error(
+                            "wire start transaction 状态已变化。"
+                        )
+                    self._require_attempt_credential_proof_locked(permit)
+                    current.status = "wire_committed"
+
+            self._run_authority_path(
+                planned=planned,
+                invocation=invocation,
+                prepared=prepared,
+                authorization=authorization,
+                consent_ledger=consent_ledger,
+                session=session,
+                approval_ledger=approval_ledger,
+                session_ledger=session_ledger,
+                authority_ledger=authority_ledger,
+                context=context,
+                context_ledger=context_ledger,
+                final_action=commit,
+            )
+            with self._lock:
+                if not self._wire_start_is_committed_locked(
+                    permit,
+                    claim_id=claim_id,
+                    guard_id=guard_id,
+                    guard_digest=guard_digest,
+                    start_id=start_id,
+                    result_receipt_digest=result_receipt_digest,
+                    borrow_id=borrow_id,
+                    wire_commit_id=wire_commit_id,
+                    wire_evidence_digest=wire_evidence_digest,
+                ):
+                    raise _attempt_error("wire start transaction 未提交。")
+        except BaseException:
+            with self._lock:
+                if (
+                    transition_started
+                    and
+                    self._attempt_permits.get(
+                        initial_state.attempt_permit_id
+                    )
+                    is initial_state
+                    and initial_state.status == "wire_committing"
+                    and initial_state.wire_commit_id in (None, wire_commit_id)
+                    and initial_state.wire_evidence_digest
+                    in (None, wire_evidence_digest)
+                    and initial_state.wire_borrow_id in (None, borrow_id)
+                ):
+                    initial_state.wire_commit_id = None
+                    initial_state.wire_evidence_digest = None
+                    initial_state.wire_borrow_id = None
+                    initial_state.status = "io_claimed"
+            raise
+
+    def _wire_start_is_committed_locked(
+        self,
+        permit: AttemptPermit,
+        *,
+        claim_id: UUID,
+        guard_id: UUID,
+        guard_digest: Digest256,
+        start_id: UUID,
+        result_receipt_digest: Digest256,
+        borrow_id: UUID,
+        wire_commit_id: UUID,
+        wire_evidence_digest: Digest256,
+    ) -> bool:
+        try:
+            state = self._lookup_attempt_state_locked(permit)
+        except (AttributeError, TypeError, ValueError, EndpointPolicyError):
+            return False
+        return (
+            state.status == "wire_committed"
+            and state.transport_claim_id == claim_id
+            and state.terminal_guard_id == guard_id
+            and state.terminal_guard_digest == guard_digest
+            and state.dns_start_id == start_id
+            and state.wire_commit_id == wire_commit_id
+            and state.wire_evidence_digest == wire_evidence_digest
+            and state.wire_borrow_id == borrow_id
+            and self._wire_state_is_well_formed(state)
+            and self._resolver_completion_matches_wire_locked(
+                state,
+                claim_id=claim_id,
+                guard_id=guard_id,
+                guard_digest=guard_digest,
+                start_id=start_id,
+                result_receipt_digest=result_receipt_digest,
+            )
+        )
+
+    def _wire_start_is_committed(
+        self,
+        permit: AttemptPermit,
+        *,
+        claim_id: UUID,
+        guard_id: UUID,
+        guard_digest: Digest256,
+        start_id: UUID,
+        result_receipt_digest: Digest256,
+        borrow_id: UUID,
+        wire_commit_id: UUID,
+        wire_evidence_digest: Digest256,
+        _authority: object | None = None,
+    ) -> bool:
+        if _authority is not _TRANSPORT_ATTEMPT_AUTHORITY:
+            raise TypeError("wire start observation requires trusted transport")
+        if (
+            type(permit) is not AttemptPermit
+            or type(claim_id) is not UUID
+            or type(guard_id) is not UUID
+            or type(guard_digest) is not Digest256
+            or type(start_id) is not UUID
+            or type(result_receipt_digest) is not Digest256
+            or type(borrow_id) is not UUID
+            or type(wire_commit_id) is not UUID
+            or type(wire_evidence_digest) is not Digest256
+        ):
+            return False
+        with self._lock:
+            return self._wire_start_is_committed_locked(
+                permit,
+                claim_id=claim_id,
+                guard_id=guard_id,
+                guard_digest=guard_digest,
+                start_id=start_id,
+                result_receipt_digest=result_receipt_digest,
+                borrow_id=borrow_id,
+                wire_commit_id=wire_commit_id,
+                wire_evidence_digest=wire_evidence_digest,
+            )
+
+    @staticmethod
+    def _transport_io_state_matches_locked(
+        state: _AttemptPermitState,
+        *,
+        claim_id: UUID,
+        guard_id: UUID,
+        guard_digest: Digest256,
+        start_id: UUID,
+        result_receipt_digest: Digest256,
+        borrow_id: UUID | None,
+        wire_commit_id: UUID | None,
+        wire_evidence_digest: Digest256 | None,
+    ) -> bool:
+        if (
+            state.transport_claim_id != claim_id
+            or state.terminal_guard_id != guard_id
+            or state.terminal_guard_digest != guard_digest
+            or state.dns_start_id != start_id
+            or not AttemptGate._wire_state_is_well_formed(state)
+            or not AttemptGate._resolver_completion_matches_wire_locked(
+                state,
+                claim_id=claim_id,
+                guard_id=guard_id,
+                guard_digest=guard_digest,
+                start_id=start_id,
+                result_receipt_digest=result_receipt_digest,
+            )
+        ):
+            return False
+        if wire_commit_id is None and wire_evidence_digest is None:
+            return (
+                state.status == "io_claimed"
+                and state.credential_borrow_id == borrow_id
+                and state.wire_commit_id is None
+                and state.wire_evidence_digest is None
+                and state.wire_borrow_id is None
+            )
+        return (
+            type(borrow_id) is UUID
+            and type(wire_commit_id) is UUID
+            and type(wire_evidence_digest) is Digest256
+            and state.status == "wire_committed"
+            and state.credential_borrow_id in (None, borrow_id)
+            and state.wire_borrow_id == borrow_id
+            and state.wire_commit_id == wire_commit_id
+            and state.wire_evidence_digest == wire_evidence_digest
+        )
+
+    def _checkpoint_transport_io(
+        self,
+        permit: AttemptPermit,
+        *,
+        claim_id: UUID,
+        guard_id: UUID,
+        guard_digest: Digest256,
+        start_id: UUID,
+        result_receipt_digest: Digest256,
+        phase: str,
+        borrow_id: UUID | None = None,
+        wire_commit_id: UUID | None = None,
+        wire_evidence_digest: Digest256 | None = None,
+        _authority: object | None = None,
+    ) -> HelperWaitSlice:
+        """Issue one bounded provider-I/O slice from the frozen attempt.
+
+        Pre-wire checkpoints accept either no credential borrow or the exact
+        active borrow.  Post-wire checkpoints require the committed wire
+        owner/evidence and remain usable after the secret borrow has been
+        released.  No caller supplies time, duration, deadline, or token.
+        """
+
+        if _authority is not _TRANSPORT_ATTEMPT_AUTHORITY:
+            raise TypeError("transport checkpoint requires trusted transport")
+        checked_phase = require_text(phase, "phase", max_length=48)
+        wire_values_absent = (
+            wire_commit_id is None and wire_evidence_digest is None
+        )
+        wire_values_exact = (
+            type(wire_commit_id) is UUID
+            and type(wire_evidence_digest) is Digest256
+            and type(borrow_id) is UUID
+        )
+        if (
+            type(permit) is not AttemptPermit
+            or type(claim_id) is not UUID
+            or type(guard_id) is not UUID
+            or type(guard_digest) is not Digest256
+            or type(start_id) is not UUID
+            or type(result_receipt_digest) is not Digest256
+            or (borrow_id is not None and type(borrow_id) is not UUID)
+            or not (wire_values_absent or wire_values_exact)
+        ):
+            raise _attempt_error("transport checkpoint proof 无效。")
+        with self._lock:
+            initial_state = self._lookup_attempt_state_locked(permit)
+            if not self._transport_io_state_matches_locked(
+                initial_state,
+                claim_id=claim_id,
+                guard_id=guard_id,
+                guard_digest=guard_digest,
+                start_id=start_id,
+                result_receipt_digest=result_receipt_digest,
+                borrow_id=borrow_id,
+                wire_commit_id=wire_commit_id,
+                wire_evidence_digest=wire_evidence_digest,
+            ):
+                raise _attempt_error("transport checkpoint owner 或状态无效。")
+            authority_id = initial_state.resolver_completion_authority_id
+            stop_state = self._helper_stop_authorities.get(authority_id)
+            if (
+                type(authority_id) is not UUID
+                or stop_state is None
+                or type(stop_state.authority) is not HelperStopAuthority
+                or stop_state.completion_attempt_id
+                != permit.attempt_permit_id
+                or stop_state.completion_receipt_digest
+                != result_receipt_digest
+            ):
+                raise _attempt_error("transport checkpoint deadline owner 无效。")
+            stop_authority = stop_state.authority
+
+        candidate = self._checkpoint_helper_stop_authority(
+            stop_authority,
+            phase=f"transport:{checked_phase}",
+            _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+        )
+        with self._lock:
+            current = self._lookup_attempt_state_locked(permit)
+            current_stop = self._helper_stop_authorities.get(authority_id)
+            if (
+                current is not initial_state
+                or current_stop is not stop_state
+                or current_stop.issued_wait_slice is not candidate
+                or current_stop.issued_wait_slice_digest
+                != candidate.slice_digest
+                or not self._transport_io_state_matches_locked(
+                    current,
+                    claim_id=claim_id,
+                    guard_id=guard_id,
+                    guard_digest=guard_digest,
+                    start_id=start_id,
+                    result_receipt_digest=result_receipt_digest,
+                    borrow_id=borrow_id,
+                    wire_commit_id=wire_commit_id,
+                    wire_evidence_digest=wire_evidence_digest,
+                )
+            ):
+                raise _attempt_error("transport checkpoint publication 已变化。")
+        return candidate
+
     def _helper_stop_authority_is_released(
         self,
         authority: HelperStopAuthority,
@@ -5345,7 +6246,10 @@ class AttemptGate:
             raise _attempt_error("凭据句柄证明无效。")
         with self._lock:
             state = self._lookup_attempt_state_locked(permit)
-            if state.status != "io_claimed":
+            if (
+                state.status != "io_claimed"
+                or not self._wire_state_is_well_formed(state)
+            ):
                 raise _attempt_error("attempt 当前不能借用凭据。")
             if state.credential_borrow_id is not None:
                 raise _attempt_error("attempt 已有凭据借用 owner。")
@@ -5373,12 +6277,14 @@ class AttemptGate:
         with self._lock:
             state = self._lookup_attempt_state_locked(permit)
             if (
-                state.status != "io_claimed"
+                state.status not in ("io_claimed", "wire_committed")
                 or state.credential_borrow_id != borrow_id
                 or permit.credential_handle_id != handle_id
                 or permit.credential_handle_digest != handle_digest
             ):
                 raise _attempt_error("attempt 的凭据借用状态已经变化。")
+            if not self._wire_state_is_well_formed(state):
+                raise _attempt_error("attempt 的 wire 状态无效。")
             self._require_attempt_credential_proof_locked(permit)
             state.credential_borrow_id = None
 
@@ -5403,8 +6309,9 @@ class AttemptGate:
             ):
                 raise _attempt_error("attempt 的凭据句柄证明不匹配。")
             return (
-                state.status == "io_claimed"
+                state.status in ("io_claimed", "wire_committed")
                 and state.credential_borrow_id == borrow_id
+                and self._wire_state_is_well_formed(state)
             )
 
     def _force_finish_credential_borrow(
@@ -5423,12 +6330,14 @@ class AttemptGate:
         with self._lock:
             state = self._lookup_attempt_state_locked(permit)
             if (
-                state.status != "io_claimed"
+                state.status not in ("io_claimed", "wire_committed")
                 or state.credential_borrow_id != borrow_id
                 or permit.credential_handle_id != handle_id
                 or permit.credential_handle_digest != handle_digest
             ):
                 raise _attempt_error("attempt 的凭据借用恢复状态不匹配。")
+            if not self._wire_state_is_well_formed(state):
+                raise _attempt_error("attempt 的 wire 状态无效。")
             self._require_attempt_credential_proof_locked(permit)
             state.credential_borrow_id = None
 
@@ -5455,31 +6364,49 @@ class AttemptGate:
                 or state.terminal_guard_digest is not None
                 or state.dns_start_id is not None
                 or state.credential_borrow_id is not None
+                or not self._wire_state_is_well_formed(state)
             ):
                 raise _attempt_error("已领取或正在终结的 attempt 不能废弃。")
             context_ledger = permit._context_ledger
             reservation = permit._reservation
             credential = permit._credential_permit
             context = credential._context
-            state.status = "abandoning"
-
-        def terminal() -> None:
+        transition_started = False
+        try:
             with self._lock:
                 current = self._lookup_attempt_state_locked(permit)
-                if current.status != "abandoning":
-                    raise _attempt_error("attempt 废弃状态已经变化。")
-                credential_state = self._credential_permits[
-                    permit.credential_permit_id
-                ]
-                self._commit_attempt_terminal_locked(
-                    permit=permit,
-                    state=current,
-                    credential=credential,
-                    credential_state=credential_state,
-                    terminal_status="abandoned",
-                )
+                if (
+                    current is not state
+                    or current.status != "active"
+                    or current.transport_claim_id is not None
+                    or current.terminal_guard_id is not None
+                    or current.terminal_guard_digest is not None
+                    or current.dns_start_id is not None
+                    or current.credential_borrow_id is not None
+                    or not self._wire_state_is_well_formed(current)
+                ):
+                    raise _attempt_error(
+                        "已领取或正在终结的 attempt 不能废弃。"
+                    )
+                transition_started = True
+                current.status = "abandoning"
 
-        try:
+            def terminal() -> None:
+                with self._lock:
+                    current = self._lookup_attempt_state_locked(permit)
+                    if current.status != "abandoning":
+                        raise _attempt_error("attempt 废弃状态已经变化。")
+                    credential_state = self._credential_permits[
+                        permit.credential_permit_id
+                    ]
+                    self._commit_attempt_terminal_locked(
+                        permit=permit,
+                        state=current,
+                        credential=credential,
+                        credential_state=credential_state,
+                        terminal_status="abandoned",
+                    )
+
             context_ledger._finish_attempt_and_activity(
                 context=context,
                 reservation=reservation,
@@ -5490,11 +6417,11 @@ class AttemptGate:
             )
         except BaseException:
             with self._lock:
-                if state.status == "abandoning":
+                if transition_started and state.status == "abandoning":
                     state.status = "active"
             raise
         with self._lock:
-            if state.status == "abandoning":
+            if transition_started and state.status == "abandoning":
                 state.status = "active"
                 raise _attempt_error("attempt 废弃 transaction 未提交。")
         return True
@@ -5529,6 +6456,7 @@ class AttemptGate:
             if (
                 state.status not in ("io_claimed", "wire_committed")
                 or state.credential_borrow_id is not None
+                or not self._wire_state_is_well_formed(state)
                 or not self._resolver_completion_proof_is_well_formed(
                     state,
                     allow_committing=False,
@@ -5546,33 +6474,56 @@ class AttemptGate:
             credential = permit._credential_permit
             context = credential._context
             previous_status = state.status
-            state.status = "finishing"
-
-        def terminal() -> None:
+        transition_started = False
+        try:
             with self._lock:
                 current = self._lookup_attempt_state_locked(permit)
                 if (
-                    current.status != "finishing"
-                    or current.transport_claim_id != claim_id
+                    current is not state
+                    or current.status != previous_status
+                    or current.credential_borrow_id is not None
+                    or not self._wire_state_is_well_formed(current)
+                    or not self._resolver_completion_proof_is_well_formed(
+                        current,
+                        allow_committing=False,
+                    )
                 ):
-                    raise _attempt_error("attempt 终结状态已经变化。")
+                    raise _attempt_error(
+                        "attempt 终结状态已经变化。"
+                    )
+                self._require_transport_owner_locked(current, claim_id)
                 self._require_terminal_guard_proof_locked(
                     current,
                     guard_id=guard_id,
                     guard_digest=guard_digest,
                 )
-                credential_state = self._credential_permits[
-                    permit.credential_permit_id
-                ]
-                self._commit_attempt_terminal_locked(
-                    permit=permit,
-                    state=current,
-                    credential=credential,
-                    credential_state=credential_state,
-                    terminal_status="finished",
-                )
+                transition_started = True
+                current.status = "finishing"
 
-        try:
+            def terminal() -> None:
+                with self._lock:
+                    current = self._lookup_attempt_state_locked(permit)
+                    if (
+                        current.status != "finishing"
+                        or current.transport_claim_id != claim_id
+                    ):
+                        raise _attempt_error("attempt 终结状态已经变化。")
+                    self._require_terminal_guard_proof_locked(
+                        current,
+                        guard_id=guard_id,
+                        guard_digest=guard_digest,
+                    )
+                    credential_state = self._credential_permits[
+                        permit.credential_permit_id
+                    ]
+                    self._commit_attempt_terminal_locked(
+                        permit=permit,
+                        state=current,
+                        credential=credential,
+                        credential_state=credential_state,
+                        terminal_status="finished",
+                    )
+
             context_ledger._finish_attempt_and_activity(
                 context=context,
                 reservation=reservation,
@@ -5581,21 +6532,26 @@ class AttemptGate:
                 action=terminal,
                 _authority=_ATTEMPT_BUDGET_AUTHORITY,
             )
+            with self._lock:
+                if (
+                    transition_started
+                    and state.status == "finishing"
+                    and state.transport_claim_id == claim_id
+                ):
+                    state.status = previous_status
+                    raise _attempt_error(
+                        "attempt 终结 transaction 未提交。"
+                    )
         except BaseException:
             with self._lock:
                 if (
+                    transition_started
+                    and
                     state.status == "finishing"
                     and state.transport_claim_id == claim_id
                 ):
                     state.status = previous_status
             raise
-        with self._lock:
-            if (
-                state.status == "finishing"
-                and state.transport_claim_id == claim_id
-            ):
-                state.status = previous_status
-                raise _attempt_error("attempt 终结 transaction 未提交。")
         return True
 
     def _attempt_is_terminal(

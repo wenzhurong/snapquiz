@@ -41,7 +41,7 @@ from snapquiz.domain.solve import PipelineKind, SOLVE_RESULT_SCHEMA_VERSION, Sta
 from snapquiz.result.validator import RESULT_VALIDATOR_VERSION
 from snapquiz.routing.registry import RegistryAuthority, RegistrySnapshot
 
-BUILTIN_REGISTRY_REVISION = "snapquiz.builtin-registry@2026-08-31-m4"
+BUILTIN_REGISTRY_REVISION = "snapquiz.builtin-registry@2026-09-03-w09"
 BUILTIN_REGISTRY_PUBLISHED_AT = datetime(2026, 8, 31, tzinfo=timezone.utc)
 
 GLM_PROVIDER_ID = "zhipu"
@@ -52,7 +52,7 @@ GLM_BINDING_ID = "binding:zhipu/glm-4.6v-flash@openai-chat.v1"
 GLM_PIPELINE_PROFILE_ID = "direct-zhipu-glm-4.6v-flash-v1"
 GLM_ENDPOINT_POLICY_VERSION = "zhipu-official-chat-completions.v1"
 GLM_NETWORK_POLICY_VERSION = "remote-https.v1"
-GLM_TLS_POLICY_REF = "system-trust-hostname-verify.v1"
+GLM_TLS_POLICY_REF = "snapquiz.tls.system-default-h1.v1"
 GLM_CREDENTIAL_BINDING_REF = "registry:zhipu-official-glm.v1"
 GLM_CREDENTIAL_REF = "env:GLM_API_KEY"
 
