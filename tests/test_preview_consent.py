@@ -375,3 +375,63 @@ class CaptureModeTest(unittest.TestCase):
             _build_capture_fn(cfg(region=None), interactive=interactive),
             select_region_png,
         )
+
+
+class ShippedScriptsTest(unittest.TestCase):
+    """README 里让用户跑的脚本必须真的能跑。
+
+    这一条是「干净 clone 验收」抓出来的:grant_check.py 在 Task 2 重写
+    permissions.py 之后一直 import 一个已删除的函数,而它是 README 的
+    首次运行步骤 —— 单测只覆盖 snapquiz/,从没碰过 scripts/。
+    """
+
+    def _script(self, name):
+        return pathlib.Path(__file__).parent.parent / "scripts" / name
+
+    def test_every_shipped_script_imports_cleanly(self):
+        import py_compile
+        import importlib.util
+        import sys
+
+        scripts = sorted((pathlib.Path(__file__).parent.parent / "scripts").glob("*.py"))
+        self.assertTrue(scripts, "scripts/ 不该是空的")
+        for script in scripts:
+            with self.subTest(script=script.name):
+                py_compile.compile(str(script), doraise=True)
+                spec = importlib.util.spec_from_file_location(
+                    f"_shipped_{script.stem}", script
+                )
+                module = importlib.util.module_from_spec(spec)
+                try:
+                    spec.loader.exec_module(module)
+                except SystemExit:
+                    pass  # 脚本以 main() 收尾时不会触发,这里只是保险
+                self.assertTrue(hasattr(module, "main"), f"{script.name} 应有 main()")
+
+    def test_grant_check_reports_all_three_permission_states(self):
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "_grant_check", self._script("grant_check.py")
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        from snapquiz.core.permissions import (
+            PermissionObservation,
+            PermissionReason,
+            ScreenPermissionState,
+        )
+
+        cases = [
+            (ScreenPermissionState.GRANTED, PermissionReason.GRANTED, 0),
+            (ScreenPermissionState.DENIED, PermissionReason.DENIED, 1),
+            (ScreenPermissionState.UNKNOWN, PermissionReason.API_ERROR, 1),
+        ]
+        for state, reason, expected in cases:
+            with self.subTest(state=state), patch.object(
+                module,
+                "observe_screen_permission",
+                lambda s=state, r=reason: PermissionObservation(s, r),
+            ), patch.object(module, "request_screen_recording", lambda: False):
+                self.assertEqual(module.main(), expected)

@@ -145,12 +145,15 @@ opencode Go 是订阅制,响应里 `cost` 恒为 `0` —— token 数不计费,�
 ## 开发 / 测试
 
 ```bash
-python3 -m unittest discover -s tests    # 137 个离线单测,约 0.15 秒
+python3 -m unittest discover -s tests    # 189 个离线单测,约 0.3 秒
 ```
 
-覆盖:配置与端点钉死、权限三态 fail-closed、截图质量(黑帧/空白帧)、
-GLM 线格与 34 个业务错误码、严格 JSON 解码、出站字节不可变性与密钥隔离、
-编排顺序(取消则零网络零密钥)、结果严格校验、呈现格式。
+覆盖:Provider 档案与模型白名单、端点钉死、权限三态 fail-closed、
+截图质量(黑帧/空白帧)、选区模式判定、拖框取消语义、
+**预览必须从实际出站字节里解出**、一次性同意的作用域、
+GLM 34 个业务错误码与 opencode typed error、严格 JSON 解码与围栏剥离、
+出站字节不可变性与密钥隔离、编排顺序(取消则零网络零密钥)、
+结果严格校验、呈现格式、README 里让用户跑的脚本能不能跑。
 
 另有 `python -m snapquiz.smoke` 对固定合成题图打一次**真实** GLM(单次,无重试),
 用来验证请求形状确实被服务端接受 —— 离线 golden 证明不了这件事。
