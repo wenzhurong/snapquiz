@@ -1,5 +1,12 @@
 # snapquiz 产品与技术规格（v3 · 多模型双通道）
 
+> ⚠️ **2026-09-15：本文的里程碑顺序与门禁已被 [`RECOVERY_PLAN.md`](./RECOVERY_PLAN.md) 取代。**
+> 原计划把「第一次真实 API」锁在 M6、「真实截图」锁在 M7、「评测集」排在 M9 之后，
+> 导致 7.6 万行代码中 99.9% 从 CLI 入口不可达。恢复计划把这三件事提到最前面。
+> 本文仍然有效的部分：§4 领域契约、§7 结构化输出策略、§14 风险表。
+> 已失效的部分：M5–M9 的交付顺序、W08–W12 工作包、所有 production gate 状态。
+
+
 > **状态**：v3 实现基准。本文描述目标架构；远端 `main@341374b` 已完成 M0–M4、M5/W08 与 W09 的全部 local/offline 范围。当前未提交工作区已完成 W10 `direct_multimodal` 的本地/离线组合：唯一 test-authorized executor、Provider-neutral Adapter 边界、capture-start/result-publication 线性化、精确返回 owner attestation、取消/single-flight 与 cleanup-only recovery 均已落地；W08–W10 双 Python 定向安全集分别 341/341、完整离线 suite 分别 1341/1341 通过，独立终审 P0/P1/P2=0。它没有接入 CLI/app、真实截图或 production edge。Production W09/M5 仍阻塞于 fixed Team-signed app/supervisor/helper/native artifacts、最终 bundle/signing IDs 与 Keychain entitlements、绑定这些 artifacts 的真实 process/DNS/socket/SSL/Security.framework vtable、真实 control/liveness/Keychain/transport evidence、S7/app cutover，以及另行明确的 activation/acceptance 授权。相应 production flags 继续为 false，`ResolverHelperLauncher.production()`、`MultimodalPipelineExecutor.production()` 与 CLI 均 fail-closed；W10 local/offline complete 不等于 production complete 或用户路径可用。下一阶段是先关闭 W09 production gates，再在另行授权下进行 W11 单次固定合成图真实 API smoke；W12 才接真实截图。交付顺序、状态与逐项验收见 [`IMPLEMENTATION_PLAN.md`](./IMPLEMENTATION_PLAN.md)。
 >
 > **已定方向**：模型能力分为两条推理通道：

@@ -1,5 +1,12 @@
 # snapquiz v3 实施计划（Phase 1 优先多模态）
 
+> ⚠️ **2026-09-15：本文的里程碑顺序与门禁已被 [`RECOVERY_PLAN.md`](./RECOVERY_PLAN.md) 取代。**
+> 原计划把「第一次真实 API」锁在 M6、「真实截图」锁在 M7、「评测集」排在 M9 之后，
+> 导致 7.6 万行代码中 99.9% 从 CLI 入口不可达。恢复计划把这三件事提到最前面。
+> 本文仍然有效的部分：§4 领域契约、§7 结构化输出策略、§14 风险表。
+> 已失效的部分：M5–M9 的交付顺序、W08–W12 工作包、所有 production gate 状态。
+
+
 > **状态**：Active
 >
 > **实施基线**：`2026-09-05`，远端 `main@341374b` 已完成并推送 W09 的全部 local/offline 实现与可在无生产身份条件下构建的 foundations。当前未提交工作区已完成 W10 `direct_multimodal` 的本地/离线组合与安全负向矩阵；W09 的 production activation/acceptance 仍因正式身份、最终 artifacts、真实系统 vtable/entitlement、S7 接线与授权门槛标记为 `blocked`，W10 production factory 也继续 fail-closed
