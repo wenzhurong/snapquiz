@@ -1,3 +1,4 @@
+import io
 import json
 import pathlib
 import subprocess
@@ -377,6 +378,7 @@ class CaptureModeTest(unittest.TestCase):
         )
 
 
+@patch("sys.stdout", new_callable=io.StringIO)
 class ShippedScriptsTest(unittest.TestCase):
     """README 里让用户跑的脚本必须真的能跑。
 
@@ -388,7 +390,7 @@ class ShippedScriptsTest(unittest.TestCase):
     def _script(self, name):
         return pathlib.Path(__file__).parent.parent / "scripts" / name
 
-    def test_every_shipped_script_imports_cleanly(self):
+    def test_every_shipped_script_imports_cleanly(self, _stdout):
         import py_compile
         import importlib.util
         import sys
@@ -408,7 +410,7 @@ class ShippedScriptsTest(unittest.TestCase):
                     pass  # 脚本以 main() 收尾时不会触发,这里只是保险
                 self.assertTrue(hasattr(module, "main"), f"{script.name} 应有 main()")
 
-    def test_grant_check_reports_all_three_permission_states(self):
+    def test_grant_check_reports_all_three_permission_states(self, _stdout):
         import importlib.util
 
         spec = importlib.util.spec_from_file_location(
