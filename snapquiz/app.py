@@ -30,6 +30,35 @@ EXIT_CONSENT_DECLINED = 3
 EXIT_PERMISSION_ERROR = 4
 
 
+class CaptureModeError(Exception):
+    """选区模式的配置自相矛盾。"""
+
+
+def choose_interactive(cfg, *, select: bool, region: bool) -> bool:
+    """决定这次用「拖框」还是「固定选区」。
+
+    规则（显式 > 隐式）：
+      --select        → 拖框（即使配了 SNAPQUIZ_REGION）
+      --region        → 固定选区（没配就报错，不静默退回拖框）
+      都没给          → 配了 SNAPQUIZ_REGION 就固定，否则拖框
+
+    ⚠️ 陷阱：``SNAPQUIZ_REGION`` 一旦写进 ``.env``，shell 里 ``unset`` 是没用的 ——
+    ``load_dotenv()`` 会把它重新读回来。所以要临时拖框必须用 ``--select``。
+    """
+
+    if select and region:
+        raise CaptureModeError("--select 与 --region 不能同时给")
+    if select:
+        return True
+    if region:
+        if cfg.region is None:
+            raise CaptureModeError(
+                "--region 需要先配置 SNAPQUIZ_REGION='left,top,width,height'"
+            )
+        return False
+    return cfg.region is None
+
+
 def _build_capture_fn(cfg, *, interactive: bool):
     """交互拖框 or 固定选区。两条路都没有「全屏」这个选项。"""
 
@@ -213,7 +242,8 @@ def main(argv=None) -> int:
     parser.add_argument(
         "--select",
         action="store_true",
-        help="每次都弹出十字准星拖框选题(未配置 SNAPQUIZ_REGION 时的默认行为)",
+        help="每次弹十字准星拖框选题。未配 SNAPQUIZ_REGION 时是默认行为;"
+        "配了也可以用它临时覆盖(shell 里 unset 无效,.env 会被重新读入)",
     )
     parser.add_argument(
         "--region",
@@ -259,14 +289,13 @@ def main(argv=None) -> int:
         print(f"❌ 配置错误:{exc}", file=sys.stderr, flush=True)
         return EXIT_CONFIG_ERROR
 
-    if args.region and cfg.region is None:
-        print(
-            "❌ --region 需要先配置 SNAPQUIZ_REGION='left,top,width,height'",
-            file=sys.stderr,
-            flush=True,
+    try:
+        interactive = choose_interactive(
+            cfg, select=args.select, region=args.region
         )
+    except CaptureModeError as exc:
+        print(f"❌ {exc}", file=sys.stderr, flush=True)
         return EXIT_CONFIG_ERROR
-    interactive = args.select or (cfg.region is None and not args.region)
 
     if not _ensure_consent(cfg, assume_yes=args.yes):
         print("未获得数据政策同意,已退出(什么都没有发送)。", flush=True)
@@ -277,14 +306,17 @@ def main(argv=None) -> int:
 
     from snapquiz.core.orchestrator import always_approve
 
-    scope = (
-        "每次拖框选区"
-        if interactive
-        else f"固定选区 {cfg.region[2]}×{cfg.region[3]} @ ({cfg.region[0]},{cfg.region[1]})"
-    )
-    banner = (
-        f"snapquiz 就绪 | {cfg.provider.provider_id.value}/{cfg.model} | {scope}"
-    )
+    head = f"snapquiz 就绪 | {cfg.provider.provider_id.value}/{cfg.model}"
+    if interactive:
+        banner = f"{head} | 选区:每次拖框(Esc 取消)"
+    else:
+        # 固定选区最容易让人误以为「怎么没弹准星」,所以把来源和切换方式都说清楚。
+        left, top, width, height = cfg.region
+        banner = (
+            f"{head} | 选区:固定 {width}×{height} @ ({left},{top}) —— **不会弹准星**\n"
+            f"           想每次拖框:加 --select,或把 SNAPQUIZ_REGION 从 .env 里注释掉\n"
+            f"           (shell 里 unset 没用,.env 会被重新读入)"
+        )
 
     if args.trigger == "hotkey":
         from snapquiz.core.busyguard import BusyGuard

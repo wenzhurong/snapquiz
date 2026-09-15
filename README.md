@@ -78,8 +78,19 @@ snapquiz --trigger hotkey        # 全局热键(默认 Cmd+Shift+Space,需 [hotk
 
 答 `n` 则**零网络、零密钥读取**,预览临时文件立刻删除。`-y` 可跳过确认(不推荐)。
 
-选区有两种模式:不配 `SNAPQUIZ_REGION` 就每次拖框(默认);配了就用固定选区、
-不弹准星。`--select` / `--region` 可强制其一。**两种都不存在「全屏」这个选项。**
+### 选区两种模式
+
+| | 何时生效 | 行为 |
+|---|---|---|
+| **拖框**(默认) | 没配 `SNAPQUIZ_REGION` | 每次弹十字准星,Esc 取消 |
+| **固定** | 配了 `SNAPQUIZ_REGION` | 直接截那一块,**不弹准星** |
+
+`--select` / `--region` 可强制其一。**两种都不存在「全屏」这个选项。**
+
+> ⚠️ **一个容易踩的坑**:`SNAPQUIZ_REGION` 一旦写进 `.env`,在 shell 里
+> `unset SNAPQUIZ_REGION` 是**没用的** —— `load_dotenv()` 会把它重新读回来,
+> 于是你以为在拖框、实际却是固定选区。想临时拖框请用 `snapquiz --select`,
+> 想永久拖框就把它在 `.env` 里注释掉。启动横幅会明确告诉你当前是哪种模式。
 
 首次运行会一次性征求数据政策同意(截图会传给谁),记录在 `~/.snapquiz/consent.json`,
 `snapquiz --revoke-consent` 撤销。这跟每次发送前的确认是**两层**:

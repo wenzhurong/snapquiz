@@ -324,3 +324,54 @@ class DeclineIsAirtightTest(unittest.TestCase):
         self.assertTrue(created, "应当确实创建过预览目录")
         for path in created:
             self.assertFalse(path.exists(), f"预览目录未清理: {path}")
+
+
+class CaptureModeTest(unittest.TestCase):
+    """选区模式的判定。
+
+    这是实测暴露出来的洞：我的验收脚本显式传了 --select，所以从没跑过
+    「什么都不加」这条默认路径，而用户用的正是那条。
+    """
+
+    def setUp(self):
+        from snapquiz.app import CaptureModeError, choose_interactive
+
+        self.choose = choose_interactive
+        self.error = CaptureModeError
+
+    def test_no_region_configured_means_drag(self):
+        self.assertTrue(
+            self.choose(cfg(region=None), select=False, region=False)
+        )
+
+    def test_configured_region_means_fixed(self):
+        self.assertFalse(
+            self.choose(cfg(region=(0, 0, 10, 10)), select=False, region=False)
+        )
+
+    def test_select_overrides_a_configured_region(self):
+        """SNAPQUIZ_REGION 写在 .env 里时,shell 的 unset 无效,只能靠 --select。"""
+
+        self.assertTrue(
+            self.choose(cfg(region=(0, 0, 10, 10)), select=True, region=False)
+        )
+
+    def test_region_without_configuration_is_an_error_not_a_silent_fallback(self):
+        with self.assertRaises(self.error):
+            self.choose(cfg(region=None), select=False, region=True)
+
+    def test_both_flags_is_an_error(self):
+        with self.assertRaises(self.error):
+            self.choose(cfg(region=(0, 0, 10, 10)), select=True, region=True)
+
+    def test_default_invocation_uses_the_interactive_selector(self):
+        """端到端钉死：不带任何参数时，capture_fn 必须是拖框那个。"""
+
+        from snapquiz.app import _build_capture_fn
+        from snapquiz.capture.select import select_region_png
+
+        interactive = self.choose(cfg(region=None), select=False, region=False)
+        self.assertIs(
+            _build_capture_fn(cfg(region=None), interactive=interactive),
+            select_region_png,
+        )
