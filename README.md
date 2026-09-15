@@ -2,9 +2,8 @@
 
 个人学习刷题助手 —— 热键一按,读取屏幕上的题目,调用 LLM 给出**答案 + 解析 + 相关知识点**,辅助自学、自测与错题复习。
 
-> **状态(2026-09-15):✅ 核心闭环可用,两个 Provider 真实打通**。
-> 对固定合成题图实测:智谱 `glm-4.6v` 7.3 秒答对,opencode `mimo-v2.5` 86 秒答对。
-> 尚未接入拖框选区(Task 4)、评测集、错题本与浮层(阶段 B)。
+> **状态(2026-09-15):✅ 阶段 A 功能完成**。拖框选区 → 预览实际出站图片 →
+> 逐次确认 → 两个 Provider 均真实打通。尚未做评测集、错题本与浮层(阶段 B)。
 > v3 时期的 7.6 万行离线安全链已封存于 tag `v3-transport-research`;
 > 重建过程与后续计划见 [docs/RECOVERY_PLAN.md](docs/RECOVERY_PLAN.md)。
 
@@ -52,16 +51,39 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install -e .                 # 基础依赖(httpx / mss / pyobjc ...)
 pip install -e ".[hotkey]"       # 可选:真·全局热键(pynput,需辅助功能权限)
 
-cp .env.example .env             # 然后编辑 .env,填入智谱 GLM_API_KEY
-export SNAPQUIZ_REGION=100,100,900,700    # 必填:题目所在区域(左,上,宽,高)
+cp .env.example .env             # 然后编辑 .env,填入 API key
 python scripts/grant_check.py    # 首次:按提示授予「屏幕录制」权限后重启终端
 
-snapquiz                         # 默认 stdin 触发:聚焦终端按 Enter,解答该区域里的题
+snapquiz                         # 按 Enter → 拖框选题 → 看图确认 → 出答案
 snapquiz --trigger hotkey        # 全局热键(默认 Cmd+Shift+Space,需 [hotkey] 依赖 + 辅助功能权限)
 ```
 
-每次发送前会先告诉你要上传什么、多大、发到哪,确认后才解析密钥并联网;
-回答 `n` 则零网络、零密钥读取。`-y` 可跳过确认(不推荐)。
+**一次交互长这样:**
+
+```
+按 Enter 触发一次答题(Ctrl+C / Ctrl+D 退出)...
+⏎
+  → 屏幕变暗,出现十字准星(macOS 原生选区,Esc 取消)
+  → 拖框选中题目
+  → Quick Look 弹出**即将上传的那张图**,终端同时打印:
+       即将上传一张 66 KB 的 image/png 截图
+         目标   https://open.bigmodel.cn/api/paas/v4/chat/completions
+         模型   glm-4.6v
+         总大小 89 KB(envelope 35f3cc9b54cf)
+     发送?[y/N] y
+  → 答案:C. 29
+     模型自评把握:较高(未校准,仅供参考)
+     解析:……
+```
+
+答 `n` 则**零网络、零密钥读取**,预览临时文件立刻删除。`-y` 可跳过确认(不推荐)。
+
+选区有两种模式:不配 `SNAPQUIZ_REGION` 就每次拖框(默认);配了就用固定选区、
+不弹准星。`--select` / `--region` 可强制其一。**两种都不存在「全屏」这个选项。**
+
+首次运行会一次性征求数据政策同意(截图会传给谁),记录在 `~/.snapquiz/consent.json`,
+`snapquiz --revoke-consent` 撤销。这跟每次发送前的确认是**两层**:
+同意的是「政策」,批准的是「这一张图」。
 
 > ⚠️ **权限归属**:snapquiz 目前不是独立 app bundle,macOS 把截屏行为归属给
 > **调用它的终端**。所以「屏幕录制」要勾给终端.app,不是勾给 snapquiz。

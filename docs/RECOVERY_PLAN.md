@@ -708,12 +708,56 @@ body 顶层键: ["max_tokens", "messages", "model"]
 结果时，先怀疑自己的探针，别急着下结论——尤其当已知可用的那个也一起失败时。
 本项目用 httpx，不受影响。
 
+### Task 4 — 完成（2026-09-15）
+
+**验收句已满足**：拖框选题 → Quick Look 看到即将上传的那张图 → 按 y 拿到答案；
+按 n 则零网络（用 httpx tripwire 实测 0 次调用）、零密钥读取、预览临时文件立刻删除。
+
+三个模块，共约 330 行：
+
+| 模块 | 行 | 做什么 |
+|---|---:|---|
+| `capture/select.py` | 77 | `screencapture -i -s` 拖框；Esc → `SelectionCancelled` |
+| `privacy/preview.py` | 174 | **从出站字节里**解出图片 → Quick Look + 文字描述 |
+| `privacy/consent.py` | 105 | 一次性数据政策同意，按 provider+endpoint 限定 |
+
+对比 v3：`privacy/egress.py` 2,072 行 + `privacy/consent.py` 2,279 行 = 4,351 行。
+
+#### 关键不变量：预览的图从 `OutboundRequest.body` 里解出来
+
+不是用调用方手上那份原始 PNG。否则「预览的」和「发出的」只是碰巧相同，
+而不是同一份东西 —— 一旦中间哪一步动了 body，预览就会骗人。有测试钉死
+（换 provider/模型后预览内容必须跟着变）。
+
+#### 选区坐标拿不到，所以「选区记忆」降级了
+
+`screencapture` 只给图不给位置。所以：交互模式每次现拖（无记忆），
+固定模式靠 `SNAPQUIZ_REGION`。坐标级记忆需要自己写选择器（NSPanel + 多显示器
++ Retina + 旋转的坐标变换），留到阶段 B。原计划里写的
+「把选中的区域存进 region.json」**做不到**，这里如实降级。
+
+#### 两个我自己制造的坑
+
+1. **Cocoa 的 `samplesPerPixel` 不能当步长。** 实测 `samplesPerPixel=3` 但
+   `bitsPerPixel=32` —— 每像素 4 字节，第 4 字节是值为 `0xFF` 的填充。
+   按 3 字节步进会读到错位的填充字节，**全黑图被判成有内容**。
+   要用 `bitsPerPixel // 8`。写完第一版时四个负向用例全部静默通过，
+   是逐个手验才发现的。
+
+2. **验收脚本把 `builtins.input` 无条件 patch 成返回 "y"**，导致 stdin 触发
+   循环永远读不到 EOF，在真实 API 上死循环，**烧掉 40 次调用（约 7 万 tokens）**
+   才被发现并 kill。教训：给真实外部调用做端到端脚本时，桩必须是**有限序列**，
+   耗尽即抛 EOF，并对调用次数加断言上限。修正版加了
+   `assert len(captures) <= 2, "疑似死循环"`。
+
 ---
 
 ## 4. 已知问题（滚动记录）
 
-- `-y/--yes` 跳过确认后，隐私护栏只剩「必须显式选区」一条。Task 4 的图片预览落地前不建议常用。
-- `hotkey` 模式的 osascript 确认对话框只显示字节数和目标，不显示图片本身；Task 4 补。
+- `-y/--yes` 会同时跳过数据政策同意与逐次发送确认，隐私护栏只剩「必须显式选区」一条。
+- `hotkey` 模式的确认对话框已能弹图（Quick Look），但 osascript 对话框本身仍是纯文字。
+- 坐标级选区记忆未实现（见 Task 4 记录）。
+- macOS 原生拖框那一步只做过桩测试，真实拖拽需要人手验证一次。
 - `glm-4.5v` 只做过裸 API 验证，没跑过完整链路。
 - 智谱到底扣了哪个资源包，只能在控制台账单页确认；API 侧无从查询也无从指定。
 - opencode 的响应里没有 `request_id`，冒烟显示 `None`；只影响对账。

@@ -1,10 +1,11 @@
 """snapquiz 命令行入口。
 
-流程：加载配置 → 权限自检 → 构造 Adapter + 编排器 → 绑定触发方式。
+流程：加载配置 → 数据政策同意（仅首次）→ 权限自检 → 绑定触发方式
+→ 拖框选区 → 预览实际出站字节 → 逐次确认 → 发送。
 
 两种触发方式的执行模型**故意不同**：
-- ``stdin``（默认）：串行同步执行。确认提示要读 stdin，不能和触发循环抢同一个输入流，
-  所以这一题跑完才读下一次 Enter。
+- ``stdin``（默认）：串行同步执行。确认提示要读 stdin，不能和触发循环抢同一个
+  输入流，所以这一题跑完才读下一次 Enter。
 - ``hotkey``：触发来自监听线程，用 busy-guard 挡住连击造成的并发截图与重复计费；
   确认走系统对话框，因为终端多半没有焦点、stdin 也被触发循环占着。
 
@@ -16,6 +17,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import subprocess
 import sys
 
 from snapquiz.config import ConfigError, load_config
@@ -24,13 +26,26 @@ logger = logging.getLogger("snapquiz")
 
 EXIT_OK = 0
 EXIT_CONFIG_ERROR = 2
+EXIT_CONSENT_DECLINED = 3
 EXIT_PERMISSION_ERROR = 4
 
 
-def _build_orchestrator(cfg, *, approve):
+def _build_capture_fn(cfg, *, interactive: bool):
+    """交互拖框 or 固定选区。两条路都没有「全屏」这个选项。"""
+
+    if interactive:
+        from snapquiz.capture.select import select_region_png
+
+        return select_region_png
+
+    from snapquiz.capture.screen import capture_png_bytes
+
+    return lambda: capture_png_bytes(cfg.region)
+
+
+def _build_orchestrator(cfg, *, approve, interactive: bool):
     # 延迟 import：未装依赖时不影响纯逻辑测试。
     from snapquiz.adapters.openai_chat import OpenAIChatAdapter
-    from snapquiz.capture.screen import capture_png_bytes
     from snapquiz.core.orchestrator import Orchestrator
     from snapquiz.core.permissions import require_screen_permission
     from snapquiz.present.notify import notify_error, present
@@ -39,7 +54,7 @@ def _build_orchestrator(cfg, *, approve):
     return Orchestrator(
         config=cfg,
         adapter=OpenAIChatAdapter(),
-        capture_fn=lambda: capture_png_bytes(cfg.region),
+        capture_fn=_build_capture_fn(cfg, interactive=interactive),
         send_fn=send_once,
         present_fn=present,
         require_permission_fn=require_screen_permission,
@@ -48,42 +63,116 @@ def _build_orchestrator(cfg, *, approve):
     )
 
 
-def _describe(prepared) -> str:
-    meta = prepared.safe_metadata()
-    kinds = "、".join(meta["outbound_data"])
-    return (
-        f"即将上传 {kinds},{meta['payload_byte_size'] / 1024:.0f} KB"
-        f" → {meta['canonical_url']}"
-    )
+# --------------------------------------------------------------------------
+# 发送前确认：让人**看到实际要发的那张图**，而不是只看字节数
+# --------------------------------------------------------------------------
 
 
 def _confirm_in_terminal(prepared) -> bool:
-    """stdin 模式：直接在终端问。此时主线程没有别的东西在读 stdin。"""
+    """stdin 模式：Quick Look 弹图 + 终端问 y/N。"""
 
-    print("\n" + _describe(prepared), flush=True)
+    from snapquiz.privacy.preview import (
+        PreviewUnavailable,
+        build_preview,
+        discard,
+        show_image,
+    )
+
     try:
-        return input("发送?[y/N] ").strip().lower() in ("y", "yes")
-    except (EOFError, KeyboardInterrupt):
-        print()
+        preview = build_preview(prepared)
+    except PreviewUnavailable as exc:
+        # 看不到要发什么就不发。
+        print(f"\n⚠️ 无法预览即将发送的内容({exc});已取消。", flush=True)
         return False
+
+    path = show_image(preview)
+    try:
+        print("\n" + preview.describe(), flush=True)
+        if path is None:
+            print("  (没能弹出预览窗口,下面的确认是盲发,请谨慎)", flush=True)
+        try:
+            return input("发送?[y/N] ").strip().lower() in ("y", "yes")
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return False
+    finally:
+        discard(path)
 
 
 def _confirm_in_dialog(prepared) -> bool:
-    """hotkey 模式：终端多半没有焦点,而且 stdin 被触发循环占着,只能弹系统对话框。"""
+    """hotkey 模式：Quick Look 弹图 + 系统对话框。
 
-    import subprocess
+    终端多半没有焦点,而且 stdin 被触发循环占着,只能走对话框。
+    """
 
-    script = (
-        'display dialog "{}" with title "snapquiz" '
-        'buttons {{"取消", "发送"}} default button "取消"'
-    ).format(_describe(prepared).replace("\\", "\\\\").replace('"', '\\"'))
+    from snapquiz.privacy.preview import (
+        PreviewUnavailable,
+        build_preview,
+        discard,
+        show_image,
+    )
+
     try:
-        done = subprocess.run(
-            ["osascript", "-e", script], capture_output=True, timeout=60, check=False
-        )
-    except Exception:
+        preview = build_preview(prepared)
+    except PreviewUnavailable:
         return False
-    return done.returncode == 0 and b"\xe5\x8f\x91\xe9\x80\x81" in done.stdout
+
+    path = show_image(preview)
+    try:
+        text = preview.describe().replace("\\", "\\\\").replace('"', '\\"')
+        script = (
+            f'display dialog "{text}" with title "snapquiz 发送确认" '
+            'buttons {"取消", "发送"} default button "取消"'
+        )
+        try:
+            done = subprocess.run(
+                ["osascript", "-e", script],
+                capture_output=True,
+                timeout=180,
+                check=False,
+            )
+        except Exception:
+            return False
+        return done.returncode == 0 and "发送" in done.stdout.decode(
+            "utf-8", errors="replace"
+        )
+    finally:
+        discard(path)
+
+
+# --------------------------------------------------------------------------
+# 一次性的数据政策同意（与逐次发送确认是两层，不能互相替代）
+# --------------------------------------------------------------------------
+
+
+def _ensure_consent(cfg, *, assume_yes: bool) -> bool:
+    from snapquiz.privacy import consent
+
+    provider_id = cfg.provider.provider_id.value
+    if consent.load(provider_id=provider_id, endpoint=cfg.endpoint_url):
+        return True
+    if assume_yes:
+        consent.grant(provider_id=provider_id, endpoint=cfg.endpoint_url)
+        return True
+
+    print()
+    print("=" * 66)
+    print(
+        consent.disclosure(
+            provider_id=provider_id, endpoint=cfg.endpoint_url, model=cfg.model
+        )
+    )
+    print("=" * 66)
+    try:
+        answer = input("接受并继续?[y/N] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+    if answer not in ("y", "yes"):
+        return False
+    consent.grant(provider_id=provider_id, endpoint=cfg.endpoint_url)
+    print("已记录(可用 snapquiz --revoke-consent 撤销)。\n", flush=True)
+    return True
 
 
 def _startup_permission_hint() -> bool:
@@ -114,9 +203,7 @@ def _startup_permission_hint() -> bool:
 
 
 def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(
-        prog="snapquiz", description="个人学习刷题助手"
-    )
+    parser = argparse.ArgumentParser(prog="snapquiz", description="个人学习刷题助手")
     parser.add_argument(
         "--trigger",
         choices=["stdin", "hotkey"],
@@ -124,10 +211,25 @@ def main(argv=None) -> int:
         help="触发方式:stdin=终端按 Enter(默认);hotkey=全局热键(需辅助功能权限)",
     )
     parser.add_argument(
+        "--select",
+        action="store_true",
+        help="每次都弹出十字准星拖框选题(未配置 SNAPQUIZ_REGION 时的默认行为)",
+    )
+    parser.add_argument(
+        "--region",
+        action="store_true",
+        help="使用 SNAPQUIZ_REGION 配置的固定选区,不弹准星",
+    )
+    parser.add_argument(
         "-y",
         "--yes",
         action="store_true",
         help="跳过每次发送前的确认(不推荐:确认是防止误传隐私内容的主要手段)",
+    )
+    parser.add_argument(
+        "--revoke-consent",
+        action="store_true",
+        help="撤销已记录的数据政策同意并退出",
     )
     parser.add_argument("--verbose", action="store_true", help="打印调试日志")
     args = parser.parse_args(argv)
@@ -137,6 +239,12 @@ def main(argv=None) -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
+    if args.revoke_consent:
+        from snapquiz.privacy import consent
+
+        print("已撤销。" if consent.revoke() else "本来就没有已记录的同意。")
+        return EXIT_OK
+
     try:
         from dotenv import load_dotenv
 
@@ -145,30 +253,47 @@ def main(argv=None) -> int:
         pass
 
     try:
-        cfg = load_config(os.environ)
+        # 选区可以来自环境变量,也可以每次拖框;两者都不是「全屏」。
+        cfg = load_config(os.environ, require_region=False)
     except ConfigError as exc:
         print(f"❌ 配置错误:{exc}", file=sys.stderr, flush=True)
         return EXIT_CONFIG_ERROR
+
+    if args.region and cfg.region is None:
+        print(
+            "❌ --region 需要先配置 SNAPQUIZ_REGION='left,top,width,height'",
+            file=sys.stderr,
+            flush=True,
+        )
+        return EXIT_CONFIG_ERROR
+    interactive = args.select or (cfg.region is None and not args.region)
+
+    if not _ensure_consent(cfg, assume_yes=args.yes):
+        print("未获得数据政策同意,已退出(什么都没有发送)。", flush=True)
+        return EXIT_CONSENT_DECLINED
 
     if not _startup_permission_hint():
         return EXIT_PERMISSION_ERROR
 
     from snapquiz.core.orchestrator import always_approve
 
-    left, top, width, height = cfg.region
+    scope = (
+        "每次拖框选区"
+        if interactive
+        else f"固定选区 {cfg.region[2]}×{cfg.region[3]} @ ({cfg.region[0]},{cfg.region[1]})"
+    )
     banner = (
-        f"snapquiz 就绪 | {cfg.provider.provider_id.value}/{cfg.model}"
-        f" | 选区 {width}×{height} @ ({left},{top})"
+        f"snapquiz 就绪 | {cfg.provider.provider_id.value}/{cfg.model} | {scope}"
     )
 
     if args.trigger == "hotkey":
-        # 热键来自监听线程,必须用 busy-guard 挡住连击造成的并发截图与重复计费;
-        # 确认只能走系统对话框,因为 stdin 被触发循环占着、终端也多半没有焦点。
         from snapquiz.core.busyguard import BusyGuard
         from snapquiz.hotkey.global_hotkey import run_global_hotkey
 
         approve = always_approve if args.yes else _confirm_in_dialog
-        orchestrator = _build_orchestrator(cfg, approve=approve)
+        orchestrator = _build_orchestrator(
+            cfg, approve=approve, interactive=interactive
+        )
         guard = BusyGuard(on_error=lambda exc: logger.error("后台任务失败:%s", exc))
 
         def trigger() -> None:
@@ -179,12 +304,12 @@ def main(argv=None) -> int:
         run_global_hotkey(cfg.hotkey, trigger)
         guard.wait_idle(timeout=cfg.timeout + 5)
     else:
-        # stdin 模式本来就是串行的:同步跑完这一题再读下一次 Enter。
-        # 不能丢进后台线程 —— 那样确认提示会和触发循环抢同一个 stdin。
         from snapquiz.hotkey.stdin_trigger import run_stdin_trigger
 
         approve = always_approve if args.yes else _confirm_in_terminal
-        orchestrator = _build_orchestrator(cfg, approve=approve)
+        orchestrator = _build_orchestrator(
+            cfg, approve=approve, interactive=interactive
+        )
         print(banner, flush=True)
         run_stdin_trigger(orchestrator.run_once)
 
