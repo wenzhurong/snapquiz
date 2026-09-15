@@ -522,9 +522,70 @@ Preview 打开给用户看，终端问 `发送这张图到 open.bigmodel.cn？[y
 
 ---
 
+## 3.5 执行记录
+
+### Task 1 — 完成（2026-09-15）
+
+- `0df1819` 提交 W10 全部未落盘工作；tag `v3-transport-research` 已推送到 origin。
+- README 边界声明按用户决定删除；状态段改为诚实描述。
+- ARCHITECTURE / IMPLEMENTATION_PLAN 加取代声明。
+
+### Task 2 — 完成（2026-09-15）
+
+**验收句已满足**：真实截屏 900×700 → 117 KB PNG → 预览确认 → 发送 → 严格校验 →
+终端打印「题面 / 答案 B / 模型自评把握:较高(未校准) / 解析」。
+
+规模：删除 131 文件 / 135,878 行；新写 **1,869 行**（14 个文件）。
+测试从 1,341 个 / 568 秒变成 **137 个 / 0.13 秒**。
+
+#### ⚠ 三处计划偏差（重要，影响对"可回收资产"的判断）
+
+§1 把 `domain/outbound.py`、`domain/adapter.py`、`domain/solve.py` 归为「A. 可原样存活」，
+**这个判断偏乐观**。导入图显示它们自闭包没错，但 PlannedExecution 的穿线还长在
+**类的字段列表里**：
+
+| 类 | 被迫移除的字段 | 后果 |
+|---|---|---|
+| `PreparedOutbound` | plan_id / plan_digest / stage_id / operation_id / source_ids / source_digests | 整类重写为 `OutboundRequest` |
+| `TransportResponse` | plan_id / stage_id / operation_id | 重写 |
+| `AnswerCandidateResult` | plan_id / plan_digest / stage_id / operation_id / invocation_digest | 重写 |
+| `StageProvenance` | binding_id / provider_profile_digest / capabilities_ref / capabilities_digest / component_id / component_version | 重写 |
+| `SolveProvenance` | plan_id | 重写 |
+
+保留下来的是真正做事的那条相关性：**请求 envelope digest ↔ 响应体 digest ↔ 候选结果**。
+它足以拒绝「用另一次请求的响应冒充这次的结果」，而且不需要任何 plan 记账。
+
+**给下一个阶段的教训**：判断 v3 代码能否复用，看导入图不够，要看类的字段。
+真正没有被穿线污染的只有 `digest.py` / `errors.py` / `_validation.py` / `policy.py` /
+`intent.py` / `capture.py` / `result/validator.py` 的 `validate_solve_result` /
+`adapters/prompt.py` / `capture/topology.py` / `core/busyguard.py` / `llm/*`。
+
+#### 计划外新增
+
+- `snapquiz/adapters/glm_errors.py`（274 行）：从 v3 抄出的 34 个 GLM 业务错误码矩阵
+  + 严格 JSON 解码。这是 v3 最值钱的一块，单独成模块以便复用。
+- `snapquiz/adapters/glm.py`（213 行）：具体 Adapter，线格对着
+  `tests/fixtures/glm_request.json` golden 核对。
+- `snapquiz/transport/tls.py`（34 行）：7 个 TLS 环境变量屏蔽。
+
+#### 验收过程中发现并修掉的真实 bug
+
+`--trigger stdin` 下，发送确认提示与 stdin 触发循环**抢同一个输入流** ——
+BusyGuard 把编排丢进后台线程，后台线程的 `input()` 和主线程触发循环的 `input()`
+互相吃对方的输入，表现为「刚按 Enter 就说上一题还在处理中」然后确认被当成取消。
+
+修法：两种触发方式用不同执行模型。`stdin` 串行同步执行（确认独占 stdin）；
+`hotkey` 保留 BusyGuard（连击护栏是它存在的理由），确认改走 osascript 系统对话框。
+**这个 bug 靠单测发现不了，只有跑真实 CLI 才会暴露** —— 这正是「验收判据必须在代码之外」的意义。
+
+---
+
 ## 4. 已知问题（滚动记录）
 
-- `README.md` 的边界声明改动未决（Task 1.3）。
+- `-y/--yes` 跳过确认后，隐私护栏只剩「必须显式选区」一条。Task 4 的图片预览落地前不建议常用。
+- `hotkey` 模式的 osascript 确认对话框只显示字节数和目标，不显示图片本身；Task 4 补。
+- 真实 GLM API 尚未打过一次（Task 3）。当前请求形状只对着 golden fixture 核对过，
+  **未经真实服务端验证**。
 - **v3 各层不可按文件切分**（见 §1 的结构事实框）。任何"先删一半再让另一半编译过"的
   做法都会立刻 ImportError。白名单 27 文件已实跑验证，悬空 import 恰好 5 处。
 - `PermissionGate.require_granted` 要求 `observation.observed_at == now` 精确相等，

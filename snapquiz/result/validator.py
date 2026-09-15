@@ -2,10 +2,8 @@
 from __future__ import annotations
 
 from typing import Any, Optional
-from uuid import UUID
 
-from snapquiz.domain.adapter import AnswerCandidateResult
-from snapquiz.domain.digest import Digest256
+from snapquiz.domain.adapter import AnswerCandidateResult, TransportResponse
 from snapquiz.domain.errors import InvalidOutputError
 from snapquiz.domain.solve import (
     ConfidenceKind,
@@ -134,20 +132,14 @@ def validate_solve_result(
 def validate_answer_candidate(
     candidate: AnswerCandidateResult,
     *,
+    response: TransportResponse,
     provenance: SolveProvenance,
-    request_id: UUID,
-    plan_id: UUID,
-    plan_digest: Digest256,
-    stage_id: UUID,
-    operation_id: UUID,
-    invocation_digest: Digest256,
-    request_envelope_digest: Digest256,
     provider_profile_id: Optional[str] = None,
 ) -> SolveResult:
     """Validate correlation before converting an Adapter candidate.
 
-    The explicit expected bindings must come from the active executor context;
-    model output and the candidate object cannot select their own provenance.
+    The candidate must be bound to the exact response that this executor
+    received; model output cannot select its own provenance.
     """
 
     if type(candidate) is not AnswerCandidateResult:
@@ -155,23 +147,10 @@ def validate_answer_candidate(
     if type(provenance) is not SolveProvenance:
         raise TypeError("provenance must be SolveProvenance")
     try:
-        candidate.validate_binding(
-            request_id=request_id,
-            plan_id=plan_id,
-            plan_digest=plan_digest,
-            stage_id=stage_id,
-            operation_id=operation_id,
-            invocation_digest=invocation_digest,
-            request_envelope_digest=request_envelope_digest,
-        )
+        candidate.validate_binding(response=response)
         payload = candidate.candidate_payload
-        if (
-            payload is None
-            or candidate.refusal is not None
-            or provenance.plan_id != plan_id
-            or tuple(stage.stage_id for stage in provenance.stages) != (stage_id,)
-        ):
-            raise ValueError("candidate correlation mismatch")
+        if payload is None or candidate.refusal is not None:
+            raise ValueError("candidate carries no usable payload")
     except (TypeError, ValueError, AttributeError):
         raise _fail(provider_profile_id) from None
     return validate_solve_result(

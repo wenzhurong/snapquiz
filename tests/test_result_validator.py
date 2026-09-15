@@ -4,7 +4,6 @@ import unittest
 from dataclasses import FrozenInstanceError, asdict
 from uuid import UUID
 
-from snapquiz.domain.digest import Digest256
 from snapquiz.domain.errors import InvalidOutputError
 from snapquiz.domain.solve import (
     ConfidenceKind,
@@ -22,26 +21,19 @@ def provenance():
     stage = StageProvenance(
         stage_id=UUID("00000000-0000-0000-0000-000000000011"),
         role=StageRole.SOLVER,
-        binding_id="zhipu-glm-4.6v-flash",
-        provider_profile_id="zhipu-official",
-        provider_profile_digest=Digest256("1" * 64),
         provider_id="zhipu",
         model_id="glm-4.6v-flash",
-        component_id=None,
-        component_version=None,
         adapter_family="openai_chat_compatible",
-        adapter_version="v1",
-        capabilities_ref="capabilities:zhipu-glm-4.6v-flash:v1",
-        capabilities_digest=Digest256("2" * 64),
+        adapter_version="2",
         attempts=1,
         network_calls=1,
         latency_ms=250,
     )
     return SolveProvenance(
         pipeline_kind=PipelineKind.DIRECT_MULTIMODAL,
-        plan_id=UUID("00000000-0000-0000-0000-000000000010"),
         stages=(stage,),
     )
+
 
 
 def answered_candidate(**overrides):
@@ -100,24 +92,36 @@ class ResultValidatorTest(unittest.TestCase):
                 validate_solve_result(candidate, provenance=provenance())
 
     def test_provenance_rejects_invalid_stage_identity_and_topology(self):
-        base_stage = provenance().stages[0]
+        base = provenance().stages[0]
+        fields = {n: getattr(base, n) for n in base.__dataclass_fields__}
+
+        # 网络调用数不能超过尝试次数
         with self.assertRaises(ValueError):
-            StageProvenance(
-                **{
-                    name: getattr(base_stage, name)
-                    for name in base_stage.__dataclass_fields__
-                    if name not in {"role", "model_id", "component_id", "component_version"}
-                },
-                role=StageRole.OCR,
-                model_id="must-not-exist",
-                component_id="ocr",
-                component_version="v1",
+            StageProvenance(**{**fields, "attempts": 1, "network_calls": 2})
+
+        # 负数不接受
+        with self.assertRaises(ValueError):
+            StageProvenance(**{**fields, "latency_ms": -1})
+
+        # direct_multimodal 必须恰好一个 solver 阶段
+        with self.assertRaises(ValueError):
+            SolveProvenance(
+                pipeline_kind=PipelineKind.DIRECT_MULTIMODAL,
+                stages=(StageProvenance(**{**fields, "role": StageRole.OCR}),),
             )
+
+        # ocr_text 需要 (ocr, text_solver) 有序两段，单个 solver 不符合
         with self.assertRaises(ValueError):
             SolveProvenance(
                 pipeline_kind=PipelineKind.OCR_TEXT,
-                plan_id=provenance().plan_id,
                 stages=provenance().stages,
+            )
+
+        # stage_id 不能重复
+        with self.assertRaises(ValueError):
+            SolveProvenance(
+                pipeline_kind=PipelineKind.OCR_TEXT,
+                stages=(base, base),
             )
 
     def test_null_confidence_cannot_claim_calibration(self):

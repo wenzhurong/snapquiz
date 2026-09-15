@@ -91,77 +91,50 @@ class UsageSummary:
 @runtime_final
 @dataclass(frozen=True, slots=True)
 class StageProvenance:
+    """一次求解阶段的可观测事实。
+
+    v3 原版另有 binding_id / provider_profile_digest / capabilities_ref /
+    capabilities_digest 等 Registry 字段，随 Registry 一并移除。
+    """
+
     stage_id: UUID
     role: StageRole
-    binding_id: str
-    provider_profile_id: str
-    provider_profile_digest: Digest256
     provider_id: str
     model_id: Optional[str]
-    component_id: Optional[str]
-    component_version: Optional[str]
     adapter_family: str
     adapter_version: str
-    capabilities_ref: str
-    capabilities_digest: Digest256
     attempts: int
     network_calls: int
     latency_ms: int
-    usage: Optional[UsageSummary] = None
 
     def __post_init__(self) -> None:
         if type(self.stage_id) is not UUID:
             raise ValueError("stage_id must be a UUID")
         if not isinstance(self.role, StageRole):
             raise ValueError("role must be StageRole")
-        for name in (
-            "binding_id",
-            "provider_profile_id",
-            "provider_id",
-            "adapter_family",
-            "adapter_version",
-            "capabilities_ref",
-        ):
-            _required_non_empty_text(getattr(self, name), name, 256)
-        if type(self.provider_profile_digest) is not Digest256:
-            raise ValueError("provider_profile_digest must be Digest256")
-        if type(self.capabilities_digest) is not Digest256:
-            raise ValueError("capabilities_digest must be Digest256")
-        _optional_non_empty_text(self.model_id, "model_id", 256)
-        _optional_non_empty_text(self.component_id, "component_id", 256)
-        _optional_non_empty_text(self.component_version, "component_version", 256)
-        if self.role in (StageRole.SOLVER, StageRole.TEXT_SOLVER):
-            if self.model_id is None:
-                raise ValueError("solver stages require model_id")
-            if self.component_id is not None or self.component_version is not None:
-                raise ValueError("solver stages must not carry component identity")
-        elif self.role is StageRole.OCR:
-            if self.model_id is not None:
-                raise ValueError("ocr stages must not carry model_id")
-            if self.component_id is None or self.component_version is None:
-                raise ValueError("ocr stages require component_id and component_version")
+        for name in ("provider_id", "adapter_family", "adapter_version"):
+            value = getattr(self, name)
+            if type(value) is not str or not value:
+                raise ValueError(f"{name} must be a non-empty string")
+        if self.model_id is not None and type(self.model_id) is not str:
+            raise ValueError("model_id must be a string or null")
         for name in ("attempts", "network_calls", "latency_ms"):
             value = getattr(self, name)
             if type(value) is not int or value < 0:
                 raise ValueError(f"{name} must be a non-negative integer")
         if self.network_calls > self.attempts:
-            raise ValueError("network_calls must not exceed attempts")
-        if self.usage is not None and type(self.usage) is not UsageSummary:
-            raise ValueError("usage must be UsageSummary or null")
+            raise ValueError("network_calls cannot exceed attempts")
 
 
 @runtime_final
 @dataclass(frozen=True, slots=True)
 class SolveProvenance:
     pipeline_kind: PipelineKind
-    plan_id: UUID
     stages: tuple[StageProvenance, ...]
 
     def __post_init__(self) -> None:
         if not isinstance(self.pipeline_kind, PipelineKind):
             raise ValueError("pipeline_kind must be PipelineKind")
-        if type(self.plan_id) is not UUID:
-            raise ValueError("plan_id must be a UUID")
         if type(self.stages) is not tuple or not self.stages:
             raise ValueError("stages must be a non-empty tuple")
         if not all(type(stage) is StageProvenance for stage in self.stages):
@@ -288,5 +261,5 @@ class SolveResult:
             f"schema_version={self.schema_version!r}, status={self.status!r}, "
             f"confidence_kind={self.confidence_kind!r}, "
             f"pipeline_kind={self.provenance.pipeline_kind!r}, "
-            f"plan_id={self.provenance.plan_id!r})"
+            f"pipeline={self.provenance.pipeline_kind.value!r})"
         )

@@ -14,7 +14,7 @@ from snapquiz.domain.capture import (
 )
 from snapquiz.domain.digest import Digest256
 
-from tests.w06_helpers import NOW, selected_scope, topology
+from tests.helpers import NOW, selected_scope, topology
 
 
 class DisplayTopologyContractTest(unittest.TestCase):

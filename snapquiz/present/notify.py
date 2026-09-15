@@ -1,47 +1,81 @@
-"""呈现:格式化答案并展示(终端打印 + macOS 通知)。
+"""呈现：格式化 SolveResult 并展示（终端 + macOS 通知）。
 
-MVP-0 用终端 + 系统通知;MVP-1 再换成 NSPanel「先自答」浮层。
-format_result 是纯函数(可测)。
+``format_result`` 是纯函数（可测）。
+
+一条刻意的产品规则（来自 ARCHITECTURE §4.6 与原审计第 6 条）：
+**模型自报的 confidence 不以百分比展示。** 把主观自评渲染成 "82%" 会让它看起来
+像可靠度，而它没有经过任何校准。这里降级成粗粒度提示，并明说是模型自评。
+将来若有本地校准服务，calibrated 分数才可以数值化。
 """
 from __future__ import annotations
 
 import logging
 import subprocess
+from typing import Optional
 
-from snapquiz.llm.base import AnswerResult
+from snapquiz.domain.solve import ConfidenceKind, SolveResult, SolveStatus
 
 logger = logging.getLogger(__name__)
 
-
-def format_result(result: AnswerResult) -> str:
-    if not result.parsed_ok:
-        body = result.rationale or result.raw
-        return "⚠️ 未能结构化解析,以下是模型原文:\n" + body
-
-    conf = f"{round(result.confidence * 100)}%" if result.confidence is not None else "未知"
-    return "\n".join(
-        [
-            f"答案:{result.answer}",
-            f"置信度:{conf}",
-            "",
-            f"解析:{result.rationale}",
-        ]
-    )
+_STATUS_LABEL = {
+    SolveStatus.ANSWERED: "",
+    SolveStatus.INSUFFICIENT_INPUT: "⚠️ 信息不足,模型未作答",
+    SolveStatus.UNSUPPORTED_INPUT: "⚠️ 该题型无法通过截图可靠作答",
+    SolveStatus.REFUSED: "⚠️ 模型拒绝作答",
+}
 
 
-def _summary(result: AnswerResult) -> str:
-    if not result.parsed_ok:
-        return "未能解析,详见终端"
-    conf = f"{round(result.confidence * 100)}%" if result.confidence is not None else "未知"
-    return f"答案 {result.answer}(置信度 {conf})"
+def _confidence_hint(result: SolveResult) -> Optional[str]:
+    if result.confidence is None or result.confidence_kind is ConfidenceKind.NONE:
+        return None
+    if result.confidence_kind is ConfidenceKind.CALIBRATED:
+        return f"把握:{round(result.confidence * 100)}%(已校准)"
+    # model_self_reported：只给粗粒度，且标明是自评。
+    if result.confidence >= 0.8:
+        level = "较高"
+    elif result.confidence >= 0.5:
+        level = "中等"
+    else:
+        level = "较低"
+    return f"模型自评把握:{level}(未校准,仅供参考)"
+
+
+def format_result(result: SolveResult) -> str:
+    lines: list[str] = []
+    label = _STATUS_LABEL.get(result.status, "")
+    if label:
+        lines.append(label)
+    if result.question_summary:
+        lines.append(f"题面:{result.question_summary}")
+    if result.answer:
+        lines.append(f"答案:{result.answer}")
+    hint = _confidence_hint(result)
+    if hint:
+        lines.append(hint)
+    if result.rationale:
+        lines.append("")
+        lines.append(f"解析:{result.rationale}")
+    for warning in result.warnings:
+        lines.append(f"· {warning}")
+    return "\n".join(lines)
+
+
+def _summary(result: SolveResult) -> str:
+    if result.status is not SolveStatus.ANSWERED or not result.answer:
+        return _STATUS_LABEL.get(result.status, "未作答")
+    return f"答案 {result.answer}"
 
 
 def _osascript_notify(title: str, message: str) -> None:
-    safe_msg = message.replace('\\', '\\\\').replace('"', '\\"')
-    safe_title = title.replace('\\', '\\\\').replace('"', '\\"')
+    safe_msg = message.replace("\\", "\\\\").replace('"', '\\"')
+    safe_title = title.replace("\\", "\\\\").replace('"', '\\"')
     try:
         subprocess.run(
-            ["osascript", "-e", f'display notification "{safe_msg}" with title "{safe_title}"'],
+            [
+                "osascript",
+                "-e",
+                f'display notification "{safe_msg}" with title "{safe_title}"',
+            ],
             check=False,
             timeout=5,
         )
@@ -49,12 +83,11 @@ def _osascript_notify(title: str, message: str) -> None:
         logger.debug("osascript 通知失败:%s", exc)
 
 
-def present(result: AnswerResult) -> None:
+def present(result: SolveResult) -> None:
     print("\n" + format_result(result) + "\n", flush=True)
     _osascript_notify("snapquiz", _summary(result))
 
 
-def notify_denied() -> None:
-    msg = "缺少屏幕录制权限:请在 系统设置 › 隐私与安全性 › 屏幕录制 中勾选 snapquiz(或你的终端),然后重启。"
-    print("⚠️ " + msg, flush=True)
-    _osascript_notify("snapquiz 权限", "缺少屏幕录制权限")
+def notify_error(message: str) -> None:
+    print("⚠️ " + message, flush=True)
+    _osascript_notify("snapquiz", message[:120])

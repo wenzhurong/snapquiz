@@ -2,11 +2,10 @@
 
 个人学习刷题助手 —— 热键一按,读取屏幕上的题目,调用 LLM 给出**答案 + 解析 + 相关知识点**,辅助自学、自测与错题复习。
 
-> **状态(2026-09-15):🔧 重建中,当前不可运行。**
-> 原 MVP-0 链路已被冻结,`snapquiz` 命令只会打印禁用提示并返回退出码 3。
-> v3 离线安全链(7.6 万行)已完整保存于 tag `v3-transport-research`,现正按
-> [docs/RECOVERY_PLAN.md](docs/RECOVERY_PLAN.md) 重建可执行闭环。
-> 下面的「运行」一节描述的是重建后的目标状态,**现在照做会失败**。
+> **状态(2026-09-15):✅ 核心闭环可用**(热键截屏 → GLM → 答案+解析)。
+> 尚未接入真实 API 冒烟(Task 3)、拖框选区(Task 4)、错题本与浮层(阶段 B)。
+> v3 时期的 7.6 万行离线安全链已封存于 tag `v3-transport-research`;
+> 重建过程与后续计划见 [docs/RECOVERY_PLAN.md](docs/RECOVERY_PLAN.md)。
 
 ## 这是什么
 
@@ -44,35 +43,55 @@
 - **MVP-1** —— 1–2 周:「先自答→看解析」浮层 + SQLite 错题本/去重缓存 + 可改热键 + 选区记忆 + 成本&幻觉护栏。
 - **MVP-2** —— 按需:签名+公证 .app + 密钥入 Keychain;可选升级(GLM-4.6V 质量档 / Qwen-VL / 本地 VLM 隐私路)。
 
-## 运行(MVP-0)
+## 运行
 
 ```bash
 cd snapquiz
 python3 -m venv .venv && source .venv/bin/activate
-pip install -e .                 # 基础依赖(openai / mss / pyobjc ...)
+pip install -e .                 # 基础依赖(httpx / mss / pyobjc ...)
 pip install -e ".[hotkey]"       # 可选:真·全局热键(pynput,需辅助功能权限)
 
 cp .env.example .env             # 然后编辑 .env,填入智谱 GLM_API_KEY
+export SNAPQUIZ_REGION=100,100,900,700    # 必填:题目所在区域(左,上,宽,高)
 python scripts/grant_check.py    # 首次:按提示授予「屏幕录制」权限后重启终端
 
-snapquiz                         # 默认 stdin 触发:聚焦终端按 Enter,解答当前屏幕上的题
+snapquiz                         # 默认 stdin 触发:聚焦终端按 Enter,解答该区域里的题
 snapquiz --trigger hotkey        # 全局热键(默认 Cmd+Shift+Space,需 [hotkey] 依赖 + 辅助功能权限)
 ```
 
-可选环境变量(见 `.env.example`):`GLM_MODEL`、`GLM_BASE_URL`、`SNAPQUIZ_HOTKEY`、
-`SNAPQUIZ_REGION`(`left,top,width,height` 截取区域,默认全屏)。
+每次发送前会先告诉你要上传什么、多大、发到哪,确认后才解析密钥并联网;
+回答 `n` 则零网络、零密钥读取。`-y` 可跳过确认(不推荐)。
 
-> 触发方式说明:MVP-0 默认 `stdin`(零权限)让你立刻验证核心链路;`hotkey` 用 pynput
-> 实现真·全局热键但需辅助功能权限。架构目标里「零权限 Carbon 热键」留待 MVP-1。
+> ⚠️ **权限归属**:snapquiz 目前不是独立 app bundle,macOS 把截屏行为归属给
+> **调用它的终端**。所以「屏幕录制」要勾给终端.app,不是勾给 snapquiz。
+> 打包成 .app 之后才会变(见 RECOVERY_PLAN 阶段 C)。
+
+环境变量(见 `.env.example`):
+
+| 变量 | 必填 | 说明 |
+|---|---|---|
+| `GLM_API_KEY` | ✅ | 智谱开放平台 API Key |
+| `SNAPQUIZ_REGION` | ✅ | `left,top,width,height`。**没有全屏默认值** —— 默认全屏会把聊天、终端、通知一并上传 |
+| `GLM_MODEL` | | `glm-4.6v-flash`(默认)或 `glm-4.6v`;白名单外的模型名会被拒绝 |
+| `GLM_BASE_URL` | | 只允许官方 endpoint;自定义地址会被拒绝 |
+| `SNAPQUIZ_HOTKEY` | | 默认 `cmd+shift+space` |
+| `SNAPQUIZ_TIMEOUT` | | 默认 30 秒 |
+
+> 触发方式说明:`stdin` 串行执行,确认提示直接在终端问;`hotkey` 用 pynput 实现
+> 真·全局热键(需辅助功能权限),确认走系统对话框。架构目标里「零权限 Carbon 热键」
+> 留待阶段 B Task 9。
 
 ## 开发 / 测试
 
 ```bash
-python3 -m unittest discover -s tests    # 45 个纯逻辑单测,无需网络/依赖
+python3 -m unittest discover -s tests    # 137 个离线单测,约 0.15 秒
 ```
 
-纯逻辑(配置、prompt、输出解析、busy-guard、编排、格式化、热键转换)均有单测覆盖;
-截屏、GLM 网络调用、macOS 权限/通知、全局热键等需在 macOS 上实跑验证。
+覆盖:配置与端点钉死、权限三态 fail-closed、截图质量(黑帧/空白帧)、
+GLM 线格与 34 个业务错误码、严格 JSON 解码、出站字节不可变性与密钥隔离、
+编排顺序(取消则零网络零密钥)、结果严格校验、呈现格式。
+
+真实 GLM 网络调用、真实 TCC 权限弹窗、全局热键监听需在 macOS 上实跑验证。
 
 ## 许可
 

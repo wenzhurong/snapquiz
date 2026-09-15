@@ -1,7 +1,6 @@
-"""Pure v3 Provider adapters; importing this package performs no I/O."""
+"""纯 v3 Provider adapters；导入本包不产生任何 I/O。"""
 
-# Keep package import minimal: the built-in Registry imports the content-
-# addressed prompt policy, while concrete Adapters consume that Registry.
 from snapquiz.adapters.base import DirectMultimodalAdapter
+from snapquiz.adapters.glm import GlmChatAdapter
 
-__all__ = ["DirectMultimodalAdapter"]
+__all__ = ["DirectMultimodalAdapter", "GlmChatAdapter"]
