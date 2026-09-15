@@ -160,7 +160,7 @@ class ProviderDifferenceTest(unittest.TestCase):
 
     def test_opencode_gets_the_required_session_header(self):
         prepared = OpenAIChatAdapter().prepare(
-            config=cfg(model="mimo-v2.5", profile=OPENCODE_GO), png=PNG
+            config=cfg(model="glm-5.3-flash", profile=OPENCODE_GO), png=PNG
         )
         names = {h.lowercase_name: h.normalized_value
                  for h in prepared.non_secret_headers}
@@ -175,10 +175,10 @@ class ProviderDifferenceTest(unittest.TestCase):
         """它会被预览,所以必须进 digest —— 换了 session 就是另一次请求。"""
 
         a = OpenAIChatAdapter().prepare(
-            config=Config(provider=OPENCODE_GO, model="mimo-v2.5",
+            config=Config(provider=OPENCODE_GO, model="glm-5.3-flash",
                           region=(0, 0, 1, 1), session_id="ses_a"), png=PNG)
         b = OpenAIChatAdapter().prepare(
-            config=Config(provider=OPENCODE_GO, model="mimo-v2.5",
+            config=Config(provider=OPENCODE_GO, model="glm-5.3-flash",
                           region=(0, 0, 1, 1), session_id="ses_b"), png=PNG)
         self.assertEqual(a.body, b.body, "session 不进 body")
         self.assertNotEqual(a.envelope_digest, b.envelope_digest)
@@ -186,7 +186,7 @@ class ProviderDifferenceTest(unittest.TestCase):
     def test_each_provider_uses_its_own_endpoint_and_budget(self):
         z = OpenAIChatAdapter().prepare(config=cfg(), png=PNG)
         o = OpenAIChatAdapter().prepare(
-            config=cfg(model="mimo-v2.5", profile=OPENCODE_GO), png=PNG)
+            config=cfg(model="glm-5.3-flash", profile=OPENCODE_GO), png=PNG)
         self.assertIn("open.bigmodel.cn", z.canonical_url)
         self.assertIn("opencode.ai", o.canonical_url)
         self.assertEqual(json.loads(z.body)["max_tokens"], ZHIPU.max_output_tokens)
@@ -196,9 +196,9 @@ class ProviderDifferenceTest(unittest.TestCase):
         """实测 mimo-v2.5 在预算不足时:content=None、输出全在 reasoning。"""
 
         prepared = OpenAIChatAdapter().prepare(
-            config=cfg(model="mimo-v2.5", profile=OPENCODE_GO), png=PNG)
+            config=cfg(model="glm-5.3-flash", profile=OPENCODE_GO), png=PNG)
         body = json.dumps({
-            "model": "mimo-v2.5",
+            "model": "glm-5.3-flash",
             "choices": [{"index": 0, "finish_reason": "length",
                          "message": {"role": "assistant", "content": None,
                                      "reasoning": "Let me think about primes...",

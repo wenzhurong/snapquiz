@@ -665,13 +665,57 @@ Adapter 已经是纯 `prepare`/`decode`，加一个 Provider 不需要碰传输�
 
 `mimo-v2.5-pro` 是纯文本的：404「No endpoints found that support image」。
 
+### 模型选型与计费核查（2026-09-15）
+
+#### 智谱资源包：客户端无从选择
+
+用户问「是不是后台选错了资源包，用了通用包而不是 glm-4.6v 专用包」。核查结论：
+
+**请求里根本没有资源包选择项。** 我们发给智谱的全部内容是：
+
+```
+POST https://open.bigmodel.cn/api/paas/v4/chat/completions
+headers: accept: application/json + authorization
+body 顶层键: ["max_tokens", "messages", "model"]
+```
+
+没有任何参数或 header 能指定用哪个包。智谱官方文档的规则是
+「优先扣除**满足模型适用场景**的资源包余额，再扣除现金账户余额；存在多个相同适用
+场景的资源包时，优先扣除最快过期的」。也就是说包的匹配完全由**模型名**决定，
+在服务端完成。智谱也没有公开的余额/资源包查询 API（试过 `/usage`、
+`/account/balance`、`/resource_packages`，全 404），只能在控制台账单页看。
+
+**唯一受我们控制、且真的会影响匹配的是模型名。** 这里有一个需要说明的窗口：
+本轮重建过程中默认模型一度是 `glm-4v-flash`（当时 `glm-4.6v-flash` 间歇 1305，
+选了实测最稳的），那段时间的调用不会匹配 `glm-4.6v` 专用包。涉及约十几次调用、
+每次 1.1k–1.8k tokens。现已按用户要求固定为 `glm-4.6v`。
+
+#### opencode 模型选型：flash 系完胜 mimo
+
+`mimo-v2.5` 中位 24.5 秒、1513 completion tokens，比同平台的 flash 系慢 5 倍。
+改默认为 `glm-5.3-flash`（4.6 秒 / 122 tokens / 3-3 正确）。详见 README 实测表。
+
+#### 一个把我自己骗过去的坑
+
+第一轮扫描 12 个模型时全部返回 `403 error code: 1010`，我差点得出
+「opencode 没有模型支持图片」的结论。两个原因叠加：
+
+1. 我手工编的 32×32 测试 PNG **是坏的**（IDAT CRC 错、缺 IEND chunk）；
+2. 更要命的是探测脚本用了 `urllib`，而 **opencode 的 CDN 直接拦
+   `Python-urllib` 和空 User-Agent**（Cloudflare 1010）。curl 和 httpx 都放行。
+
+也就是说那一轮 403 跟模型能力毫无关系。教训：拿到「所有目标一致失败」这种
+结果时，先怀疑自己的探针，别急着下结论——尤其当已知可用的那个也一起失败时。
+本项目用 httpx，不受影响。
+
 ---
 
 ## 4. 已知问题（滚动记录）
 
 - `-y/--yes` 跳过确认后，隐私护栏只剩「必须显式选区」一条。Task 4 的图片预览落地前不建议常用。
 - `hotkey` 模式的 osascript 确认对话框只显示字节数和目标，不显示图片本身；Task 4 补。
-- `glm-4.5v` 与 `mimo-v2-omni` 只做过裸 API 验证，没跑过完整链路。
+- `glm-4.5v` 只做过裸 API 验证，没跑过完整链路。
+- 智谱到底扣了哪个资源包，只能在控制台账单页确认；API 侧无从查询也无从指定。
 - opencode 的响应里没有 `request_id`，冒烟显示 `None`；只影响对账。
 - `mimo-v2.5` 的 86 秒延迟没有做过多次采样，可能波动很大。
 - 推理模型在完整九字段 prompt 下的 token 消耗未系统测量；`MAX_OUTPUT_TOKENS=1024`

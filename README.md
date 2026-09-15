@@ -81,19 +81,29 @@ snapquiz --trigger hotkey        # 全局热键(默认 Cmd+Shift+Space,需 [hotk
 
 ### 实测模型矩阵(2026-09-15,同一张合成题图,单次调用)
 
-| Provider | 模型 | 结果 | 延迟 | completion tokens |
+走本项目完整九字段 prompt,各跑 3 次取中位数。
+
+| Provider | 模型 | 结果 | 中位延迟 | completion tokens |
 |---|---|---|---:|---:|
-| zhipu | **`glm-4.6v`**(默认) | ✅ 答对 | 7.3 s | 374 |
-| zhipu | `glm-4v-flash` | ✅ 答对 | **4.3 s** | 136 |
+| zhipu | **`glm-4.6v`**(默认) | ✅ 3/3 | 7.6 s | 374 |
+| zhipu | `glm-4v-flash` | ✅ | 4.3 s | 136 |
 | zhipu | `glm-4.6v-flash` | ❌ `1305` 访问量过大 | — | — |
-| opencode_go | **`mimo-v2.5`**(默认) | ✅ 答对 | **86 s** | 1699 |
+| opencode_go | **`glm-5.3-flash`**(默认) | ✅ 3/3 | **4.6 s** | **122** |
+| opencode_go | `deepseek-v4-flash-vision-exp` | ✅ 3/3 | **3.4 s** | 176 |
+| opencode_go | `qwen3.8-flash` | ✅ 3/3 | 5.5 s | 201 |
+| opencode_go | `mimo-v2.5` | ✅ 3/3 | 24.5 s | 1513 |
 
-`mimo-v2.5` 是推理模型,思维链很长:`max_tokens` 低于 ~2000 会 `finish_reason=length`
-且拿不到答案,因此该 provider 的预算设为 8192、超时 240 秒。**它比 GLM 慢一个数量级**,
-按热键等一分半钟基本不实用;留着是为了证明 Provider 抽象成立、也便于将来对比评测。
+opencode Go 是订阅制,响应里 `cost` 恒为 `0` —— token 数不计费,所以"性价比"的判据
+是**延迟与稳定性**。选 `glm-5.3-flash` 而不是更快的 deepseek:后者名字里的 `-exp`
+表示实验端点,随时可能消失或改行为,为日常工具省那 1.2 秒不值得。要更快就显式设
+`SNAPQUIZ_MODEL=deepseek-v4-flash-vision-exp`。
 
-**纯文本模型用不了**(本工具发的是截图):`glm-4.5-air` 返回 `1210`,
-`mimo-v2.5-pro` 返回 404「No endpoints found that support image」。
+**用不了的模型**(本工具发的是截图):`glm-4.5-air` → `1210` 纯文本;
+`mimo-v2.5-pro` → 404「No endpoints found that support image」;
+`mimo-v2-omni` → 400;`gpt-5.6-luna` → 500。
+
+> ⚠️ opencode 的 CDN 会拦 `Python-urllib` 与空 User-Agent(Cloudflare `1010`/403)。
+> 本项目用 httpx,不受影响;换传输层时要注意。
 
 > 触发方式说明:`stdin` 串行执行,确认提示直接在终端问;`hotkey` 用 pynput 实现
 > 真·全局热键(需辅助功能权限),确认走系统对话框。架构目标里「零权限 Carbon 热键」

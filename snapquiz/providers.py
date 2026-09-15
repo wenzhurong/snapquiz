@@ -86,19 +86,34 @@ OPENCODE_GO = ProviderProfile(
     base_url="https://opencode.ai/zen/go/v1",
     chat_path="/chat/completions",
     key_env="OPENCODE_API_KEY",
-    default_model="mimo-v2.5",
+    default_model="glm-5.3-flash",
     # 2026-09-15 实测：
-    #   mimo-v2.5       ✅ 答对，但**很慢**：max_tokens=8192 时耗时 141 秒、
-    #                      completion 1172 tok。它是推理模型，输出在 message.reasoning，
-    #                      content 要等推理结束才出现；max_tokens=1024 时
-    #                      finish_reason="length"、content=None，什么都拿不到。
+    # 2026-09-15 实测：同一张合成题图，走本项目完整九字段 prompt，各 3 次取中位数。
+    # opencode Go 是订阅制，响应里 cost 恒为 0 —— token 数不计费，
+    # 所以「性价比」的判据是延迟与稳定性，不是 token。
+    #
+    #   模型                            中位延迟   completion   正确
+    #   glm-5.3-flash                    4.6 s        122      3/3  ← 默认
+    #   deepseek-v4-flash-vision-exp     3.4 s        176      3/3  最快但带 -exp
+    #   qwen3.8-flash                    5.5 s        201      3/3
+    #   mimo-v2.5                       24.5 s       1513      3/3  慢 5 倍
+    #
+    # 选 glm-5.3-flash 而不是更快的 deepseek：后者名字里的 -exp 表示实验端点，
+    # 随时可能消失或改行为；为日常工具省那 1.2 秒不值得押在实验端点上。
+    # 想要更快可以显式设 SNAPQUIZ_MODEL=deepseek-v4-flash-vision-exp。
+    #
     #   mimo-v2.5-pro   ❌ 404「No endpoints found that support image」——纯文本
-    #   mimo-v2-omni    ✅ 接受图片（未跑完整链路）
-    allowed_models=frozenset({"mimo-v2.5", "mimo-v2-omni"}),
-    reasoning_models=frozenset({"mimo-v2.5", "mimo-v2-omni"}),
+    #   mimo-v2-omni    ❌ HTTP 400
+    #   gpt-5.6-luna    ❌ HTTP 500
+    allowed_models=frozenset(
+        {"mimo-v2.5", "glm-5.3-flash", "qwen3.8-flash", "deepseek-v4-flash-vision-exp"}
+    ),
+    reasoning_models=frozenset(
+        {"mimo-v2.5", "glm-5.3-flash", "qwen3.8-flash", "deepseek-v4-flash-vision-exp"}
+    ),
     error_scheme=ErrorScheme.OPENCODE_TYPED,
-    max_output_tokens=8192,      # 1024 不够：实测全被思维链吃光
-    default_timeout=240.0,       # 实测 141 秒，留足余量
+    max_output_tokens=8192,      # mimo 用 1024 会被思维链吃光；对 flash 系无害
+    default_timeout=120.0,       # flash 系 3-6 秒；mimo 最慢实测 24.8 秒，留足余量
     requires_session_header=True,
 )
 

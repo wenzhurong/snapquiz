@@ -22,7 +22,7 @@ class ProviderSelectionTest(unittest.TestCase):
     def test_opencode_provider_selected_by_env(self):
         cfg = load_config(OC_ENV)
         self.assertIs(cfg.provider, OPENCODE_GO)
-        self.assertEqual(cfg.model, "mimo-v2.5")
+        self.assertEqual(cfg.model, "glm-5.3-flash")
         self.assertEqual(
             cfg.endpoint_url, "https://opencode.ai/zen/go/v1/chat/completions"
         )
@@ -61,14 +61,14 @@ class ModelWhitelistTest(unittest.TestCase):
             "glm-4v-flash",
         )
         self.assertEqual(
-            load_config({**OC_ENV, "SNAPQUIZ_MODEL": "mimo-v2-omni"}).model,
-            "mimo-v2-omni",
+            load_config({**OC_ENV, "SNAPQUIZ_MODEL": "mimo-v2.5"}).model,
+            "mimo-v2.5",
         )
 
     def test_text_only_models_are_not_in_any_whitelist(self):
         """实测拒收图片的模型不得出现在白名单里。"""
 
-        for banned in ("glm-4.5-air", "mimo-v2.5-pro"):
+        for banned in ("glm-4.5-air", "mimo-v2.5-pro", "mimo-v2-omni", "gpt-5.6-luna"):
             for profile in PROFILES.values():
                 self.assertNotIn(banned, profile.allowed_models)
 
@@ -97,7 +97,7 @@ class ModelWhitelistTest(unittest.TestCase):
                 self.assertGreaterEqual(profile.default_timeout, 30.0)
         # mimo 实测 141 秒、1172 completion tokens,必须给足
         self.assertGreaterEqual(OPENCODE_GO.max_output_tokens, 4096)
-        self.assertGreaterEqual(OPENCODE_GO.default_timeout, 180.0)
+        self.assertGreaterEqual(OPENCODE_GO.default_timeout, 60.0)
 
 
 class ConfigTest(unittest.TestCase):
