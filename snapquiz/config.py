@@ -60,8 +60,12 @@ def _parse_region(raw: str) -> Region:
     return nums  # type: ignore[return-value]
 
 
-def load_config(env: Mapping[str, str]) -> Config:
-    """从环境变量构造配置。不读取 API key 的值,只确认它存在。"""
+def load_config(env: Mapping[str, str], *, require_region: bool = True) -> Config:
+    """从环境变量构造配置。不读取 API key 的值,只确认它存在。
+
+    ``require_region=False`` 只给以文件为输入的冒烟用 —— 那条路径不截屏,
+    选区无意义。产品入口必须保持 ``True``。
+    """
 
     if not (env.get(API_KEY_ENV) or "").strip():
         raise ConfigError(
@@ -82,7 +86,7 @@ def load_config(env: Mapping[str, str]) -> Config:
         )
 
     region_raw = (env.get("SNAPQUIZ_REGION") or "").strip()
-    if not region_raw:
+    if not region_raw and require_region:
         raise ConfigError(
             "必须提供 SNAPQUIZ_REGION='left,top,width,height'。"
             "默认全屏已禁用,避免把聊天、终端、通知一并上传。"
@@ -101,7 +105,7 @@ def load_config(env: Mapping[str, str]) -> Config:
         model=model,
         hotkey=(env.get("SNAPQUIZ_HOTKEY") or DEFAULT_HOTKEY).strip(),
         timeout=timeout,
-        region=_parse_region(region_raw),
+        region=_parse_region(region_raw) if region_raw else None,
     )
 
 

@@ -59,6 +59,14 @@ class ConfigTest(unittest.TestCase):
                 load_config({**BASE_ENV, "SNAPQUIZ_TIMEOUT": raw})
         self.assertEqual(load_config({**BASE_ENV, "SNAPQUIZ_TIMEOUT": "12.5"}).timeout, 12.5)
 
+    def test_region_stays_required_for_the_product_entrypoint(self):
+        """require_region=False 只给文件输入的冒烟用;产品入口不得放宽。"""
+
+        with self.assertRaises(ConfigError):
+            load_config({"GLM_API_KEY": "k"})
+        cfg = load_config({"GLM_API_KEY": "k"}, require_region=False)
+        self.assertIsNone(cfg.region)
+
     def test_resolve_api_key_reads_process_env(self):
         import os
 
