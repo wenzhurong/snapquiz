@@ -29,7 +29,7 @@ EXIT_PERMISSION_ERROR = 4
 
 def _build_orchestrator(cfg, *, approve):
     # 延迟 import：未装依赖时不影响纯逻辑测试。
-    from snapquiz.adapters.glm import GlmChatAdapter, PROVIDER_PROFILE_ID, GLM_PROVIDER_ID
+    from snapquiz.adapters.openai_chat import OpenAIChatAdapter
     from snapquiz.capture.screen import capture_png_bytes
     from snapquiz.core.orchestrator import Orchestrator
     from snapquiz.core.permissions import require_screen_permission
@@ -38,15 +38,13 @@ def _build_orchestrator(cfg, *, approve):
 
     return Orchestrator(
         config=cfg,
-        adapter=GlmChatAdapter(),
+        adapter=OpenAIChatAdapter(),
         capture_fn=lambda: capture_png_bytes(cfg.region),
         send_fn=send_once,
         present_fn=present,
         require_permission_fn=require_screen_permission,
         on_error=notify_error,
         approve_fn=approve,
-        provider_id=GLM_PROVIDER_ID,
-        provider_profile_id=PROVIDER_PROFILE_ID,
     )
 
 
@@ -159,7 +157,8 @@ def main(argv=None) -> int:
 
     left, top, width, height = cfg.region
     banner = (
-        f"snapquiz 就绪 | 模型 {cfg.model} | 选区 {width}×{height} @ ({left},{top})"
+        f"snapquiz 就绪 | {cfg.provider.provider_id.value}/{cfg.model}"
+        f" | 选区 {width}×{height} @ ({left},{top})"
     )
 
     if args.trigger == "hotkey":

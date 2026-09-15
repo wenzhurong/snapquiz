@@ -1,11 +1,15 @@
-"""GLM / OpenAI-Chat-compatible 纯 Adapter。
+"""OpenAI Chat Completions 兼容的纯 Adapter。
 
 ``prepare`` 生成确定性的出站字节，``decode`` 把有界响应解成不可信候选。
 两者都不读环境、不建 SDK、不 sleep、不重试、不联网。
 
+**一个 Adapter 服务所有 Provider**：智谱 GLM 与 opencode Go 都是 OpenAI Chat
+Completions 兼容，差异（endpoint / 模型白名单 / 必需 header / 错误方案）全部
+收在 ``providers.ProviderProfile`` 里，这里不含任何 Provider 分支。
+
 线格与 tests/fixtures/glm_request.json（v3 时期对着智谱官方文档固化的 golden）
 保持一致：顶层只有 model / messages / max_tokens，user 消息是
-``[image_url, text]`` 两段，图片走 base64 data URI。
+``[image_url, text]`` 两段，图片走 base64 data URI。已对两个 Provider 实测通过。
 """
 from __future__ import annotations
 
@@ -15,7 +19,7 @@ import re
 from typing import Any, Optional
 
 from snapquiz.adapters.base import DirectMultimodalAdapter
-from snapquiz.adapters.glm_errors import DECODE_STAGE, strict_json_bytes
+from snapquiz.adapters.provider_errors import DECODE_STAGE, strict_json_bytes
 from snapquiz.adapters.prompt import SYSTEM_INSTRUCTION, build_user_instruction
 from snapquiz.domain.adapter import (
     AnswerCandidateResult,
@@ -30,10 +34,8 @@ from snapquiz.domain.outbound import (
 )
 from snapquiz.domain.solve import UsageSummary
 
-GLM_ADAPTER_FAMILY = "openai_chat_compatible"
-GLM_ADAPTER_VERSION = "2"
-GLM_PROVIDER_ID = "zhipu"
-PROVIDER_PROFILE_ID = "zhipu.glm-4.6v"
+ADAPTER_FAMILY = "openai_chat_compatible"
+ADAPTER_VERSION = "3"
 MAX_OUTPUT_TOKENS = 1024
 
 
@@ -69,25 +71,23 @@ _ACCEPT = NonSecretHeader(
 )
 
 
-def _invalid() -> InvalidOutputError:
-    return InvalidOutputError(
-        stage=DECODE_STAGE, provider_profile_id=PROVIDER_PROFILE_ID
-    )
+def _invalid(profile_id: str) -> InvalidOutputError:
+    return InvalidOutputError(stage=DECODE_STAGE, provider_profile_id=profile_id)
 
 
-def _text(value: object, *, max_length: int) -> Optional[str]:
+def _text(value: object, *, max_length: int, profile_id: str) -> Optional[str]:
     if value is None:
         return None
     if type(value) is not str or len(value) > max_length:
-        raise _invalid()
+        raise _invalid(profile_id)
     return value
 
 
-def _usage(value: object) -> UsageSummary:
+def _usage(value: object, profile_id: str) -> UsageSummary:
     if value is None:
         return UsageSummary()
     if type(value) is not dict:
-        raise _invalid()
+        raise _invalid(profile_id)
     out: dict[str, Optional[int]] = {}
     for wire, field in (
         ("prompt_tokens", "input_tokens"),
@@ -100,20 +100,20 @@ def _usage(value: object) -> UsageSummary:
         elif type(raw) is int and raw >= 0:
             out[field] = raw
         else:
-            raise _invalid()
+            raise _invalid(profile_id)
     try:
         return UsageSummary(**out)
     except ValueError:
-        raise _invalid() from None
+        raise _invalid(profile_id) from None
 
 
-class GlmChatAdapter(DirectMultimodalAdapter):
-    """无状态的 GLM 绑定。"""
+class OpenAIChatAdapter(DirectMultimodalAdapter):
+    """无状态的 OpenAI-Chat-compatible 绑定，对所有 Provider 通用。"""
 
     __slots__ = ()
 
-    adapter_family = GLM_ADAPTER_FAMILY
-    adapter_version = GLM_ADAPTER_VERSION
+    adapter_family = ADAPTER_FAMILY
+    adapter_version = ADAPTER_VERSION
 
     def prepare(self, *, config, png: bytes, user_hint: Optional[str] = None):
         if type(png) is not bytes or not png:
@@ -137,8 +137,9 @@ class GlmChatAdapter(DirectMultimodalAdapter):
                     ],
                 },
             ],
-            # 明确上限：官方默认 16384，远大于简短答题所需，会平白增加成本与延迟。
-            "max_tokens": MAX_OUTPUT_TOKENS,
+            # 明确上限：不设时官方默认 16384，远大于所需，平白增加成本与延迟。
+            # 具体数值按 Provider 走：推理模型的预算要同时覆盖思维链与答案。
+            "max_tokens": config.provider.max_output_tokens,
         }
         body = json.dumps(
             body_obj, ensure_ascii=False, separators=(",", ":"), sort_keys=True
@@ -148,52 +149,68 @@ class GlmChatAdapter(DirectMultimodalAdapter):
         if user_hint:
             kinds.append(OutboundDataKind.USER_HINT)
 
+        headers = [_ACCEPT]
+        if config.provider.requires_session_header:
+            # opencode Go 的路由层强制要求；缺了会返回 MissingSessionID。
+            # 它不是密钥，所以是 non-secret header，会进 envelope digest 并被预览。
+            headers.append(
+                NonSecretHeader(
+                    lowercase_name="x-opencode-session",
+                    normalized_value=config.session_id,
+                )
+            )
+
         return OutboundRequest(
             http_method="POST",
             canonical_url=config.endpoint_url,
             content_type="application/json",
-            non_secret_headers=(_ACCEPT,),
+            non_secret_headers=tuple(headers),
             outbound_data=tuple(kinds),
             body=body,
         )
 
     def decode(
-        self, *, prepared: OutboundRequest, response: TransportResponse
+        self,
+        *,
+        prepared: OutboundRequest,
+        response: TransportResponse,
+        provider_profile_id: str = "unknown",
     ) -> AnswerCandidateResult:
+        pid = provider_profile_id
         response.validate_integrity()
         if response.request_envelope_digest != prepared.envelope_digest:
-            raise _invalid()
+            raise _invalid(pid)
 
         try:
             wrapper = strict_json_bytes(response.body)
         except (UnicodeError, ValueError, TypeError, OverflowError, RecursionError):
-            raise _invalid() from None
+            raise _invalid(pid) from None
         if type(wrapper) is not dict:
-            raise _invalid()
+            raise _invalid(pid)
 
         choices = wrapper.get("choices")
         if type(choices) is not list or len(choices) != 1:
-            raise _invalid()
+            raise _invalid(pid)
         choice = choices[0]
         if type(choice) is not dict:
-            raise _invalid()
+            raise _invalid(pid)
         # 刻意用 `is not 0` 语义的显式类型检查：False 不能冒充 index 0。
         index = choice.get("index")
         if type(index) is not int or type(index) is bool or index != 0:
-            raise _invalid()
+            raise _invalid(pid)
 
         message = choice.get("message")
         if type(message) is not dict or message.get("role") != "assistant":
-            raise _invalid()
+            raise _invalid(pid)
         if message.get("tool_calls") is not None or message.get("audio") is not None:
-            raise _invalid()
+            raise _invalid(pid)
 
-        finish_reason = _text(choice.get("finish_reason"), max_length=64)
-        request_id = _text(wrapper.get("request_id"), max_length=256)
-        usage = _usage(wrapper.get("usage"))
+        finish_reason = _text(choice.get("finish_reason"), max_length=64, profile_id=pid)
+        request_id = _text(wrapper.get("request_id"), max_length=256, profile_id=pid)
+        usage = _usage(wrapper.get("usage"), pid)
 
         if wrapper.get("model") != prepared_model(prepared):
-            raise _invalid()
+            raise _invalid(pid)
 
         content = message.get("content")
         if content is None or type(content) is not str or not content.strip():
@@ -201,9 +218,9 @@ class GlmChatAdapter(DirectMultimodalAdapter):
                 # 推理模型的典型失败：思维链吃光了 token 预算，content 为空。
                 # 这不是"模型乱答"，而是预算配置问题，值得单独报出来。
                 raise OutputBudgetExhausted(
-                    stage=DECODE_STAGE, provider_profile_id=PROVIDER_PROFILE_ID
+                    stage=DECODE_STAGE, provider_profile_id=pid
                 )
-            raise _invalid()
+            raise _invalid(pid)
 
         if finish_reason == "sensitive":
             return AnswerCandidateResult(
@@ -219,9 +236,9 @@ class GlmChatAdapter(DirectMultimodalAdapter):
         try:
             payload = strict_json_bytes(_unwrap_code_fence(content).encode("utf-8"))
         except (UnicodeError, ValueError, TypeError, OverflowError, RecursionError):
-            raise _invalid() from None
+            raise _invalid(pid) from None
         if type(payload) is not dict:
-            raise _invalid()
+            raise _invalid(pid)
 
         return AnswerCandidateResult(
             request_envelope_digest=prepared.envelope_digest,
@@ -240,10 +257,9 @@ def prepared_model(prepared: OutboundRequest) -> str:
 
 
 __all__ = [
+    "ADAPTER_FAMILY",
+    "ADAPTER_VERSION",
+    "MAX_OUTPUT_TOKENS",
+    "OpenAIChatAdapter",
     "OutputBudgetExhausted",
-    "GLM_ADAPTER_FAMILY",
-    "GLM_ADAPTER_VERSION",
-    "GLM_PROVIDER_ID",
-    "PROVIDER_PROFILE_ID",
-    "GlmChatAdapter",
 ]

@@ -21,11 +21,7 @@ import sys
 import time
 from uuid import uuid4
 
-from snapquiz.adapters.glm import (
-    GLM_PROVIDER_ID,
-    PROVIDER_PROFILE_ID,
-    GlmChatAdapter,
-)
+from snapquiz.adapters.openai_chat import OpenAIChatAdapter
 from snapquiz.capture.validation import check_png_size
 from snapquiz.config import ConfigError, load_config, resolve_api_key
 from snapquiz.domain.solve import (
@@ -84,14 +80,16 @@ def main(argv=None) -> int:
     png = args.image.read_bytes()
     check_png_size(png)
 
-    adapter = GlmChatAdapter()
+    adapter = OpenAIChatAdapter()
+    profile_id = cfg.provider_profile_id
     prepared = adapter.prepare(config=cfg, png=png, user_hint=args.hint)
 
     print("=" * 66)
     print("真实 API 冒烟 —— 单次调用,无自动重试")
     print("=" * 66)
     print(f"  图片      {args.image}  ({len(png)} 字节)")
-    print(f"  模型      {cfg.model}")
+    print(f"  provider  {cfg.provider.provider_id.value}")
+    print(f"  模型      {cfg.model}" + ("  (推理模型)" if cfg.is_reasoning_model else ""))
     print(f"  端点      {prepared.canonical_url}")
     print(f"  请求体    {prepared.payload_byte_size} 字节")
     print(f"  envelope  {str(prepared.envelope_digest)[:16]}")
@@ -113,7 +111,8 @@ def main(argv=None) -> int:
             prepared,
             api_key=api_key,
             timeout=cfg.timeout,
-            provider_profile_id=PROVIDER_PROFILE_ID,
+            provider_profile_id=profile_id,
+            error_scheme=cfg.provider.error_scheme,
         )
     except Exception as exc:
         elapsed = (time.monotonic() - started) * 1000
@@ -130,7 +129,9 @@ def main(argv=None) -> int:
     print(f"  响应体      {response.response_byte_size} 字节")
 
     try:
-        candidate = adapter.decode(prepared=prepared, response=response)
+        candidate = adapter.decode(
+            prepared=prepared, response=response, provider_profile_id=profile_id
+        )
     except Exception as exc:
         print(f"\n❌ 解码失败:{type(exc).__name__}: {exc}")
         print("   服务端接受了请求,但响应形状与 Adapter 预期不符。")
@@ -151,7 +152,7 @@ def main(argv=None) -> int:
             StageProvenance(
                 stage_id=uuid4(),
                 role=StageRole.SOLVER,
-                provider_id=GLM_PROVIDER_ID,
+                provider_id=cfg.provider.provider_id.value,
                 model_id=cfg.model,
                 adapter_family=adapter.adapter_family,
                 adapter_version=adapter.adapter_version,
@@ -166,7 +167,7 @@ def main(argv=None) -> int:
             candidate,
             response=response,
             provenance=provenance,
-            provider_profile_id=PROVIDER_PROFILE_ID,
+            provider_profile_id=profile_id,
         )
     except Exception as exc:
         print(f"\n❌ 严格校验拒绝了模型输出:{type(exc).__name__}: {exc}")

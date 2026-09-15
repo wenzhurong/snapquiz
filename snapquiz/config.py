@@ -1,37 +1,23 @@
 """环境配置解析。
 
-保留冻结版 legacy_config 已经做对的三件事：endpoint 钉死官方地址、model 走白名单、
+保留冻结版 legacy_config 已经做对的三件事：endpoint 钉死、model 走白名单、
 选区必须显式给出（不回退全屏）。改掉的一件：``Config`` 不再持有 API key 明文 ——
 它只记住 key 从哪个环境变量来，真正取值发生在出站批准之后（见 transport.client）。
+
+Provider 之间的差异全在 ``providers.ProviderProfile`` 里，这里只负责从环境变量
+选出一个 profile 并校验模型名。
 """
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+import uuid
+from dataclasses import dataclass, field
 from typing import Mapping, Optional, Tuple
 
-DEFAULT_BASE_URL = "https://open.bigmodel.cn/api/paas/v4"
-CHAT_COMPLETIONS_PATH = "/chat/completions"
-DEFAULT_MODEL = "glm-4v-flash"
+from snapquiz.providers import DEFAULT_PROVIDER, ProviderProfile, resolve_profile
+
 DEFAULT_HOTKEY = "cmd+shift+space"
 DEFAULT_TIMEOUT = 30.0
-API_KEY_ENV = "GLM_API_KEY"
-
-# 只允许**已实测可用**的智谱视觉模型；未知模型名不得继承已知能力。
-# 2026-09-15 实测（tests/fixtures/sample_question.png，单次调用）：
-#   glm-4v-flash    ✅ 稳定；非推理模型，答案直接在 content
-#   glm-4v          ✅ 稳定；非推理模型
-#   glm-4.6v-flash  ⚠️ 间歇 1305「访问量过大」(3 次里中 1 次)；推理模型
-#   glm-4.6v        ✅ 可用；推理模型
-#   glm-4.5v        ✅ 可用；推理模型
-#   glm-4.5-air     ❌ 纯文本，拒收图片（1210 messages.content.type 取值范围 ['text']）
-ALLOWED_MODELS = frozenset(
-    {"glm-4v-flash", "glm-4v", "glm-4.6v-flash", "glm-4.6v", "glm-4.5v"}
-)
-
-# 推理模型把思维链放在 reasoning_content，答案在 content。token 预算必须同时覆盖两者：
-# 预算不足时 finish_reason="length" 且 content 为空（实测 max_tokens=50 时 reasoning 就吃掉 49）。
-REASONING_MODELS = frozenset({"glm-4.6v-flash", "glm-4.6v", "glm-4.5v"})
 
 Region = Tuple[int, int, int, int]  # left, top, width, height（屏幕「点」坐标）
 
@@ -44,16 +30,33 @@ class ConfigError(Exception):
 
 @dataclass(frozen=True)
 class Config:
-    base_url: str = DEFAULT_BASE_URL
-    model: str = DEFAULT_MODEL
+    provider: ProviderProfile
+    model: str
     hotkey: str = DEFAULT_HOTKEY
-    timeout: float = DEFAULT_TIMEOUT
+    timeout: float = 0.0  # 0 = 用 provider 的默认值，见 __post_init__
     region: Optional[Region] = None
-    api_key_env: str = API_KEY_ENV
+    #: opencode Go 路由要求的 x-opencode-session。它不是密钥，会进 envelope digest。
+    session_id: str = field(default_factory=lambda: f"ses_{uuid.uuid4().hex}")
+
+    def __post_init__(self) -> None:
+        if self.timeout <= 0:
+            object.__setattr__(self, "timeout", self.provider.default_timeout)
 
     @property
     def endpoint_url(self) -> str:
-        return self.base_url + CHAT_COMPLETIONS_PATH
+        return self.provider.endpoint_url
+
+    @property
+    def api_key_env(self) -> str:
+        return self.provider.key_env
+
+    @property
+    def provider_profile_id(self) -> str:
+        return self.provider.profile_id
+
+    @property
+    def is_reasoning_model(self) -> bool:
+        return self.model in self.provider.reasoning_models
 
 
 def _parse_region(raw: str) -> Region:
@@ -80,22 +83,32 @@ def load_config(env: Mapping[str, str], *, require_region: bool = True) -> Confi
     选区无意义。产品入口必须保持 ``True``。
     """
 
-    if not (env.get(API_KEY_ENV) or "").strip():
+    provider_name = (env.get("SNAPQUIZ_PROVIDER") or DEFAULT_PROVIDER.value).strip()
+    try:
+        profile = resolve_profile(provider_name)
+    except KeyError as exc:
+        raise ConfigError(str(exc)) from None
+
+    if not (env.get(profile.key_env) or "").strip():
         raise ConfigError(
-            f"缺少 {API_KEY_ENV}。请在 .env 里填入智谱开放平台的 API Key(见 .env.example)。"
+            f"缺少 {profile.key_env}(provider={profile.provider_id.value})。"
+            "请在 .env 里填入,见 .env.example。"
         )
 
-    base_url = (env.get("GLM_BASE_URL") or DEFAULT_BASE_URL).strip().rstrip("/")
-    if base_url != DEFAULT_BASE_URL:
+    # endpoint 不接受来自环境的覆盖:自定义地址会把截图和密钥一起送到未验证的主机。
+    override = (env.get("SNAPQUIZ_BASE_URL") or "").strip().rstrip("/")
+    if override and override != profile.base_url:
         raise ConfigError(
-            f"GLM_BASE_URL 只允许官方 endpoint {DEFAULT_BASE_URL};"
-            "自定义地址会把截图和密钥一起送到未验证的主机。"
+            f"SNAPQUIZ_BASE_URL 只允许 {profile.provider_id.value} 的官方地址 "
+            f"{profile.base_url}"
         )
 
-    model = (env.get("GLM_MODEL") or DEFAULT_MODEL).strip()
-    if model not in ALLOWED_MODELS:
+    model = (env.get("SNAPQUIZ_MODEL") or env.get("GLM_MODEL") or "").strip()
+    model = model or profile.default_model
+    if model not in profile.allowed_models:
         raise ConfigError(
-            f"GLM_MODEL={model!r} 不在白名单内;当前允许:{sorted(ALLOWED_MODELS)}"
+            f"模型 {model!r} 不在 {profile.provider_id.value} 的白名单内;"
+            f"当前允许:{sorted(profile.allowed_models)}"
         )
 
     region_raw = (env.get("SNAPQUIZ_REGION") or "").strip()
@@ -107,18 +120,22 @@ def load_config(env: Mapping[str, str], *, require_region: bool = True) -> Confi
 
     timeout_raw = (env.get("SNAPQUIZ_TIMEOUT") or "").strip()
     try:
-        timeout = float(timeout_raw) if timeout_raw else DEFAULT_TIMEOUT
+        timeout = float(timeout_raw) if timeout_raw else profile.default_timeout
     except ValueError:
         raise ConfigError(f"SNAPQUIZ_TIMEOUT 必须是数字,收到:{timeout_raw!r}") from None
-    if not 0 < timeout <= 300:
-        raise ConfigError("SNAPQUIZ_TIMEOUT 必须在 (0, 300] 秒之间")
+    if not 0 < timeout <= 600:
+        raise ConfigError("SNAPQUIZ_TIMEOUT 必须在 (0, 600] 秒之间")
+
+    session_id = (env.get("OPENCODE_SESSION") or "").strip()
+    extra = {"session_id": session_id} if session_id else {}
 
     return Config(
-        base_url=base_url,
+        provider=profile,
         model=model,
         hotkey=(env.get("SNAPQUIZ_HOTKEY") or DEFAULT_HOTKEY).strip(),
         timeout=timeout,
         region=_parse_region(region_raw) if region_raw else None,
+        **extra,
     )
 
 

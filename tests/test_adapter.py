@@ -2,13 +2,13 @@ import json
 import pathlib
 import unittest
 
-from snapquiz.adapters.glm import (
-    PROVIDER_PROFILE_ID,
-    GlmChatAdapter,
+from snapquiz.adapters.openai_chat import (
+    OpenAIChatAdapter,
     OutputBudgetExhausted,
     _unwrap_code_fence,
 )
 from snapquiz.config import Config
+from snapquiz.providers import OPENCODE_GO, ZHIPU
 from snapquiz.domain.adapter import NormalizedRefusal, TransportResponse
 from snapquiz.domain.errors import (
     AuthError,
@@ -18,7 +18,7 @@ from snapquiz.domain.errors import (
     ProviderServerError,
     RateLimitError,
 )
-from snapquiz.adapters.glm_errors import map_http_error, map_provider_error
+from snapquiz.adapters.provider_errors import map_http_error, map_provider_error
 from snapquiz.domain.outbound import NonSecretHeader, OutboundDataKind, OutboundRequest
 from snapquiz.result.validator import validate_answer_candidate
 from tests.helpers import provenance
@@ -28,12 +28,14 @@ PNG = b"\x89PNG\r\n\x1a\nfake-pixels"
 
 
 # golden fixture 录的是 glm-4.6v-flash 的响应；测试显式钉住它，
-# 不依赖 DEFAULT_MODEL（那个会随实测可用性变化）。
+# 不依赖 profile 的 default_model（那个会随实测可用性变化）。
 FIXTURE_MODEL = "glm-4.6v-flash"
+PROFILE_ID = ZHIPU.profile_id
 
 
-def cfg(model=FIXTURE_MODEL):
-    return Config(region=(0, 0, 640, 480), model=model)
+def cfg(model=FIXTURE_MODEL, profile=ZHIPU):
+    return Config(provider=profile, model=model, region=(0, 0, 640, 480),
+                  session_id="ses_test")
 
 
 def err_body(code):
@@ -43,7 +45,7 @@ def err_body(code):
 class PrepareTest(unittest.TestCase):
     def test_wire_shape_matches_golden(self):
         golden = json.loads((FIXTURES / "glm_request.json").read_text())
-        body = json.loads(GlmChatAdapter().prepare(config=cfg(), png=PNG).body)
+        body = json.loads(OpenAIChatAdapter().prepare(config=cfg(), png=PNG).body)
         self.assertEqual(sorted(body), sorted(golden))
         self.assertEqual(
             [p["type"] for p in body["messages"][1]["content"]],
@@ -52,24 +54,24 @@ class PrepareTest(unittest.TestCase):
         self.assertEqual(body["max_tokens"], golden["max_tokens"])
 
     def test_prepare_is_deterministic(self):
-        a = GlmChatAdapter().prepare(config=cfg(), png=PNG)
-        b = GlmChatAdapter().prepare(config=cfg(), png=PNG)
+        a = OpenAIChatAdapter().prepare(config=cfg(), png=PNG)
+        b = OpenAIChatAdapter().prepare(config=cfg(), png=PNG)
         self.assertEqual(a.body, b.body)
         self.assertEqual(a.envelope_digest, b.envelope_digest)
 
     def test_hint_changes_declared_outbound_data(self):
-        without = GlmChatAdapter().prepare(config=cfg(), png=PNG)
-        with_hint = GlmChatAdapter().prepare(config=cfg(), png=PNG, user_hint="这是几何题")
+        without = OpenAIChatAdapter().prepare(config=cfg(), png=PNG)
+        with_hint = OpenAIChatAdapter().prepare(config=cfg(), png=PNG, user_hint="这是几何题")
         self.assertNotIn(OutboundDataKind.USER_HINT, without.outbound_data)
         self.assertIn(OutboundDataKind.USER_HINT, with_hint.outbound_data)
         self.assertNotEqual(without.envelope_digest, with_hint.envelope_digest)
 
     def test_url_is_pinned_https_official(self):
-        prepared = GlmChatAdapter().prepare(config=cfg(), png=PNG)
+        prepared = OpenAIChatAdapter().prepare(config=cfg(), png=PNG)
         self.assertTrue(prepared.canonical_url.startswith("https://open.bigmodel.cn/"))
 
     def test_no_credential_headers_in_prepared_bytes(self):
-        prepared = GlmChatAdapter().prepare(config=cfg(), png=PNG)
+        prepared = OpenAIChatAdapter().prepare(config=cfg(), png=PNG)
         names = {h.lowercase_name for h in prepared.non_secret_headers}
         self.assertNotIn("authorization", names)
         self.assertNotIn(b"Bearer", prepared.body)
@@ -77,7 +79,7 @@ class PrepareTest(unittest.TestCase):
 
 class DecodeTest(unittest.TestCase):
     def setUp(self):
-        self.adapter = GlmChatAdapter()
+        self.adapter = OpenAIChatAdapter()
         self.prepared = self.adapter.prepare(config=cfg(), png=PNG)
 
     def _resp(self, body):
@@ -94,7 +96,7 @@ class DecodeTest(unittest.TestCase):
             candidate,
             response=response,
             provenance=provenance(),
-            provider_profile_id=PROVIDER_PROFILE_ID,
+            provider_profile_id=PROFILE_ID,
         )
         self.assertEqual(result.answer, "2")
 
@@ -153,11 +155,71 @@ class DecodeTest(unittest.TestCase):
             )
 
 
+class ProviderDifferenceTest(unittest.TestCase):
+    """两个 Provider 的差异必须全部落在 profile 上,核心不含分支。"""
+
+    def test_opencode_gets_the_required_session_header(self):
+        prepared = OpenAIChatAdapter().prepare(
+            config=cfg(model="mimo-v2.5", profile=OPENCODE_GO), png=PNG
+        )
+        names = {h.lowercase_name: h.normalized_value
+                 for h in prepared.non_secret_headers}
+        self.assertEqual(names.get("x-opencode-session"), "ses_test")
+
+    def test_zhipu_does_not_get_the_session_header(self):
+        prepared = OpenAIChatAdapter().prepare(config=cfg(), png=PNG)
+        names = {h.lowercase_name for h in prepared.non_secret_headers}
+        self.assertNotIn("x-opencode-session", names)
+
+    def test_session_header_is_covered_by_the_envelope_digest(self):
+        """它会被预览,所以必须进 digest —— 换了 session 就是另一次请求。"""
+
+        a = OpenAIChatAdapter().prepare(
+            config=Config(provider=OPENCODE_GO, model="mimo-v2.5",
+                          region=(0, 0, 1, 1), session_id="ses_a"), png=PNG)
+        b = OpenAIChatAdapter().prepare(
+            config=Config(provider=OPENCODE_GO, model="mimo-v2.5",
+                          region=(0, 0, 1, 1), session_id="ses_b"), png=PNG)
+        self.assertEqual(a.body, b.body, "session 不进 body")
+        self.assertNotEqual(a.envelope_digest, b.envelope_digest)
+
+    def test_each_provider_uses_its_own_endpoint_and_budget(self):
+        z = OpenAIChatAdapter().prepare(config=cfg(), png=PNG)
+        o = OpenAIChatAdapter().prepare(
+            config=cfg(model="mimo-v2.5", profile=OPENCODE_GO), png=PNG)
+        self.assertIn("open.bigmodel.cn", z.canonical_url)
+        self.assertIn("opencode.ai", o.canonical_url)
+        self.assertEqual(json.loads(z.body)["max_tokens"], ZHIPU.max_output_tokens)
+        self.assertEqual(json.loads(o.body)["max_tokens"], OPENCODE_GO.max_output_tokens)
+
+    def test_mimo_style_empty_content_is_budget_exhaustion(self):
+        """实测 mimo-v2.5 在预算不足时:content=None、输出全在 reasoning。"""
+
+        prepared = OpenAIChatAdapter().prepare(
+            config=cfg(model="mimo-v2.5", profile=OPENCODE_GO), png=PNG)
+        body = json.dumps({
+            "model": "mimo-v2.5",
+            "choices": [{"index": 0, "finish_reason": "length",
+                         "message": {"role": "assistant", "content": None,
+                                     "reasoning": "Let me think about primes...",
+                                     "refusal": None}}],
+            "usage": {"prompt_tokens": 1177, "completion_tokens": 1024,
+                      "total_tokens": 2201},
+        }).encode()
+        response = TransportResponse(
+            request_envelope_digest=prepared.envelope_digest,
+            http_status=200, body=body)
+        with self.assertRaises(OutputBudgetExhausted):
+            OpenAIChatAdapter().decode(
+                prepared=prepared, response=response,
+                provider_profile_id=OPENCODE_GO.profile_id)
+
+
 class RealWorldResponseTest(unittest.TestCase):
     """这些形状来自 2026-09-15 对真实 GLM 的实测，不是想象出来的。"""
 
     def setUp(self):
-        self.adapter = GlmChatAdapter()
+        self.adapter = OpenAIChatAdapter()
         self.prepared = self.adapter.prepare(config=cfg(), png=PNG)
 
     def _resp(self, body):
@@ -258,28 +320,28 @@ class ErrorMappingTest(unittest.TestCase):
             (500, ProviderServerError),
         ):
             with self.subTest(status=status), self.assertRaises(exc):
-                map_http_error(status, PROVIDER_PROFILE_ID)
+                map_http_error(status, PROFILE_ID)
 
     def test_business_code_distinguishes_retryable_quota(self):
         """1302 是瞬时限流(可重试);1310 是周期额度耗尽(重试只会继续失败)。"""
 
         with self.assertRaises(RateLimitError) as transient:
             map_provider_error(status=429, body=err_body("1302"),
-                               provider_profile_id=PROVIDER_PROFILE_ID)
+                               provider_profile_id=PROFILE_ID)
         self.assertTrue(transient.exception.retryable)
 
         with self.assertRaises(RateLimitError) as exhausted:
             map_provider_error(status=429, body=err_body("1310"),
-                               provider_profile_id=PROVIDER_PROFILE_ID)
+                               provider_profile_id=PROFILE_ID)
         self.assertFalse(exhausted.exception.retryable)
 
     def test_content_policy_code(self):
         with self.assertRaises(ContentPolicyError):
             map_provider_error(status=400, body=err_body("1301"),
-                               provider_profile_id=PROVIDER_PROFILE_ID)
+                               provider_profile_id=PROFILE_ID)
 
     def test_unknown_code_falls_through_to_http_mapping(self):
-        map_provider_error(status=418, body=b"{}", provider_profile_id=PROVIDER_PROFILE_ID)
+        map_provider_error(status=418, body=b"{}", provider_profile_id=PROFILE_ID)
 
     def test_provider_message_never_reaches_the_exception(self):
         body = json.dumps(
@@ -287,7 +349,7 @@ class ErrorMappingTest(unittest.TestCase):
         ).encode()
         with self.assertRaises(AuthError) as ctx:
             map_provider_error(status=401, body=body,
-                               provider_profile_id=PROVIDER_PROFILE_ID)
+                               provider_profile_id=PROFILE_ID)
         self.assertNotIn("SECRET-INTERNAL-DETAIL", repr(ctx.exception))
 
 
@@ -309,10 +371,10 @@ class OutboundRequestTest(unittest.TestCase):
             )
 
     def test_integrity_check_detects_nothing_when_untouched(self):
-        GlmChatAdapter().prepare(config=cfg(), png=PNG).validate_integrity()
+        OpenAIChatAdapter().prepare(config=cfg(), png=PNG).validate_integrity()
 
     def test_safe_metadata_has_no_body(self):
-        meta = GlmChatAdapter().prepare(config=cfg(), png=PNG).safe_metadata()
+        meta = OpenAIChatAdapter().prepare(config=cfg(), png=PNG).safe_metadata()
         self.assertNotIn("body", meta)
         self.assertGreater(meta["payload_byte_size"], 0)
 

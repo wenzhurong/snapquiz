@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import logging
 
-from snapquiz.adapters.glm_errors import map_http_error, map_provider_error
+from snapquiz.adapters.provider_errors import map_business_error, map_http_error
 from snapquiz.domain.adapter import MAX_PROVIDER_RESPONSE_BYTES, TransportResponse
 from snapquiz.domain.errors import NetworkError, TimeoutError as SnapTimeoutError
 from snapquiz.domain.outbound import OutboundRequest
@@ -34,6 +34,7 @@ def send_once(
     api_key: str,
     timeout: float,
     provider_profile_id: str,
+    error_scheme,
 ) -> TransportResponse:
     """发送一次。没有重试循环 —— 重试策略属于调用方，且必须共享同一预算。"""
 
@@ -84,9 +85,14 @@ def send_once(
         )
 
     if response.status_code != 200:
-        # 先看智谱业务错误码（能区分「限流可重试」与「周期额度已耗尽」），
+        # 先看 Provider 的业务错误（智谱能区分「限流可重试」与「周期额度已耗尽」；
+        # opencode 能把「模型名写错」和「密钥失效」分开——两者都是 401）。
         # 未命中再回落到 HTTP 状态映射。
-        map_provider_error(
+        # error_scheme 是**必填**的:给它默认值会让调用方漏传时静默退化成
+        # 只看 HTTP 状态 —— 那样 GLM 的「额度耗尽」会被当成可重试限流,
+        # opencode 的「模型名写错」会被当成密钥失效。
+        map_business_error(
+            error_scheme,
             status=response.status_code,
             body=body,
             provider_profile_id=provider_profile_id,

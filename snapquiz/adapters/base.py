@@ -40,6 +40,7 @@ class DirectMultimodalAdapter:
         *,
         prepared: OutboundRequest,
         response: TransportResponse,
+        provider_profile_id: str = "unknown",
     ) -> AnswerCandidateResult:
         raise NotImplementedError
 

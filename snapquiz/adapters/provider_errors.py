@@ -1,4 +1,4 @@
-"""GLM 错误映射与严格 JSON 解码。
+"""Provider 错误映射与严格 JSON 解码。
 
 这两部分是 v3 里经得起复用的成果，直接从 `openai_chat_compatible.py` 抄出：
 
@@ -261,13 +261,81 @@ def map_provider_error(
         raise ProviderUnavailableError(**kwargs)
 
 
+# ---------------------------------------------------------------------------
+# opencode Go
+# ---------------------------------------------------------------------------
+# 实测（2026-09-15）：opencode 对**模型不存在**也返回 HTTP 401，和无效 key 一样。
+# 只看状态码会把"模型名写错"误报成"密钥失效"，所以必须看响应体的 error.type。
+#   坏 key   → 401 {"type":"error","error":{"type":"AuthError","message":"Invalid API key."}}
+#   坏 model → 401 {"type":"error","error":{"type":"ModelError","message":"Model ... is not supported"}}
+#   缺 header→ {"error":{"code":"MissingSessionID", ...}}
+_OPENCODE_ERROR_TYPES = {
+    "AuthError": AuthError,
+    "ModelError": ProviderRequestError,
+    "MissingSessionID": ProviderRequestError,
+    "RateLimitError": RateLimitError,
+    "server_error": ProviderServerError,
+}
+
+
+def _opencode_error_type(body: bytes) -> str | None:
+    try:
+        wrapper = _strict_json_bytes(body)
+    except (
+        UnicodeError, ValueError, TypeError, OverflowError,
+        RecursionError, json.JSONDecodeError,
+    ):
+        return None
+    if type(wrapper) is not dict:
+        return None
+    error = wrapper.get("error")
+    if type(error) is not dict:
+        return None
+    for key in ("type", "code"):
+        value = error.get(key)
+        if type(value) is str and 0 < len(value) <= 64:
+            return value
+    return None
+
+
+def map_opencode_error(*, status: int, body: bytes, provider_profile_id: str) -> None:
+    """按 error.type 分流；未知 type 交回 HTTP 映射。"""
+
+    if not 400 <= status <= 599:
+        return
+    kind = _opencode_error_type(body)
+    exc = _OPENCODE_ERROR_TYPES.get(kind) if kind else None
+    if exc is None:
+        return
+    raise exc(stage=DECODE_STAGE, provider_profile_id=provider_profile_id)
+
+
+def map_business_error(
+    scheme, *, status: int, body: bytes, provider_profile_id: str
+) -> None:
+    """按 Provider 的错误方案分流。核心不含 Provider 分支，分支只在这里。"""
+
+    from snapquiz.providers import ErrorScheme
+
+    if scheme is ErrorScheme.GLM_NUMERIC:
+        map_provider_error(
+            status=status, body=body, provider_profile_id=provider_profile_id
+        )
+    elif scheme is ErrorScheme.OPENCODE_TYPED:
+        map_opencode_error(
+            status=status, body=body, provider_profile_id=provider_profile_id
+        )
+
+
 strict_json_text = _strict_json_text
 strict_json_bytes = _strict_json_bytes
 
 __all__ = [
     "DECODE_STAGE",
     "MAX_JSON_DEPTH",
+    "map_business_error",
     "map_http_error",
+    "map_opencode_error",
     "map_provider_error",
     "strict_json_bytes",
     "strict_json_text",

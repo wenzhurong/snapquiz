@@ -1,8 +1,9 @@
 import json
 import unittest
 
-from snapquiz.adapters.glm import GlmChatAdapter
+from snapquiz.adapters.openai_chat import OpenAIChatAdapter
 from snapquiz.config import Config
+from snapquiz.providers import ZHIPU
 from snapquiz.core.orchestrator import Orchestrator
 from snapquiz.core.permissions import PermissionDenied
 from snapquiz.domain.adapter import TransportResponse
@@ -51,7 +52,7 @@ class Recorder:
 
 
 def build(recorder, *, approve=True, capture_exc=None, permission_exc=None, env_key="k"):
-    cfg = Config(region=(0, 0, 640, 480), model="glm-4v-flash")
+    cfg = Config(provider=ZHIPU, model="glm-4v-flash", region=(0, 0, 640, 480))
 
     def capture():
         recorder.captures += 1
@@ -59,7 +60,7 @@ def build(recorder, *, approve=True, capture_exc=None, permission_exc=None, env_
             raise capture_exc
         return PNG
 
-    def send(prepared, *, api_key, timeout, provider_profile_id):
+    def send(prepared, *, api_key, timeout, provider_profile_id, error_scheme=None):
         recorder.sends += 1
         recorder.key_resolutions += 1
         assert api_key == env_key
@@ -75,7 +76,7 @@ def build(recorder, *, approve=True, capture_exc=None, permission_exc=None, env_
 
     return cfg, Orchestrator(
         config=cfg,
-        adapter=GlmChatAdapter(),
+        adapter=OpenAIChatAdapter(),
         capture_fn=capture,
         send_fn=send,
         present_fn=recorder.presented.append,

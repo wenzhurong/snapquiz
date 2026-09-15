@@ -2,8 +2,8 @@
 
 个人学习刷题助手 —— 热键一按,读取屏幕上的题目,调用 LLM 给出**答案 + 解析 + 相关知识点**,辅助自学、自测与错题复习。
 
-> **状态(2026-09-15):✅ 核心闭环可用,真实 API 已打通**。
-> 对固定合成题图实测:`glm-4v-flash` 4.3 秒答对,过严格校验。
+> **状态(2026-09-15):✅ 核心闭环可用,两个 Provider 真实打通**。
+> 对固定合成题图实测:智谱 `glm-4.6v` 7.3 秒答对,opencode `mimo-v2.5` 86 秒答对。
 > 尚未接入拖框选区(Task 4)、评测集、错题本与浮层(阶段 B)。
 > v3 时期的 7.6 万行离线安全链已封存于 tag `v3-transport-research`;
 > 重建过程与后续计划见 [docs/RECOVERY_PLAN.md](docs/RECOVERY_PLAN.md)。
@@ -71,12 +71,29 @@ snapquiz --trigger hotkey        # 全局热键(默认 Cmd+Shift+Space,需 [hotk
 
 | 变量 | 必填 | 说明 |
 |---|---|---|
-| `GLM_API_KEY` | ✅ | 智谱开放平台 API Key |
 | `SNAPQUIZ_REGION` | ✅ | `left,top,width,height`。**没有全屏默认值** —— 默认全屏会把聊天、终端、通知一并上传 |
-| `GLM_MODEL` | | 默认 `glm-4v-flash`(实测最快最稳)。白名单:`glm-4v-flash` / `glm-4v` / `glm-4.6v` / `glm-4.5v` / `glm-4.6v-flash`。**注意 `glm-4.5-air` 等纯文本模型用不了**,本工具发的是截图 |
-| `GLM_BASE_URL` | | 只允许官方 endpoint;自定义地址会被拒绝 |
+| `SNAPQUIZ_PROVIDER` | | `zhipu`(默认) 或 `opencode_go` |
+| `GLM_API_KEY` | ✅* | 智谱 key(provider=zhipu 时必填) |
+| `OPENCODE_API_KEY` | ✅* | opencode key(provider=opencode_go 时必填) |
+| `SNAPQUIZ_MODEL` | | 不填则用当前 provider 的默认模型;跨 provider 的模型名会被拒绝 |
 | `SNAPQUIZ_HOTKEY` | | 默认 `cmd+shift+space` |
-| `SNAPQUIZ_TIMEOUT` | | 默认 30 秒 |
+| `SNAPQUIZ_TIMEOUT` | | 不填则用 provider 默认值(zhipu 30s / opencode_go 240s) |
+
+### 实测模型矩阵(2026-09-15,同一张合成题图,单次调用)
+
+| Provider | 模型 | 结果 | 延迟 | completion tokens |
+|---|---|---|---:|---:|
+| zhipu | **`glm-4.6v`**(默认) | ✅ 答对 | 7.3 s | 374 |
+| zhipu | `glm-4v-flash` | ✅ 答对 | **4.3 s** | 136 |
+| zhipu | `glm-4.6v-flash` | ❌ `1305` 访问量过大 | — | — |
+| opencode_go | **`mimo-v2.5`**(默认) | ✅ 答对 | **86 s** | 1699 |
+
+`mimo-v2.5` 是推理模型,思维链很长:`max_tokens` 低于 ~2000 会 `finish_reason=length`
+且拿不到答案,因此该 provider 的预算设为 8192、超时 240 秒。**它比 GLM 慢一个数量级**,
+按热键等一分半钟基本不实用;留着是为了证明 Provider 抽象成立、也便于将来对比评测。
+
+**纯文本模型用不了**(本工具发的是截图):`glm-4.5-air` 返回 `1210`,
+`mimo-v2.5-pro` 返回 404「No endpoints found that support image」。
 
 > 触发方式说明:`stdin` 串行执行,确认提示直接在终端问;`hotkey` 用 pynput 实现
 > 真·全局热键(需辅助功能权限),确认走系统对话框。架构目标里「零权限 Carbon 热键」

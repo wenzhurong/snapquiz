@@ -50,8 +50,6 @@ class Orchestrator:
         require_permission_fn: Callable[[], None],
         on_error: Callable[[str], None],
         approve_fn: ApprovalFn = always_approve,
-        provider_id: str = "zhipu",
-        provider_profile_id: str = "zhipu.glm-4.6v",
         question_hint: Optional[str] = None,
     ) -> None:
         self._config = config
@@ -62,8 +60,6 @@ class Orchestrator:
         self._require_permission_fn = require_permission_fn
         self._on_error = on_error
         self._approve_fn = approve_fn
-        self._provider_id = provider_id
-        self._provider_profile_id = provider_profile_id
         self._question_hint = question_hint
 
     def run_once(self) -> Optional[SolveResult]:
@@ -90,6 +86,7 @@ class Orchestrator:
         prepared = self._adapter.prepare(
             config=cfg, png=png, user_hint=self._question_hint
         )
+        profile_id = cfg.provider_profile_id
 
         # 4. 发送前确认。取消则零网络、零密钥解析。
         if not self._approve_fn(prepared):
@@ -103,21 +100,24 @@ class Orchestrator:
                 prepared,
                 api_key=api_key,
                 timeout=cfg.timeout,
-                provider_profile_id=self._provider_profile_id,
+                provider_profile_id=profile_id,
+                error_scheme=cfg.provider.error_scheme,
             )
         finally:
             del api_key
         latency_ms = int((time.monotonic() - started) * 1000)
 
         # 6. 解码成不可信候选，再由本地严格 Validator 构造唯一可信结果。
-        candidate = self._adapter.decode(prepared=prepared, response=response)
+        candidate = self._adapter.decode(
+            prepared=prepared, response=response, provider_profile_id=profile_id
+        )
         provenance = SolveProvenance(
             pipeline_kind=PipelineKind.DIRECT_MULTIMODAL,
             stages=(
                 StageProvenance(
                     stage_id=uuid4(),
                     role=StageRole.SOLVER,
-                    provider_id=self._provider_id,
+                    provider_id=cfg.provider.provider_id.value,
                     model_id=cfg.model,
                     adapter_family=self._adapter.adapter_family,
                     adapter_version=self._adapter.adapter_version,
@@ -131,7 +131,7 @@ class Orchestrator:
             candidate,
             response=response,
             provenance=provenance,
-            provider_profile_id=self._provider_profile_id,
+            provider_profile_id=profile_id,
         )
 
         self._present_fn(result)

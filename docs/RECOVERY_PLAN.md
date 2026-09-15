@@ -633,13 +633,47 @@ system prompt 明写 "no Markdown, code fence, commentary"，模型仍然返回�
 - 请求线格（model / messages / max_tokens 三个顶层键，`[image_url, text]` 两段）
   **被真实服务端接受**，golden fixture 这一点是对的。
 
+### 接入第二个 Provider（2026-09-15，计划外，用户要求）
+
+原计划把多 Provider 放在阶段 C。提前做是因为它现在**确实便宜**：
+Adapter 已经是纯 `prepare`/`decode`，加一个 Provider 不需要碰传输、权限、
+捕获、校验任何一层。
+
+做法是一张**静态表**（`snapquiz/providers.py`，约 120 行），不是 Registry：
+
+- 核心逻辑不含任何 Provider 分支；唯一的分支在 `map_business_error` 的两行 if 里；
+- 每个 Provider 的差异（endpoint / key 变量 / 模型白名单 / 必需 header /
+  错误方案 / token 预算 / 超时）全部是 `ProviderProfile` 的字段；
+- 新增 Provider = 加一条表项，不动其他文件。
+
+对比：v3 的 Registry/Plan 机制做同一件事用了 **3,643 行**，代价是一条贯穿
+每一层的 PlannedExecution 穿线。
+
+#### opencode / mimo-v2.5 实测到的四件事
+
+1. **Go 路由强制要 `x-opencode-session` header**，缺了返回 `MissingSessionID`。
+   它不是密钥，所以作为 non-secret header 进 envelope digest —— 换个 session
+   就是另一次请求，预览时也看得见。
+2. **opencode 对「模型名写错」也返回 HTTP 401**，和无效 key 一样。只看状态码会
+   把配置错误误报成密钥失效，必须看 `error.type`（`AuthError` vs `ModelError`）。
+   这正是 `error_scheme` 必须**必填**的原因：给它默认值会让调用方漏传时静默退化。
+3. **`mimo-v2.5` 是推理模型**，输出在 `message.reasoning`，`content` 是 `None`
+   直到推理结束。`max_tokens=1024` 时 `finish_reason="length"`、拿不到任何答案。
+   为 GLM 加的 `OutputBudgetExhausted` 原封不动地正确诊断了它 —— 一个好抽象的迹象。
+4. **它慢一个数量级**：8192 预算下 141 秒 / 1172 tokens（裸 API），完整链路 86 秒。
+   按热键等一分半钟不实用。留着是为了证明抽象成立与将来对比评测。
+
+`mimo-v2.5-pro` 是纯文本的：404「No endpoints found that support image」。
+
 ---
 
 ## 4. 已知问题（滚动记录）
 
 - `-y/--yes` 跳过确认后，隐私护栏只剩「必须显式选区」一条。Task 4 的图片预览落地前不建议常用。
 - `hotkey` 模式的 osascript 确认对话框只显示字节数和目标，不显示图片本身；Task 4 补。
-- `glm-4.5v` 只做过裸 API 验证，没跑过完整链路（它是推理模型，理论上与 4.6v 同路）。
+- `glm-4.5v` 与 `mimo-v2-omni` 只做过裸 API 验证，没跑过完整链路。
+- opencode 的响应里没有 `request_id`，冒烟显示 `None`；只影响对账。
+- `mimo-v2.5` 的 86 秒延迟没有做过多次采样，可能波动很大。
 - 推理模型在完整九字段 prompt 下的 token 消耗未系统测量；`MAX_OUTPUT_TOKENS=1024`
   对这道简单题够用（330），复杂题是否够未知。
 - **v3 各层不可按文件切分**（见 §1 的结构事实框）。任何"先删一半再让另一半编译过"的

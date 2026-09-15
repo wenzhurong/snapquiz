@@ -3,8 +3,9 @@ import os
 import unittest
 from unittest.mock import patch
 
-from snapquiz.adapters.glm import PROVIDER_PROFILE_ID, GlmChatAdapter
+from snapquiz.adapters.openai_chat import OpenAIChatAdapter
 from snapquiz.config import Config
+from snapquiz.providers import ZHIPU
 from snapquiz.domain.errors import AuthError, NetworkError, RateLimitError
 from snapquiz.transport.tls import (
     FORBIDDEN_TLS_ENVIRONMENT_KEYS,
@@ -74,8 +75,8 @@ class SendOnceTest(unittest.TestCase):
         from snapquiz.transport.client import send_once
 
         self.send_once = send_once
-        self.cfg = Config(region=(0, 0, 640, 480), model="glm-4v-flash")
-        self.prepared = GlmChatAdapter().prepare(config=self.cfg, png=PNG)
+        self.cfg = Config(provider=ZHIPU, model="glm-4v-flash", region=(0, 0, 640, 480))
+        self.prepared = OpenAIChatAdapter().prepare(config=self.cfg, png=PNG)
         for key in FORBIDDEN_TLS_ENVIRONMENT_KEYS:
             if key in os.environ:
                 self.skipTest(f"环境里有 {key}")
@@ -102,7 +103,8 @@ class SendOnceTest(unittest.TestCase):
         with self._with(handler):
             response = self.send_once(
                 self.prepared, api_key="zp-secret",
-                timeout=5, provider_profile_id=PROVIDER_PROFILE_ID,
+                timeout=5, provider_profile_id=ZHIPU.profile_id,
+                error_scheme=ZHIPU.error_scheme,
             )
 
         self.assertEqual(seen["method"], "POST")
@@ -126,7 +128,8 @@ class SendOnceTest(unittest.TestCase):
 
         with self._with(handler), self.assertRaises(AuthError) as ctx:
             self.send_once(self.prepared, api_key="x", timeout=5,
-                           provider_profile_id=PROVIDER_PROFILE_ID)
+                           provider_profile_id=ZHIPU.profile_id,
+                           error_scheme=ZHIPU.error_scheme)
         self.assertNotIn("内部细节", repr(ctx.exception))
 
     def test_rate_limit_retryability_reaches_the_caller(self):
@@ -137,12 +140,14 @@ class SendOnceTest(unittest.TestCase):
 
         with self._with(make("1302")), self.assertRaises(RateLimitError) as transient:
             self.send_once(self.prepared, api_key="x", timeout=5,
-                           provider_profile_id=PROVIDER_PROFILE_ID)
+                           provider_profile_id=ZHIPU.profile_id,
+                           error_scheme=ZHIPU.error_scheme)
         self.assertTrue(transient.exception.retryable)
 
         with self._with(make("1310")), self.assertRaises(RateLimitError) as exhausted:
             self.send_once(self.prepared, api_key="x", timeout=5,
-                           provider_profile_id=PROVIDER_PROFILE_ID)
+                           provider_profile_id=ZHIPU.profile_id,
+                           error_scheme=ZHIPU.error_scheme)
         self.assertFalse(exhausted.exception.retryable)
 
     def test_oversized_response_is_refused(self):
@@ -151,7 +156,8 @@ class SendOnceTest(unittest.TestCase):
 
         with self._with(handler), self.assertRaises(NetworkError):
             self.send_once(self.prepared, api_key="x", timeout=5,
-                           provider_profile_id=PROVIDER_PROFILE_ID)
+                           provider_profile_id=ZHIPU.profile_id,
+                           error_scheme=ZHIPU.error_scheme)
 
     def test_network_error_text_does_not_leak_url_or_headers(self):
         def handler(request):
@@ -159,7 +165,8 @@ class SendOnceTest(unittest.TestCase):
 
         with self._with(handler), self.assertRaises(NetworkError) as ctx:
             self.send_once(self.prepared, api_key="zp-secret", timeout=5,
-                           provider_profile_id=PROVIDER_PROFILE_ID)
+                           provider_profile_id=ZHIPU.profile_id,
+                           error_scheme=ZHIPU.error_scheme)
         self.assertNotIn("zp-secret", repr(ctx.exception))
         self.assertNotIn("bigmodel", repr(ctx.exception))
 
@@ -173,7 +180,8 @@ class SendOnceTest(unittest.TestCase):
         with patch.dict(os.environ, {"SSLKEYLOGFILE": "/tmp/x"}), self._with(handler):
             with self.assertRaises(TlsEnvironmentUnsafe):
                 self.send_once(self.prepared, api_key="x", timeout=5,
-                               provider_profile_id=PROVIDER_PROFILE_ID)
+                               provider_profile_id=ZHIPU.profile_id,
+                               error_scheme=ZHIPU.error_scheme)
         self.assertEqual(called, [], "TLS 环境不安全时不得发出请求")
 
 
