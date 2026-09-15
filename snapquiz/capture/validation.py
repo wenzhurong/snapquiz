@@ -931,12 +931,8 @@ class InputValidator:
             declared_width_px=artifact.width_px,
             declared_height_px=artifact.height_px,
         )
+
         def complete_validation() -> ValidatedCapture:
-            capture_ledger._complete_validation(
-                consumed=consumed,
-                artifact_claim_digest=artifact_claim_digest,
-                _authority=_CAPTURE_VALIDATION_AUTHORITY,
-            )
             validated = ValidatedCapture(
                 artifact=artifact,
                 planned=planned,
@@ -948,6 +944,42 @@ class InputValidator:
                 _authority=_VALIDATED_CAPTURE_AUTHORITY,
             )
             validated.validate_integrity()
+            completion_failure: BaseException | None = None
+            try:
+                capture_ledger._complete_validation(
+                    consumed=consumed,
+                    artifact_claim_digest=artifact_claim_digest,
+                    validated_capture=validated,
+                    validation_digest=validated.validation_digest,
+                    _authority=_CAPTURE_VALIDATION_AUTHORITY,
+                )
+            except BaseException as error:
+                completion_failure = error
+            try:
+                publication_is_exact = (
+                    capture_ledger._validated_capture_is_exact(
+                        consumed=consumed,
+                        validated_capture=validated,
+                        validation_digest=validated.validation_digest,
+                        _authority=_CAPTURE_VALIDATION_AUTHORITY,
+                    )
+                )
+            except BaseException:
+                publication_is_exact = False
+            if (
+                type(publication_is_exact) is not bool
+                or publication_is_exact is not True
+            ):
+                try:
+                    validated.release()
+                except BaseException:
+                    pass
+                if completion_failure is not None:
+                    raise completion_failure from None
+                raise _capture_error(
+                    "input_validation",
+                    "截图校验 lease publication 未提交。",
+                )
             return validated
 
         return PrivacyGate()._run_authorized_action(

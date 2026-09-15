@@ -34,6 +34,7 @@ from snapquiz.runtime.authority import (
     RegistryPolicyAuthorityLedger,
     RegistryPolicyLease,
     _CONTEXT_AUTHORITY,
+    _CONTEXT_CHECKPOINT_AUTHORITY,
 )
 from snapquiz.runtime.clock import (
     ClockSample,
@@ -53,6 +54,9 @@ CANCELLATION_TOKEN_SCHEMA_VERSION = "snapquiz.cancellation-token.v1"
 
 _CALL_FACTORY_AUTHORITY = object()
 _ATTEMPT_BUDGET_AUTHORITY = object()
+_CAPTURE_START_AUTHORITY = object()
+_CONTEXT_RECOVERY_AUTHORITY = object()
+_RESULT_PUBLICATION_AUTHORITY = object()
 _TEST_CLOCK_AUTHORITY = object()
 _CONTEXT_UUID_NAMESPACE = UUID("9136d674-8356-58fb-a70e-bca2d1b303f2")
 _BUDGET_UUID_NAMESPACE = UUID("1740174d-d91a-5a1c-9aeb-02683450d984")
@@ -349,6 +353,11 @@ class CancellationSource:
         if type(reason) is not CancellationReason:
             raise TypeError("reason must be CancellationReason")
         return self._context_ledger.cancel(self._token, reason=reason)
+
+    def is_cancelled(self) -> bool:
+        """Observe cancellation without granting cancellation authority."""
+
+        return self._context_ledger.is_cancelled(self._token)
 
 
 def _context_identifier_payload(
@@ -664,9 +673,12 @@ class _ContextState:
         "context_digest",
         "authorization",
         "planned",
+        "start_owner",
         "budget_counts",
         "operation_billable",
         "cancelled_reason",
+        "capture_started",
+        "result_published",
         "closed",
         "attempt_gate",
         "gate_activities",
@@ -681,11 +693,13 @@ class _ContextState:
         context: CallContext,
         authorization: AuthorizationContext,
         planned: PlannedExecution,
+        start_owner: object,
     ) -> None:
         self.context = context
         self.context_digest = context.context_digest
         self.authorization = authorization
         self.planned = planned
+        self.start_owner = start_owner
         self.budget_counts = {
             budget.budget_id: 0
             for budget in (
@@ -700,6 +714,8 @@ class _ContextState:
             for operation in stage.network_operations
         }
         self.cancelled_reason: CancellationReason | None = None
+        self.capture_started = False
+        self.result_published = False
         self.closed = False
         self.attempt_gate: object | None = None
         self.gate_activities: dict[UUID, object] = {}
@@ -799,12 +815,15 @@ class CallContextLedger:
         self,
         *,
         planned: PlannedExecution,
+        start_owner: object,
         _authority: object | None = None,
     ) -> ClockSample:
         if _authority is not _CALL_FACTORY_AUTHORITY:
             raise TypeError("context start requires RuntimeCallFactory")
         if type(planned) is not PlannedExecution:
             raise TypeError("planned must be PlannedExecution")
+        if start_owner is None:
+            raise TypeError("start_owner must be an identity object")
         try:
             planned.validate_integrity()
         except (TypeError, ValueError, AttributeError):
@@ -817,6 +836,7 @@ class CallContextLedger:
             self._pending_starts[request_id] = (
                 planned.planned_execution_digest,
                 sample,
+                start_owner,
             )
             return sample
 
@@ -825,13 +845,18 @@ class CallContextLedger:
         *,
         planned: PlannedExecution,
         sample: ClockSample,
+        start_owner: object,
         _authority: object | None = None,
     ) -> None:
         if _authority is not _CALL_FACTORY_AUTHORITY:
             raise TypeError("context start cleanup requires RuntimeCallFactory")
         with self._lock:
             pending = self._pending_starts.get(planned.plan.request_id)
-            if pending == (planned.planned_execution_digest, sample):
+            if pending == (
+                planned.planned_execution_digest,
+                sample,
+                start_owner,
+            ):
                 del self._pending_starts[planned.plan.request_id]
 
     def _start_with(
@@ -841,6 +866,7 @@ class CallContextLedger:
         authorization: AuthorizationContext,
         lease: RegistryPolicyLease,
         start_sample: ClockSample,
+        start_owner: object,
         _authority: object | None = None,
     ) -> tuple[CallContext, CancellationSource]:
         if _authority is not _CALL_FACTORY_AUTHORITY:
@@ -852,7 +878,11 @@ class CallContextLedger:
         request_id = planned.plan.request_id
         with self._lock:
             pending = self._pending_starts.get(request_id)
-            if pending != (planned.planned_execution_digest, start_sample):
+            if pending != (
+                planned.planned_execution_digest,
+                start_sample,
+                start_owner,
+            ):
                 raise _runtime_error("CallContext 启动样本不属于当前账本。")
             if request_id in self._contexts:
                 raise _runtime_error("同一请求不能创建第二个 CallContext。")
@@ -965,6 +995,7 @@ class CallContextLedger:
                 context=context,
                 authorization=authorization,
                 planned=planned,
+                start_owner=start_owner,
             )
             source = CancellationSource(
                 token=token,
@@ -972,9 +1003,19 @@ class CallContextLedger:
                 _authority=_CALL_FACTORY_AUTHORITY,
             )
             # Publish only after every fallible value construction succeeds.
-            # The remaining assignments are the minimal start-once commit.
+            # Independently prove both halves of the minimal start-once
+            # commit before returning an authority-bearing context.  A
+            # normal-return no-op mapping must never make an unregistered
+            # context observable to the caller.
             self._contexts[request_id] = state
+            if self._contexts.get(request_id) is not state:
+                raise _runtime_error("CallContext publication 未提交。")
             del self._pending_starts[request_id]
+            if (
+                self._contexts.get(request_id) is not state
+                or self._pending_starts.get(request_id) is not None
+            ):
+                raise _runtime_error("CallContext 启动记账未完整提交。")
             object.__setattr__(self, "_revision", self._revision + 1)
             return context, source
 
@@ -1038,6 +1079,364 @@ class CallContextLedger:
                 raise _runtime_error("CallContext 不存在。")
             self._require_context_locked(state.context)
             return state.context
+
+    def _recover_context_for_cleanup(
+        self,
+        *,
+        request_id: UUID,
+        planned_execution_digest: Digest256,
+        start_owner: object,
+        _authority: object | None = None,
+    ) -> CallContext | None:
+        """Recover only the context/pending start owned by one W10 run.
+
+        ``_start_with`` publishes the context before it deletes the pending
+        start.  An asynchronous interruption can therefore leave both entries
+        present.  Treat that combination as one recoverable partial commit and
+        remove only the pending entry carrying the same exact owner.
+
+        The return value is deliberately not a terminality proof.  Cleanup
+        callers must confirm it with :meth:`_context_recovery_is_exact`; this
+        keeps a normal-return no-op wrapper from hiding a live context or
+        pending start.
+        """
+
+        if _authority is not _CONTEXT_RECOVERY_AUTHORITY:
+            raise TypeError("context recovery requires the W10 executor")
+        require_uuid(request_id, "request_id")
+        require_digest(planned_execution_digest, "planned_execution_digest")
+        if start_owner is None:
+            raise TypeError("start_owner must be an identity object")
+        with self._lock:
+            state = self._contexts.get(request_id)
+            pending = self._pending_starts.get(request_id)
+            pending_is_owned = (
+                type(pending) is tuple
+                and len(pending) == 3
+                and pending[0] == planned_execution_digest
+                and pending[2] is start_owner
+            )
+            if state is not None:
+                if (
+                    state.start_owner is start_owner
+                    and state.context.planned_execution_digest
+                    == planned_execution_digest
+                ):
+                    self._require_context_locked(state.context)
+                    if pending is not None:
+                        if not pending_is_owned:
+                            raise _runtime_error(
+                                "CallContext 恢复 owner 与 pending start 冲突。"
+                            )
+                        del self._pending_starts[request_id]
+                        object.__setattr__(self, "_revision", self._revision + 1)
+                    return state.context
+                return None
+            if pending_is_owned:
+                del self._pending_starts[request_id]
+            return None
+
+    def _context_recovery_is_exact(
+        self,
+        *,
+        request_id: UUID,
+        planned_execution_digest: Digest256,
+        start_owner: object,
+        expected_context: CallContext | None,
+        _authority: object | None = None,
+    ) -> bool:
+        """Independently observe one W10 start owner's recovery postcondition.
+
+        ``True`` means that the observed ledger state exactly matches the
+        recovery result.  For a ``None`` result the proof is owner-scoped: a
+        valid state or pending start owned by another run may share the same
+        request id, but no entry may belong to ``start_owner``.  This method
+        is non-authorizing and never mutates either map.
+        """
+
+        if _authority is not _CONTEXT_RECOVERY_AUTHORITY:
+            raise TypeError(
+                "context recovery observation requires the W10 executor"
+            )
+        require_uuid(request_id, "request_id")
+        require_digest(planned_execution_digest, "planned_execution_digest")
+        if start_owner is None:
+            raise TypeError("start_owner must be an identity object")
+        if (
+            expected_context is not None
+            and type(expected_context) is not CallContext
+        ):
+            raise TypeError("expected_context must be CallContext or None")
+        with self._lock:
+            state = self._contexts.get(request_id)
+            pending = self._pending_starts.get(request_id)
+            if expected_context is None:
+                if state is not None:
+                    if type(state) is not _ContextState:
+                        return False
+                    try:
+                        observed_state = self._require_context_locked(
+                            state.context
+                        )
+                    except (
+                        TypeError,
+                        ValueError,
+                        AttributeError,
+                        EndpointPolicyError,
+                    ):
+                        return False
+                    if observed_state is not state or state.start_owner is None:
+                        return False
+                    if state.start_owner is start_owner:
+                        return False
+                if pending is not None:
+                    if type(pending) is not tuple or len(pending) != 3:
+                        return False
+                    try:
+                        require_digest(pending[0], "pending_start_digest")
+                        if type(pending[1]) is not ClockSample:
+                            return False
+                        pending[1].validate_integrity()
+                    except (TypeError, ValueError, AttributeError):
+                        return False
+                    if pending[2] is None or pending[2] is start_owner:
+                        return False
+                    if state is not None and (
+                        pending[0]
+                        != state.context.planned_execution_digest
+                        or pending[2] is not state.start_owner
+                    ):
+                        return False
+                return True
+            if pending is not None:
+                return False
+            if state is None:
+                return False
+            try:
+                self._require_context_locked(expected_context)
+            except (TypeError, ValueError, AttributeError, EndpointPolicyError):
+                return False
+            return (
+                state.context is expected_context
+                and state.start_owner is start_owner
+                and state.context.planned_execution_digest
+                == planned_execution_digest
+            )
+
+    def _context_start_result_is_exact(
+        self,
+        *,
+        request_id: UUID,
+        planned_execution_digest: Digest256,
+        start_owner: object,
+        authorization: AuthorizationContext,
+        context: CallContext,
+        source: CancellationSource,
+        _authority: object | None = None,
+    ) -> bool:
+        """Observe the exact authority tuple returned by RuntimeCallFactory."""
+
+        if _authority is not _CONTEXT_RECOVERY_AUTHORITY:
+            raise TypeError("context start observation requires W10")
+        require_uuid(request_id, "request_id")
+        require_digest(planned_execution_digest, "planned_execution_digest")
+        if start_owner is None:
+            raise TypeError("start_owner must be an identity object")
+        if type(authorization) is not AuthorizationContext:
+            return False
+        if type(context) is not CallContext:
+            return False
+        if type(source) is not CancellationSource:
+            return False
+        with self._lock:
+            state = self._contexts.get(request_id)
+            if state is None or self._pending_starts.get(request_id) is not None:
+                return False
+            try:
+                self._require_context_locked(context)
+            except (TypeError, ValueError, AttributeError, EndpointPolicyError):
+                return False
+            return (
+                state.context is context
+                and state.authorization is authorization
+                and state.start_owner is start_owner
+                and state.context.planned_execution_digest
+                == planned_execution_digest
+                and context.request_id == request_id
+                and context._context_ledger is self
+                and source._context_ledger is self
+                and source._token is context.cancellation_token
+            )
+
+    def is_closed(self, context: CallContext) -> bool:
+        """Return exact ledger-owned terminal state for one context.
+
+        This observation is intentionally non-authorizing.  Cleanup owners use
+        it to distinguish a committed close (including commit-then-raise) from
+        a normal-return no-op or an interrupted close.
+        """
+
+        with self._lock:
+            state = self._require_context_locked(context)
+            return state.closed
+
+    def sample_active(self, context: CallContext) -> ClockSample:
+        """Return one trusted clock sample while requiring an active request.
+
+        W10 uses this non-authorizing checkpoint before and after capture/UI
+        boundaries.  It grants no attempt, credential, capture, or egress
+        authority; those remain owned by their dedicated ledgers and gates.
+        """
+
+        if type(context) is not CallContext:
+            raise TypeError("context must be CallContext")
+        lease = context.registry_policy_lease
+        planned = lease._planned_execution
+
+        def under_authority() -> ClockSample:
+            with self._lock:
+                state = self._require_context_locked(context)
+                sample = self._sample_locked()
+                if state.closed:
+                    raise _runtime_error("CallContext 已经终结。")
+                if state.cancelled_reason is not None:
+                    raise _cancelled_error()
+                if (
+                    sample.monotonic_after_ns
+                    >= context.runtime_deadline.deadline_monotonic_ns
+                ):
+                    raise _timeout_error()
+                return sample
+
+        return self._authority_ledger._run_context_checkpoint(
+            lease=lease,
+            planned=planned,
+            action=under_authority,
+            _authority=_CONTEXT_CHECKPOINT_AUTHORITY,
+        )
+
+    def _claim_capture_start(
+        self,
+        context: CallContext,
+        *,
+        _authority: object | None = None,
+    ) -> ClockSample:
+        """Linearize the one allowed capture against cancellation/deadline.
+
+        This is only a runtime race fence; CapturePolicy remains the owner of
+        permission, topology and consent authority.  If this claim commits
+        first, a later cancellation cannot retroactively revoke the one capture
+        already entering its synchronous start path.  Every post-capture use is
+        still blocked by the next active-context checkpoint.
+        """
+
+        if _authority is not _CAPTURE_START_AUTHORITY:
+            raise TypeError("capture start claims require the W10 executor")
+        if type(context) is not CallContext:
+            raise TypeError("context must be CallContext")
+        lease = context.registry_policy_lease
+        planned = lease._planned_execution
+
+        def under_authority() -> ClockSample:
+            with self._lock:
+                state = self._require_context_locked(context)
+                sample = self._sample_locked()
+                if state.closed:
+                    raise _runtime_error("CallContext 已经终结。")
+                if state.cancelled_reason is not None:
+                    raise _cancelled_error()
+                if (
+                    sample.monotonic_after_ns
+                    >= context.runtime_deadline.deadline_monotonic_ns
+                ):
+                    raise _timeout_error()
+                if state.capture_started:
+                    raise _runtime_error("同一 CallContext 不能开始第二次截图。")
+                state.capture_started = True
+                object.__setattr__(self, "_revision", self._revision + 1)
+                return sample
+
+        return self._authority_ledger._run_context_checkpoint(
+            lease=lease,
+            planned=planned,
+            action=under_authority,
+            _authority=_CONTEXT_CHECKPOINT_AUTHORITY,
+        )
+
+    def _capture_start_is_claimed(
+        self,
+        context: CallContext,
+        *,
+        _authority: object | None = None,
+    ) -> bool:
+        """Observe the exact capture-start commit without granting authority."""
+
+        if _authority is not _CAPTURE_START_AUTHORITY:
+            raise TypeError("capture start observation requires the W10 executor")
+        with self._lock:
+            state = self._require_context_locked(context)
+            return (
+                type(state.capture_started) is bool
+                and state.capture_started is True
+            )
+
+    def _claim_result_publication(
+        self,
+        context: CallContext,
+        *,
+        _authority: object | None = None,
+    ) -> ClockSample:
+        """Linearize final result delivery against stop-policy changes."""
+
+        if _authority is not _RESULT_PUBLICATION_AUTHORITY:
+            raise TypeError("result publication requires the W10 executor")
+        if type(context) is not CallContext:
+            raise TypeError("context must be CallContext")
+        lease = context.registry_policy_lease
+        planned = lease._planned_execution
+
+        def under_authority() -> ClockSample:
+            with self._lock:
+                state = self._require_context_locked(context)
+                sample = self._sample_locked()
+                if state.closed:
+                    raise _runtime_error("CallContext 已经终结。")
+                if state.cancelled_reason is not None:
+                    raise _cancelled_error()
+                if (
+                    sample.monotonic_after_ns
+                    >= context.runtime_deadline.deadline_monotonic_ns
+                ):
+                    raise _timeout_error()
+                if state.result_published:
+                    raise _runtime_error("同一 CallContext 不能发布第二个结果。")
+                state.result_published = True
+                object.__setattr__(self, "_revision", self._revision + 1)
+                return sample
+
+        return self._authority_ledger._run_context_checkpoint(
+            lease=lease,
+            planned=planned,
+            action=under_authority,
+            _authority=_CONTEXT_CHECKPOINT_AUTHORITY,
+        )
+
+    def _result_publication_is_claimed(
+        self,
+        context: CallContext,
+        *,
+        _authority: object | None = None,
+    ) -> bool:
+        """Observe the exact result-publication commit without authorizing it."""
+
+        if _authority is not _RESULT_PUBLICATION_AUTHORITY:
+            raise TypeError("result observation requires the W10 executor")
+        with self._lock:
+            state = self._require_context_locked(context)
+            return (
+                type(state.result_published) is bool
+                and state.result_published is True
+            )
 
     def snapshot_budget(self, budget: AtomicBudget) -> BudgetSnapshot:
         if type(budget) is not AtomicBudget:
@@ -1491,6 +1890,25 @@ class CallContextLedger:
             state.gate_activities[activity_id] = attempt_gate
             object.__setattr__(self, "_revision", self._revision + 1)
 
+    def _gate_activity_is_exact(
+        self,
+        *,
+        context: CallContext,
+        attempt_gate: object,
+        activity_id: UUID,
+        _authority: object | None = None,
+    ) -> bool:
+        """Observe an exact Context-to-Gate activity without authorizing it."""
+
+        if _authority is not _ATTEMPT_BUDGET_AUTHORITY:
+            raise TypeError("gate activity observation requires AttemptGate")
+        if attempt_gate is None:
+            raise TypeError("attempt_gate must be an exact object")
+        require_uuid(activity_id, "activity_id")
+        with self._lock:
+            state = self._require_context_locked(context)
+            return state.gate_activities.get(activity_id) is attempt_gate
+
     def _discard_gate_activity(
         self,
         *,
@@ -1666,6 +2084,8 @@ class RuntimeCallFactory:
         consent_grant_ids: tuple[UUID, ...],
         authority_ledger: RegistryPolicyAuthorityLedger,
         context_ledger: CallContextLedger,
+        _start_owner: object | None = None,
+        _authority: object | None = None,
     ) -> tuple[AuthorizationContext, CallContext, CancellationSource]:
         if type(consent_ledger) is not ConsentLedger:
             raise TypeError("consent_ledger must be ConsentLedger")
@@ -1677,8 +2097,15 @@ class RuntimeCallFactory:
             raise TypeError("context_ledger must be CallContextLedger")
         if context_ledger._authority_ledger is not authority_ledger:
             raise _runtime_error("CallContext 与 Registry authority 不匹配。")
+        if _start_owner is None:
+            start_owner = object()
+        else:
+            if _authority is not _CONTEXT_RECOVERY_AUTHORITY:
+                raise TypeError("preheld context owners require W10 authority")
+            start_owner = _start_owner
         start_sample = context_ledger._begin_start(
             planned=planned,
+            start_owner=start_owner,
             _authority=_CALL_FACTORY_AUTHORITY,
         )
         try:
@@ -1701,6 +2128,7 @@ class RuntimeCallFactory:
                         authorization=authorization,
                         lease=lease,
                         start_sample=start_sample,
+                        start_owner=start_owner,
                         _authority=_CALL_FACTORY_AUTHORITY,
                     ),
                     _authority=_CONTEXT_AUTHORITY,
@@ -1719,6 +2147,7 @@ class RuntimeCallFactory:
             context_ledger._abandon_start(
                 planned=planned,
                 sample=start_sample,
+                start_owner=start_owner,
                 _authority=_CALL_FACTORY_AUTHORITY,
             )
 

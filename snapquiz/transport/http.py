@@ -624,6 +624,47 @@ class _ResolverCoordinationRecoveryLedger:
                 and not self._resources_terminal_proven
             )
 
+    def prepared_owner_is_exact_for_ticket(
+        self,
+        ticket: "ResolverCleanupTicket",
+        prepared: "PreparedResolverAttempt",
+        *,
+        launcher: ResolverHelperLauncher,
+        credential_resolver: CredentialResolver,
+        gate: AttemptGate,
+        credential_permit: CredentialResolutionPermit,
+    ) -> bool:
+        """Observe the exact caller-owned, never-consumed publication.
+
+        This is the hand-off fence between the coordinator and its caller.  A
+        normal-return wrapper may substitute another valid Prepared object;
+        the caller must prove that the returned object is the one anchored by
+        its pre-issued cleanup ticket before adopting it or invoking
+        Transport.
+        """
+
+        with self._lock:
+            return (
+                self._ticket is ticket
+                and ticket._ledger_snapshot is self
+                and self._state == "recoverable"
+                and self._prepared_published
+                and self._prepared is prepared
+                and self._launcher is launcher
+                and self._credential_resolver is credential_resolver
+                and self._gate is gate
+                and self._credential_permit is credential_permit
+                and prepared._recovery_ledger_snapshot is self
+                and prepared._gate is gate
+                and prepared._credential_resolver is credential_resolver
+                and prepared._attempt_permit_snapshot is self._attempt
+                and prepared._credential_permit_snapshot
+                is credential_permit
+                and self._transport_owner is None
+                and not self._transport_consumed
+                and not self._resources_terminal_proven
+            )
+
     def prepared_cleanup_is_recoverable(
         self,
         prepared: "PreparedResolverAttempt",
@@ -1157,6 +1198,89 @@ class ResolverCleanupTicket:
 
     def retry_cleanup(self) -> bool:
         return self._ledger_snapshot.retry_cleanup(self)
+
+    def _prepared_is_exact_for_caller(
+        self,
+        prepared: "PreparedResolverAttempt",
+        *,
+        launcher: ResolverHelperLauncher,
+        credential_resolver: CredentialResolver,
+        gate: AttemptGate,
+        credential_permit: CredentialResolutionPermit,
+        context_id: UUID,
+        session_id: UUID,
+        operation_id: UUID,
+        request_envelope_digest: Digest256,
+    ) -> bool:
+        """Fail-closed observer for the coordinator's returned owner."""
+
+        if (
+            type(prepared) is not PreparedResolverAttempt
+            or type(launcher) is not ResolverHelperLauncher
+            or type(credential_resolver) is not CredentialResolver
+            or type(gate) is not AttemptGate
+            or type(credential_permit) is not CredentialResolutionPermit
+            or type(context_id) is not UUID
+            or type(session_id) is not UUID
+            or type(operation_id) is not UUID
+            or type(request_envelope_digest) is not Digest256
+        ):
+            return False
+        try:
+            attempt = prepared.attempt_permit
+            credential_handle = prepared.credential_handle
+            result_receipt = prepared.result_receipt
+            resolution_set = prepared.resolution_set
+            outbound = credential_permit._prepared
+            credential_permit.validate_integrity()
+            attempt.validate_integrity()
+            credential_handle.validate_integrity()
+            result_receipt._validate_exact_issuance(
+                _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
+            )
+            resolution_set.validate_binding(attempt, result_receipt)
+            if type(outbound) is not PreparedOutbound:
+                return False
+            outbound.validate_integrity()
+        except BaseException:
+            return False
+        if (
+            prepared._attempt_permit_snapshot is not attempt
+            or prepared._credential_permit_snapshot is not credential_permit
+            or prepared._credential_handle_snapshot is not credential_handle
+            or prepared._result_receipt_snapshot is not result_receipt
+            or prepared._resolution_set_snapshot is not resolution_set
+            or attempt._attempt_gate is not gate
+            or attempt._credential_permit is not credential_permit
+            or attempt._released is not False
+            or credential_permit._attempt_gate is not gate
+            or credential_permit._released is not False
+            or attempt.credential_permit_id != credential_permit.permit_id
+            or attempt.credential_permit_digest
+            != credential_permit.permit_digest
+            or attempt.context_id != context_id
+            or credential_permit.context_id != context_id
+            or attempt.session_id != session_id
+            or credential_permit.session_id != session_id
+            or attempt.operation_id != operation_id
+            or attempt.request_envelope_digest != request_envelope_digest
+            or credential_permit.request_envelope_digest
+            != request_envelope_digest
+            or outbound.operation_id != operation_id
+            or outbound.request_envelope_digest != request_envelope_digest
+        ):
+            return False
+        try:
+            return self._ledger_snapshot.prepared_owner_is_exact_for_ticket(
+                self,
+                prepared,
+                launcher=launcher,
+                credential_resolver=credential_resolver,
+                gate=gate,
+                credential_permit=credential_permit,
+            )
+        except BaseException:
+            return False
 
 
 def issue_resolver_cleanup_ticket() -> ResolverCleanupTicket:

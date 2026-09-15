@@ -14,6 +14,7 @@ from unittest.mock import patch
 from snapquiz.domain.digest import Digest256
 from snapquiz.domain.errors import EndpointPolicyError
 from snapquiz.privacy.egress import EgressApprovalLedger
+import snapquiz.transport.session as session_module
 from snapquiz.transport.session import (
     AUTHORIZED_SEND_SESSION_SCHEMA_VERSION,
     SEND_SESSION_POLICY_VERSION,
@@ -27,6 +28,28 @@ from tests.w08_helpers import make_w08_authorities
 
 
 SESSION_ISSUED_AT = NOW + timedelta(seconds=5)
+
+
+class _NoOpSetMap(dict):
+    def __setitem__(self, key, value):
+        del key, value
+
+
+class _SetThenRaiseMap(dict):
+    def __init__(self, source):
+        super().__init__(source)
+        self.armed = True
+
+    def __setitem__(self, key, value):
+        super().__setitem__(key, value)
+        if self.armed:
+            self.armed = False
+            raise RuntimeError("synthetic lifecycle publication failure")
+
+
+class _SetThenRaiseNoDeleteMap(_SetThenRaiseMap):
+    def __delitem__(self, key):
+        del key
 
 
 def _create_session(authorities, *, ledger=None, now=SESSION_ISSUED_AT):
@@ -46,6 +69,122 @@ def _create_session(authorities, *, ledger=None, now=SESSION_ISSUED_AT):
 
 
 class W08StaticSendSessionTest(unittest.TestCase):
+    def test_session_publish_normal_noop_rolls_back_without_orphan(self):
+        authorities = make_w08_authorities()
+        session_ledger = SendSessionLedger()
+        object.__setattr__(
+            session_ledger,
+            "_sessions",
+            _NoOpSetMap(session_ledger._sessions),
+        )
+
+        with self.assertRaises(EndpointPolicyError):
+            _create_session(authorities, ledger=session_ledger)
+
+        self.assertEqual(session_ledger.safe_metadata()["session_count"], 0)
+        self.assertFalse(session_ledger.safe_metadata()["poisoned"])
+
+    def test_unprovable_session_rollback_poisons_all_public_authority(self):
+        authorities = make_w08_authorities()
+        session_ledger = SendSessionLedger()
+        object.__setattr__(
+            session_ledger,
+            "_sessions",
+            _SetThenRaiseNoDeleteMap(session_ledger._sessions),
+        )
+
+        with self.assertRaises(EndpointPolicyError):
+            _create_session(authorities, ledger=session_ledger)
+
+        metadata = session_ledger.safe_metadata()
+        self.assertTrue(metadata["poisoned"])
+        self.assertEqual(metadata["session_count"], 1)
+        orphan = next(iter(session_ledger._sessions.values()))
+        with self.assertRaises(EndpointPolicyError):
+            session_ledger.snapshot(orphan.session_id)
+        with self.assertRaises(EndpointPolicyError):
+            session_ledger.validate_active(orphan, now=SESSION_ISSUED_AT)
+        with self.assertRaises(EndpointPolicyError):
+            session_ledger.revoke(
+                session_id=orphan.session_id,
+                revoked_at=SESSION_ISSUED_AT + timedelta(seconds=1),
+            )
+
+    def test_consumption_mapping_faults_poison_before_session_action(self):
+        for mapping_type in (_NoOpSetMap, _SetThenRaiseMap):
+            for attribute in ("_approvals", "_current_digests"):
+                with self.subTest(
+                    mapping=mapping_type.__name__,
+                    attribute=attribute,
+                ):
+                    authorities = make_w08_authorities()
+                    approval_ledger = authorities.approval_ledger
+                    object.__setattr__(
+                        approval_ledger,
+                        attribute,
+                        mapping_type(getattr(approval_ledger, attribute)),
+                    )
+                    session_ledger = SendSessionLedger()
+
+                    with self.assertRaises(EndpointPolicyError) as raised:
+                        _create_session(authorities, ledger=session_ledger)
+
+                    self.assertEqual(
+                        raised.exception.stage,
+                        "send_session_factory",
+                    )
+                    self.assertTrue(
+                        approval_ledger.safe_metadata()["poisoned"]
+                    )
+                    self.assertEqual(
+                        session_ledger.safe_metadata()["session_count"],
+                        0,
+                    )
+                    with self.assertRaises(EndpointPolicyError):
+                        approval_ledger.snapshot(
+                            authorities.approval.approval_id
+                        )
+
+    def test_full_subject_is_rechecked_inside_approval_lock(self):
+        authorities = make_w08_authorities()
+        session_ledger = SendSessionLedger()
+        original_validate = session_module._validate_exact_egress_binding
+
+        def validate_then_mutate(**kwargs):
+            result = original_validate(**kwargs)
+            object.__setattr__(
+                authorities.planned,
+                "solve_intent_digest",
+                Digest256("e" * 64),
+            )
+            return result
+
+        with (
+            patch.object(
+                session_module,
+                "_validate_exact_egress_binding",
+                validate_then_mutate,
+            ),
+            self.assertRaises(EndpointPolicyError),
+        ):
+            _create_session(authorities, ledger=session_ledger)
+
+        self.assertEqual(session_ledger.safe_metadata()["session_count"], 0)
+        self.assertIsNone(authorities.approval.consumed_at)
+
+    def test_attestation_tamper_blocks_session_before_approval_consumption(self):
+        authorities = make_w08_authorities()
+        authorities.approval_ledger._issued_attestation_digests[
+            authorities.approval.approval_id
+        ] = Digest256("f" * 64)
+        session_ledger = SendSessionLedger()
+
+        with self.assertRaises(EndpointPolicyError):
+            _create_session(authorities, ledger=session_ledger)
+
+        self.assertEqual(session_ledger.safe_metadata()["session_count"], 0)
+        self.assertIsNone(authorities.approval.consumed_at)
+
     def test_exact_static_session_binding_and_golden(self):
         authorities = make_w08_authorities()
         session, ledger = _create_session(authorities)

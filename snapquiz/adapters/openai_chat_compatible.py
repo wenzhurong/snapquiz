@@ -12,6 +12,7 @@ import math
 from typing import Any
 from uuid import UUID
 
+from snapquiz.adapters.base import DirectMultimodalAdapter
 from snapquiz.adapters.prompt import (
     PROMPT_POLICY_DIGEST,
     SYSTEM_INSTRUCTION,
@@ -434,10 +435,13 @@ def _map_provider_error(
 
 
 @runtime_final
-class OpenAIChatCompatibleAdapter:
+class OpenAIChatCompatibleAdapter(DirectMultimodalAdapter):
     """Stateless exact Adapter for the built-in GLM binding."""
 
     __slots__ = ()
+
+    adapter_family = GLM_ADAPTER_FAMILY
+    adapter_version = GLM_ADAPTER_VERSION
 
     @staticmethod
     def prepare(

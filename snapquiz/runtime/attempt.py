@@ -76,6 +76,8 @@ HELPER_WAIT_QUANTUM_NS = 50_000_000
 
 _PERMIT_FACTORY_AUTHORITY = object()
 _PERMIT_RELEASE_AUTHORITY = object()
+_CREDENTIAL_PERMIT_PUBLICATION_AUTHORITY = object()
+_CREDENTIAL_PERMIT_RECOVERY_AUTHORITY = object()
 _CREDENTIAL_RESOLVER_AUTHORITY = object()
 _TRANSPORT_ATTEMPT_AUTHORITY = object()
 _HELPER_STOP_FACTORY_AUTHORITY = object()
@@ -1825,6 +1827,11 @@ class AttemptGate:
                 approval_terms_digest=session.approval_terms_digest,
                 consumed_approval_digest=session.consumed_approval_digest,
                 consumed_at=session.issued_at,
+                planned=planned,
+                invocation=invocation,
+                prepared=prepared,
+                authorization=authorization,
+                planned_stage=stage,
                 now=initial_now,
                 action=under_approval,
                 _authority=_EGRESS_ATTEMPT_AUTHORITY,
@@ -1853,7 +1860,25 @@ class AttemptGate:
         authority_ledger: RegistryPolicyAuthorityLedger,
         context: CallContext,
         context_ledger: CallContextLedger,
+        _publication: (
+            Callable[[CredentialResolutionPermit], CredentialResolutionPermit]
+            | None
+        ) = None,
+        _publication_is_current: (
+            Callable[[CredentialResolutionPermit], bool] | None
+        ) = None,
+        _authority: object | None = None,
     ) -> CredentialResolutionPermit:
+        if _publication is not None:
+            if _authority is not _CREDENTIAL_PERMIT_PUBLICATION_AUTHORITY:
+                raise TypeError("credential publication requires W10 authority")
+            if not callable(_publication):
+                raise TypeError("credential publication must be callable")
+            if not callable(_publication_is_current):
+                raise TypeError("credential publication observer must be callable")
+        elif _publication_is_current is not None:
+            raise TypeError("credential publication observer has no publisher")
+
         def issue(
             stage: ExecutionPlanStage,
             operation: ExecutionPlanNetworkOperation,
@@ -1888,32 +1913,69 @@ class AttemptGate:
                 attempt_gate=self,
                 _authority=_PERMIT_FACTORY_AUTHORITY,
             )
-            context_ledger._register_gate_activity(
-                context=context,
-                attempt_gate=self,
-                activity_id=permit.permit_id,
-                _authority=_ATTEMPT_BUDGET_AUTHORITY,
-            )
-            try:
-                with self._lock:
-                    if session.session_id in self._active_by_session:
-                        raise _attempt_error("当前发送会话已有凭据解析授权。")
-                    self._credential_permits[permit.permit_id] = (
-                        _CredentialPermitState(permit)
+            if _publication is not None:
+                try:
+                    published = _publication(permit)
+                    publication_observation = _publication_is_current(permit)
+                    publication_is_current = (
+                        type(publication_observation) is bool
+                        and publication_observation is True
                     )
-                    self._active_by_session[session.session_id] = permit.permit_id
-                    return permit
-            except BaseException:
-                context_ledger._discard_gate_activity(
+                except BaseException:
+                    permit._release_authority_refs(
+                        _authority=_PERMIT_RELEASE_AUTHORITY,
+                    )
+                    raise
+                if published is not permit or not publication_is_current:
+                    permit._release_authority_refs(
+                        _authority=_PERMIT_RELEASE_AUTHORITY,
+                    )
+                    raise _attempt_error(
+                        "凭据授权 publication 未在 caller owner 提交。"
+                    )
+            permit_state = _CredentialPermitState(permit)
+            try:
+                context_ledger._register_gate_activity(
                     context=context,
                     attempt_gate=self,
                     activity_id=permit.permit_id,
                     _authority=_ATTEMPT_BUDGET_AUTHORITY,
                 )
-                permit._release_authority_refs(
-                    _authority=_PERMIT_RELEASE_AUTHORITY,
+                with self._lock:
+                    if session.session_id in self._active_by_session:
+                        raise _attempt_error("当前发送会话已有凭据解析授权。")
+                    self._credential_permits[permit.permit_id] = permit_state
+                    self._active_by_session[session.session_id] = permit.permit_id
+                committed = self._published_credential_permit_is_exact(
+                    permit,
+                    context=context,
+                    context_ledger=context_ledger,
                 )
+                if type(committed) is not bool or committed is not True:
+                    raise _attempt_error(
+                        "凭据授权 publication transaction 未提交。"
+                    )
+                if _publication_is_current is not None:
+                    caller_observation = _publication_is_current(permit)
+                    if (
+                        type(caller_observation) is not bool
+                        or caller_observation is not True
+                    ):
+                        raise _attempt_error(
+                            "凭据授权 caller owner 在提交后发生变化。"
+                        )
+            except BaseException:
+                try:
+                    self._recover_published_credential_permit_for_cleanup(
+                        permit,
+                        context=context,
+                        context_ledger=context_ledger,
+                        _authority=_CREDENTIAL_PERMIT_RECOVERY_AUTHORITY,
+                    )
+                except BaseException:
+                    pass
                 raise
+            return permit
 
         return self._run_authority_path(
             planned=planned,
@@ -1928,6 +1990,267 @@ class AttemptGate:
             context=context,
             context_ledger=context_ledger,
             final_action=issue,
+        )
+
+    def _published_credential_permit_is_exact(
+        self,
+        permit: CredentialResolutionPermit,
+        *,
+        context: CallContext,
+        context_ledger: CallContextLedger,
+    ) -> bool:
+        """Observe the exact three-part credential publication commit."""
+
+        if (
+            type(permit) is not CredentialResolutionPermit
+            or type(context) is not CallContext
+            or type(context_ledger) is not CallContextLedger
+            or permit._attempt_gate is not self
+            or context._context_ledger is not context_ledger
+            or permit.context_id != context.context_id
+            or permit.gate_id != self._gate_id
+        ):
+            return False
+        try:
+            permit.validate_integrity()
+            activity_is_exact = context_ledger._gate_activity_is_exact(
+                context=context,
+                attempt_gate=self,
+                activity_id=permit.permit_id,
+                _authority=_ATTEMPT_BUDGET_AUTHORITY,
+            )
+        except (TypeError, ValueError, AttributeError, EndpointPolicyError):
+            return False
+        if type(activity_is_exact) is not bool or activity_is_exact is not True:
+            return False
+        with self._lock:
+            state = self._credential_permits.get(permit.permit_id)
+            return (
+                type(state) is _CredentialPermitState
+                and state.permit is permit
+                and state.permit_id == permit.permit_id
+                and state.session_id == permit.session_id
+                and state.context is context
+                and state.context_ledger is context_ledger
+                and state.status == "authorized"
+                and self._active_by_session.get(permit.session_id)
+                == permit.permit_id
+                and sum(
+                    candidate.permit is permit
+                    for candidate in self._credential_permits.values()
+                )
+                == 1
+                and sum(
+                    active_id == permit.permit_id
+                    for active_id in self._active_by_session.values()
+                )
+                == 1
+            )
+
+    def _published_credential_cleanup_is_exact(
+        self,
+        permit: CredentialResolutionPermit,
+        *,
+        context: CallContext,
+        context_ledger: CallContextLedger,
+        _authority: object | None = None,
+    ) -> bool:
+        """Independently prove a caller-published permit is terminal."""
+
+        if _authority is not _CREDENTIAL_PERMIT_RECOVERY_AUTHORITY:
+            raise TypeError("credential cleanup observation requires W10 authority")
+        if (
+            type(permit) is not CredentialResolutionPermit
+            or type(context) is not CallContext
+            or type(context_ledger) is not CallContextLedger
+            or permit._attempt_gate is not self
+            or context._context_ledger is not context_ledger
+            or permit.context_id != context.context_id
+            or permit.gate_id != self._gate_id
+        ):
+            return False
+        try:
+            permit.validate_integrity()
+            activity_is_exact = context_ledger._gate_activity_is_exact(
+                context=context,
+                attempt_gate=self,
+                activity_id=permit.permit_id,
+                _authority=_ATTEMPT_BUDGET_AUTHORITY,
+            )
+        except (TypeError, ValueError, AttributeError, EndpointPolicyError):
+            return False
+        if type(activity_is_exact) is not bool or activity_is_exact is not False:
+            return False
+        with self._lock:
+            state = self._credential_permits.get(permit.permit_id)
+            aliases = tuple(
+                key
+                for key, candidate in self._credential_permits.items()
+                if candidate.permit is permit
+            )
+            if aliases not in ((), (permit.permit_id,)):
+                return False
+            if any(
+                active_id == permit.permit_id
+                for active_id in self._active_by_session.values()
+            ):
+                return False
+            state_is_terminal = state is None or (
+                type(state) is _CredentialPermitState
+                and state.permit is permit
+                and state.permit_id == permit.permit_id
+                and state.session_id == permit.session_id
+                and state.status in ("abandoned", "finished")
+                and state.recovery_refs() == (None, None)
+            )
+            return (
+                state_is_terminal
+                and self._credential_permit_refs_are_released(permit)
+            )
+
+    def _recover_published_credential_permit_for_cleanup(
+        self,
+        permit: CredentialResolutionPermit,
+        *,
+        context: CallContext,
+        context_ledger: CallContextLedger,
+        _authority: object | None = None,
+    ) -> bool:
+        """Normalize any interrupted W10 credential publication transaction."""
+
+        if _authority is not _CREDENTIAL_PERMIT_RECOVERY_AUTHORITY:
+            raise TypeError("credential cleanup recovery requires W10 authority")
+        if (
+            type(permit) is not CredentialResolutionPermit
+            or type(context) is not CallContext
+            or type(context_ledger) is not CallContextLedger
+            or permit._attempt_gate is not self
+            or context._context_ledger is not context_ledger
+            or permit.context_id != context.context_id
+            or permit.gate_id != self._gate_id
+        ):
+            return False
+        cleanup_observation = self._published_credential_cleanup_is_exact(
+            permit,
+            context=context,
+            context_ledger=context_ledger,
+            _authority=_CREDENTIAL_PERMIT_RECOVERY_AUTHORITY,
+        )
+        if (
+            type(cleanup_observation) is bool
+            and cleanup_observation is True
+        ):
+            return True
+
+        publication_observation = self._published_credential_permit_is_exact(
+            permit,
+            context=context,
+            context_ledger=context_ledger,
+        )
+        if (
+            type(publication_observation) is bool
+            and publication_observation is True
+        ):
+            try:
+                self.abandon_credential_resolution(permit)
+            except BaseException:
+                pass
+            cleanup_observation = self._published_credential_cleanup_is_exact(
+                permit,
+                context=context,
+                context_ledger=context_ledger,
+                _authority=_CREDENTIAL_PERMIT_RECOVERY_AUTHORITY,
+            )
+            if (
+                type(cleanup_observation) is bool
+                and cleanup_observation is True
+            ):
+                return True
+
+        with self._lock:
+            state = self._credential_permits.get(permit.permit_id)
+            aliases = tuple(
+                key
+                for key, candidate in self._credential_permits.items()
+                if candidate.permit is permit
+            )
+            active_aliases = tuple(
+                session_id
+                for session_id, active_id in self._active_by_session.items()
+                if active_id == permit.permit_id
+            )
+            if aliases not in ((), (permit.permit_id,)):
+                return False
+            if active_aliases not in ((), (permit.session_id,)):
+                return False
+            if (
+                self._active_by_session.get(permit.session_id)
+                not in (None, permit.permit_id)
+                or state is not None
+                and (
+                    type(state) is not _CredentialPermitState
+                    or state.permit is not permit
+                    or state.permit_id != permit.permit_id
+                    or state.session_id != permit.session_id
+                    or state.status
+                    not in ("authorized", "abandoning", "abandoned", "finished")
+                )
+            ):
+                return False
+
+        try:
+            activity_is_exact = context_ledger._gate_activity_is_exact(
+                context=context,
+                attempt_gate=self,
+                activity_id=permit.permit_id,
+                _authority=_ATTEMPT_BUDGET_AUTHORITY,
+            )
+            if type(activity_is_exact) is not bool:
+                return False
+            if activity_is_exact:
+                context_ledger._discard_gate_activity(
+                    context=context,
+                    attempt_gate=self,
+                    activity_id=permit.permit_id,
+                    _authority=_ATTEMPT_BUDGET_AUTHORITY,
+                )
+            activity_is_exact = context_ledger._gate_activity_is_exact(
+                context=context,
+                attempt_gate=self,
+                activity_id=permit.permit_id,
+                _authority=_ATTEMPT_BUDGET_AUTHORITY,
+            )
+        except BaseException:
+            return False
+        if type(activity_is_exact) is not bool or activity_is_exact is not False:
+            return False
+
+        with self._lock:
+            state = self._credential_permits.get(permit.permit_id)
+            if state is not None and (
+                type(state) is not _CredentialPermitState
+                or state.permit is not permit
+                or state.status
+                not in ("authorized", "abandoning", "abandoned", "finished")
+            ):
+                return False
+            if self._active_by_session.get(permit.session_id) == permit.permit_id:
+                del self._active_by_session[permit.session_id]
+            if state is not None and state.status in ("authorized", "abandoning"):
+                del self._credential_permits[permit.permit_id]
+                state = None
+            if not permit._released:
+                permit._release_authority_refs(
+                    _authority=_PERMIT_RELEASE_AUTHORITY,
+                )
+            if state is not None:
+                state.clear_recovery_refs()
+
+        return self._published_credential_cleanup_is_exact(
+            permit,
+            context=context,
+            context_ledger=context_ledger,
+            _authority=_CREDENTIAL_PERMIT_RECOVERY_AUTHORITY,
         )
 
     def _require_helper_stop_state_locked(

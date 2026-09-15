@@ -12,6 +12,11 @@ from threading import RLock
 from typing import Callable, TypeVar
 from uuid import UUID, uuid5
 
+from snapquiz.adapters.base import DirectMultimodalAdapter
+from snapquiz.adapters.openai_chat_compatible import (
+    OpenAIChatCompatibleAdapter,
+)
+from snapquiz.config.profiles import GLM_ADAPTER_FAMILY, GLM_ADAPTER_VERSION
 from snapquiz.domain._validation import (
     require_aware_datetime,
     require_digest,
@@ -26,7 +31,7 @@ from snapquiz.domain.outbound import (
     PreparedOutbound,
     validate_prepared_outbound_against_plan,
 )
-from snapquiz.domain.plan import OutboundDataKind
+from snapquiz.domain.plan import ExecutionPlanStage, OutboundDataKind
 from snapquiz.domain.policy import ContractMarker
 from snapquiz.pipelines.contracts import StageInvocation
 from snapquiz.privacy.consent import (
@@ -50,8 +55,50 @@ _APPROVAL_AUTHORITY = object()
 _APPROVAL_LEDGER_AUTHORITY = object()
 _EGRESS_SESSION_AUTHORITY = object()
 _EGRESS_ATTEMPT_AUTHORITY = object()
+_ENVELOPE_ATTESTATION_AUTHORITY = object()
 _EGRESS_UUID_NAMESPACE = UUID("d0ac6789-4649-5e0f-8e80-30057112354a")
 _T = TypeVar("_T")
+
+_ENVELOPE_ATTESTATION_SCHEMA_VERSION = "snapquiz.envelope-attestation.v1"
+_TRUSTED_DIRECT_MULTIMODAL_ADAPTERS = (
+    (
+        GLM_ADAPTER_FAMILY,
+        GLM_ADAPTER_VERSION,
+        OpenAIChatCompatibleAdapter,
+    ),
+)
+
+
+def _trusted_adapter_catalog_match(
+    *,
+    adapter_family: str,
+    adapter_version: str,
+) -> type[DirectMultimodalAdapter] | None:
+    """Return one exact catalog entry without provider-specific branching."""
+
+    matches = tuple(
+        adapter_type
+        for family, version, adapter_type in _TRUSTED_DIRECT_MULTIMODAL_ADAPTERS
+        if family == adapter_family and version == adapter_version
+    )
+    if len(matches) != 1:
+        return None
+    adapter_type = matches[0]
+    try:
+        is_adapter_type = (
+            type(adapter_type) is type
+            and issubclass(adapter_type, DirectMultimodalAdapter)
+            and adapter_type is not DirectMultimodalAdapter
+        )
+    except TypeError:
+        is_adapter_type = False
+    if (
+        not is_adapter_type
+        or adapter_type.adapter_family != adapter_family
+        or adapter_type.adapter_version != adapter_version
+    ):
+        return None
+    return adapter_type
 
 
 def _egress_error(message: str, *, stage: str = "egress_gate") -> EndpointPolicyError:
@@ -846,12 +893,266 @@ class EgressApproval:
             "consumed": self.consumed_at is not None,
             "revoked": self.revoked_at is not None,
         }
+
+
+def _prepared_expectation_digest(prepared: PreparedOutbound) -> Digest256:
+    """Hash every exact-envelope field without retaining outbound bytes."""
+
+    if type(prepared) is not PreparedOutbound:
+        raise TypeError("prepared must be PreparedOutbound")
+    prepared.validate_integrity()
+    return digest256(
+        "PreparedOutboundExpectation",
+        _ENVELOPE_ATTESTATION_SCHEMA_VERSION,
+        {
+            "plan_id": prepared.plan_id,
+            "plan_digest": prepared.plan_digest,
+            "stage_id": prepared.stage_id,
+            "operation_id": prepared.operation_id,
+            "source_ids": prepared.source_ids,
+            "source_digests": prepared.source_digests,
+            "capture_scope_fingerprint": _marker_payload(
+                prepared.capture_scope_fingerprint
+            ),
+            "http_method": prepared.http_method,
+            "canonical_url": prepared.canonical_url,
+            "content_type": prepared.content_type,
+            "non_secret_headers": tuple(
+                header.as_digest_payload()
+                for header in prepared.non_secret_headers
+            ),
+            "non_secret_headers_digest": prepared.non_secret_headers_digest,
+            "credential_binding_digest": _marker_payload(
+                prepared.credential_binding_digest
+            ),
+            "outbound_data": tuple(
+                item.value for item in prepared.outbound_data
+            ),
+            "body_sha256": hashlib.sha256(prepared.body).hexdigest(),
+            "body_digest": prepared.body_digest,
+            "payload_byte_size": prepared.payload_byte_size,
+            "request_envelope_digest": prepared.request_envelope_digest,
+        },
+    )
+
+
+def _full_egress_subject_digest(
+    *,
+    planned: PlannedExecution,
+    invocation: StageInvocation,
+    prepared: PreparedOutbound,
+    authorization: AuthorizationContext,
+    stage: ExecutionPlanStage,
+) -> Digest256:
+    """Recompute the complete current authority and exact-envelope subject."""
+
+    if type(planned) is not PlannedExecution:
+        raise TypeError("planned must be PlannedExecution")
+    if type(invocation) is not StageInvocation:
+        raise TypeError("invocation must be StageInvocation")
+    if type(prepared) is not PreparedOutbound:
+        raise TypeError("prepared must be PreparedOutbound")
+    if type(authorization) is not AuthorizationContext:
+        raise TypeError("authorization must be AuthorizationContext")
+    if type(stage) is not ExecutionPlanStage:
+        raise TypeError("stage must be ExecutionPlanStage")
+    planned.validate_integrity()
+    invocation.validate_integrity()
+    authorization.validate_integrity()
+    validate_prepared_outbound_against_plan(prepared, planned.plan)
+    current_stage = next(
+        (
+            candidate
+            for candidate in planned.plan.stages
+            if candidate.stage_id == invocation.stage_id
+        ),
+        None,
+    )
+    capture = invocation.input
+    if (
+        current_stage is not stage
+        or invocation.request_id != planned.plan.request_id
+        or invocation.plan_id != planned.plan.plan_id
+        or invocation.plan_digest != planned.plan.plan_digest
+        or invocation.planned_execution_digest
+        != planned.planned_execution_digest
+        or authorization.plan_id != planned.plan.plan_id
+        or authorization.plan_digest != planned.plan.plan_digest
+        or authorization.planned_execution_digest
+        != planned.planned_execution_digest
+        or prepared.plan_id != planned.plan.plan_id
+        or prepared.plan_digest != planned.plan.plan_digest
+        or prepared.stage_id != stage.stage_id
+        or prepared.operation_id
+        not in tuple(
+            operation.operation_id for operation in stage.network_operations
+        )
+        or prepared.source_ids
+        != (capture.capture_id, invocation.invocation_id)
+        or prepared.source_digests
+        != (capture.validation_digest, invocation.invocation_digest)
+        or prepared.capture_scope_fingerprint != capture.scope_fingerprint
+        or capture.privacy_authorization_id
+        != authorization.authorization_id
+        or capture.privacy_authorization_digest
+        != authorization.authorization_digest
+        or _trusted_adapter_catalog_match(
+            adapter_family=stage.adapter_family,
+            adapter_version=stage.adapter_version,
+        )
+        is None
+    ):
+        raise ValueError("egress subject binding changed")
+    return digest256(
+        "FullEgressSubject",
+        _ENVELOPE_ATTESTATION_SCHEMA_VERSION,
+        {
+            "request_id": planned.plan.request_id,
+            "plan_id": planned.plan.plan_id,
+            "plan_digest": planned.plan.plan_digest,
+            "planned_execution_digest": planned.planned_execution_digest,
+            "registry_revision": planned.resolved_pipeline.registry_revision,
+            "registry_digest": planned.resolved_pipeline.registry_digest,
+            "privacy_authorization_id": authorization.authorization_id,
+            "privacy_authorization_digest": authorization.authorization_digest,
+            "consent_grant_ids": authorization.consent_grant_ids,
+            "consent_grant_digests": authorization.consent_grant_digests,
+            "stage": stage.as_digest_payload(),
+            "invocation_id": invocation.invocation_id,
+            "invocation_digest": invocation.invocation_digest,
+            "solve_request_digest": invocation.solve_request_digest,
+            "input_digest": invocation.input_digest,
+            "capture_id": capture.capture_id,
+            "capture_validation_digest": capture.validation_digest,
+            "capture_scope_fingerprint": _marker_payload(
+                capture.scope_fingerprint
+            ),
+            "adapter_family": stage.adapter_family,
+            "adapter_version": stage.adapter_version,
+            "prepared_expectation_digest": _prepared_expectation_digest(
+                prepared
+            ),
+        },
+    )
+
+
+def _attestation_payload(
+    attestation: "_EnvelopeAttestation",
+) -> dict[str, object]:
+    return {
+        "approval_id": attestation.approval_id,
+        "approval_terms_digest": attestation.approval_terms_digest,
+        "adapter_family": attestation.adapter_family,
+        "adapter_version": attestation.adapter_version,
+        "subject_digest": attestation.subject_digest,
+        "body_digest": attestation.body_digest,
+        "payload_byte_size": attestation.payload_byte_size,
+        "request_envelope_digest": attestation.request_envelope_digest,
+    }
+
+
+class _EnvelopeAttestation:
+    """Private proof that Egress rebuilt one exact trusted Adapter envelope."""
+
+    __slots__ = (
+        "approval_id",
+        "approval_terms_digest",
+        "adapter_family",
+        "adapter_version",
+        "subject_digest",
+        "body_digest",
+        "payload_byte_size",
+        "request_envelope_digest",
+        "attestation_digest",
+        "_approval_ledger",
+    )
+
+    def __init__(
+        self,
+        *,
+        approval: EgressApproval,
+        adapter_family: str,
+        adapter_version: str,
+        subject_digest: Digest256,
+        _authority: object | None = None,
+    ) -> None:
+        if _authority is not _ENVELOPE_ATTESTATION_AUTHORITY:
+            raise TypeError("envelope attestation requires EgressGate")
+        require_text(adapter_family, "adapter_family", max_length=512)
+        require_text(adapter_version, "adapter_version", max_length=512)
+        require_digest(
+            subject_digest,
+            "subject_digest",
+        )
+        values = (
+            ("approval_id", approval.approval_id),
+            ("approval_terms_digest", approval.approval_terms_digest),
+            ("adapter_family", adapter_family),
+            ("adapter_version", adapter_version),
+            (
+                "subject_digest",
+                subject_digest,
+            ),
+            ("body_digest", approval.body_digest),
+            ("payload_byte_size", approval.payload_byte_size),
+            (
+                "request_envelope_digest",
+                approval.request_envelope_digest,
+            ),
+            ("_approval_ledger", approval._approval_ledger),
+        )
+        for name, value in values:
+            object.__setattr__(self, name, value)
+        object.__setattr__(
+            self,
+            "attestation_digest",
+            digest256(
+                "EnvelopeAttestation",
+                _ENVELOPE_ATTESTATION_SCHEMA_VERSION,
+                _attestation_payload(self),
+            ),
+        )
+
+    def __setattr__(self, name: str, value: object) -> None:
+        del name, value
+        raise AttributeError("_EnvelopeAttestation is immutable")
+
+    def validate_integrity(self) -> None:
+        if type(self._approval_ledger) is not EgressApprovalLedger:
+            raise ValueError("approval ledger authority changed")
+        require_uuid(self.approval_id, "approval_id")
+        require_digest(self.approval_terms_digest, "approval_terms_digest")
+        require_text(self.adapter_family, "adapter_family", max_length=512)
+        require_text(self.adapter_version, "adapter_version", max_length=512)
+        require_digest(
+            self.subject_digest,
+            "subject_digest",
+        )
+        require_digest(self.body_digest, "body_digest")
+        require_plain_int(
+            self.payload_byte_size,
+            "payload_byte_size",
+            minimum=1,
+        )
+        require_digest(
+            self.request_envelope_digest,
+            "request_envelope_digest",
+        )
+        if self.attestation_digest != digest256(
+            "EnvelopeAttestation",
+            _ENVELOPE_ATTESTATION_SCHEMA_VERSION,
+            _attestation_payload(self),
+        ):
+            raise ValueError("envelope attestation integrity mismatch")
+
+
 @runtime_final
 class EgressApprovalLedger:
     """Process-local authority for decision IDs and approval revisions.
 
     Preview and decision objects, image bytes, and user hints are never stored
-    here; only the decision-to-approval identifier binding is retained.
+    here.  A private digest-only trusted-envelope attestation is atomically
+    retained with each decision-to-approval identifier binding.
     """
 
     __slots__ = (
@@ -859,8 +1160,11 @@ class EgressApprovalLedger:
         "_issued_terms",
         "_current_digests",
         "_preview_decisions",
+        "_attestations",
+        "_issued_attestation_digests",
         "_lock",
         "_revision",
+        "_poisoned",
     )
 
     def __init__(self) -> None:
@@ -868,13 +1172,29 @@ class EgressApprovalLedger:
         object.__setattr__(self, "_issued_terms", {})
         object.__setattr__(self, "_current_digests", {})
         object.__setattr__(self, "_preview_decisions", {})
+        object.__setattr__(self, "_attestations", {})
+        object.__setattr__(self, "_issued_attestation_digests", {})
         object.__setattr__(self, "_lock", RLock())
         object.__setattr__(self, "_revision", 0)
+        object.__setattr__(self, "_poisoned", False)
+
+    def _require_usable_locked(self, *, stage: str = "egress_gate") -> None:
+        if self._poisoned:
+            raise _egress_error(
+                "出站批准账本状态无法完整证明，已封锁。",
+                stage=stage,
+            )
+
+    def _poison_locked(self) -> None:
+        if not self._poisoned:
+            object.__setattr__(self, "_poisoned", True)
+            object.__setattr__(self, "_revision", self._revision + 1)
 
     def _issue(
         self,
         approval: EgressApproval,
         *,
+        attestation: _EnvelopeAttestation,
         _authority: object | None = None,
     ) -> None:
         if _authority is not _APPROVAL_LEDGER_AUTHORITY:
@@ -885,20 +1205,113 @@ class EgressApprovalLedger:
             approval.validate_integrity()
         except (ValueError, TypeError, AttributeError) as error:
             raise _egress_error("出站批准完整性校验失败。") from error
+        if type(attestation) is not _EnvelopeAttestation:
+            raise TypeError("attestation must be _EnvelopeAttestation")
+        try:
+            attestation.validate_integrity()
+        except (ValueError, TypeError, AttributeError) as error:
+            raise _egress_error("受信请求包络证明完整性校验失败。") from error
+        if (
+            attestation.approval_id != approval.approval_id
+            or attestation.approval_terms_digest
+            != approval.approval_terms_digest
+            or attestation.body_digest != approval.body_digest
+            or attestation.payload_byte_size != approval.payload_byte_size
+            or attestation.request_envelope_digest
+            != approval.request_envelope_digest
+            or attestation._approval_ledger is not self
+        ):
+            raise _egress_error("受信请求包络证明未绑定当前出站批准。")
         with self._lock:
-            if approval._approval_ledger is not self:
+            self._require_usable_locked()
+            try:
+                approval.validate_integrity()
+                attestation.validate_integrity()
+            except (ValueError, TypeError, AttributeError) as error:
+                raise _egress_error("出站批准或请求包络证明已失效。") from error
+            if (
+                approval._approval_ledger is not self
+                or attestation._approval_ledger is not self
+            ):
                 raise _egress_error("出站批准不属于当前账本。")
-            if approval.approval_id in self._approvals:
+            if any(
+                approval.approval_id in mapping
+                for mapping in (
+                    self._approvals,
+                    self._issued_terms,
+                    self._current_digests,
+                    self._attestations,
+                    self._issued_attestation_digests,
+                )
+            ):
                 raise _egress_error("出站批准标识已存在。")
             if approval.preview_decision_id in self._preview_decisions:
                 raise _egress_error("同一次上传确认已经使用。")
-            self._approvals[approval.approval_id] = approval
-            self._issued_terms[approval.approval_id] = approval.approval_terms_digest
-            self._current_digests[approval.approval_id] = approval.approval_digest
-            self._preview_decisions[approval.preview_decision_id] = approval.approval_id
-            object.__setattr__(self, "_revision", self._revision + 1)
+            original_revision = self._revision
+            entries = (
+                (self._approvals, approval.approval_id, approval),
+                (
+                    self._issued_terms,
+                    approval.approval_id,
+                    approval.approval_terms_digest,
+                ),
+                (
+                    self._current_digests,
+                    approval.approval_id,
+                    approval.approval_digest,
+                ),
+                (
+                    self._preview_decisions,
+                    approval.preview_decision_id,
+                    approval.approval_id,
+                ),
+                (
+                    self._attestations,
+                    approval.approval_id,
+                    attestation,
+                ),
+                (
+                    self._issued_attestation_digests,
+                    approval.approval_id,
+                    attestation.attestation_digest,
+                ),
+            )
+            publish_failure: BaseException | None = None
+            rollback_proven = True
+            try:
+                for mapping, key, value in entries:
+                    mapping[key] = value
+                object.__setattr__(self, "_revision", original_revision + 1)
+                self._require_current_locked(approval)
+            except BaseException as error:
+                publish_failure = error
+                missing = object()
+                for mapping, key, value in reversed(entries):
+                    try:
+                        current = mapping.get(key, missing)
+                        if current is value:
+                            del mapping[key]
+                        elif current is not missing:
+                            rollback_proven = False
+                        if key in mapping:
+                            rollback_proven = False
+                    except BaseException:
+                        rollback_proven = False
+                if rollback_proven:
+                    object.__setattr__(self, "_revision", original_revision)
+                else:
+                    self._poison_locked()
+            if publish_failure is not None:
+                if not rollback_proven:
+                    raise _egress_error(
+                        "出站批准与请求包络证明无法安全回滚，账本已封锁。"
+                    )
+                if isinstance(publish_failure, (KeyboardInterrupt, SystemExit)):
+                    raise publish_failure
+                raise _egress_error("出站批准与请求包络证明未能完整签发。")
 
     def _require_current_locked(self, approval: EgressApproval) -> None:
+        self._require_usable_locked()
         if type(approval) is not EgressApproval:
             raise TypeError("approval must be EgressApproval")
         try:
@@ -906,6 +1319,13 @@ class EgressApprovalLedger:
         except (ValueError, TypeError, AttributeError) as error:
             raise _egress_error("出站批准完整性校验失败。") from error
         current = self._approvals.get(approval.approval_id)
+        attestation = self._attestations.get(approval.approval_id)
+        attestation_valid = type(attestation) is _EnvelopeAttestation
+        if attestation_valid:
+            try:
+                attestation.validate_integrity()
+            except (ValueError, TypeError, AttributeError):
+                attestation_valid = False
         if (
             current is not approval
             or approval._approval_ledger is not self
@@ -915,12 +1335,118 @@ class EgressApprovalLedger:
             != approval.approval_digest
             or self._preview_decisions.get(approval.preview_decision_id)
             != approval.approval_id
+            or not attestation_valid
+            or attestation._approval_ledger is not self
+            or attestation.approval_id != approval.approval_id
+            or attestation.approval_terms_digest
+            != approval.approval_terms_digest
+            or attestation.body_digest != approval.body_digest
+            or attestation.payload_byte_size != approval.payload_byte_size
+            or attestation.request_envelope_digest
+            != approval.request_envelope_digest
+            or self._issued_attestation_digests.get(approval.approval_id)
+            != attestation.attestation_digest
         ):
             raise _egress_error("出站批准不属于当前账本或状态已经变化。")
+
+    def _require_subject_attestation_locked(
+        self,
+        *,
+        approval: EgressApproval,
+        planned: PlannedExecution,
+        invocation: StageInvocation,
+        prepared: PreparedOutbound,
+        authorization: AuthorizationContext,
+        planned_stage: ExecutionPlanStage,
+        error_stage: str,
+    ) -> None:
+        """Match the full current authority subject under this ledger lock."""
+
+        expectation_failed = False
+        try:
+            subject_digest = _full_egress_subject_digest(
+                planned=planned,
+                invocation=invocation,
+                prepared=prepared,
+                authorization=authorization,
+                stage=planned_stage,
+            )
+        except (ValueError, TypeError, AttributeError):
+            expectation_failed = True
+            subject_digest = None
+        if expectation_failed:
+            raise _egress_error(
+                "待发送完整 authority subject 校验失败。",
+                stage=error_stage,
+            )
+        attestation = self._attestations.get(approval.approval_id)
+        if (
+            type(attestation) is not _EnvelopeAttestation
+            or attestation.adapter_family != planned_stage.adapter_family
+            or attestation.adapter_version != planned_stage.adapter_version
+            or attestation.subject_digest != subject_digest
+        ):
+            raise _egress_error(
+                "待发送 authority subject 与受信 Adapter 证明不一致。",
+                stage=error_stage,
+            )
+
+    def _publish_lifecycle_transition_locked(
+        self,
+        *,
+        current: EgressApproval,
+        replacement: EgressApproval,
+        error_stage: str,
+        rollback_allowed: bool,
+    ) -> None:
+        """Publish both lifecycle indexes or fail closed as one transition."""
+
+        original_revision = self._revision
+        publish_failure: BaseException | None = None
+        rollback_proven = False
+        try:
+            self._approvals[current.approval_id] = replacement
+            self._current_digests[current.approval_id] = (
+                replacement.approval_digest
+            )
+            object.__setattr__(self, "_revision", original_revision + 1)
+            self._require_current_locked(replacement)
+        except BaseException as error:
+            publish_failure = error
+            if rollback_allowed:
+                try:
+                    self._approvals[current.approval_id] = current
+                    self._current_digests[current.approval_id] = (
+                        current.approval_digest
+                    )
+                    object.__setattr__(self, "_revision", original_revision)
+                    self._require_current_locked(current)
+                    rollback_proven = True
+                except BaseException:
+                    rollback_proven = False
+            if not rollback_proven:
+                self._poison_locked()
+        if publish_failure is None:
+            return
+        if rollback_proven and isinstance(
+            publish_failure,
+            (KeyboardInterrupt, SystemExit),
+        ):
+            raise publish_failure
+        if rollback_proven:
+            raise _egress_error(
+                "出站批准状态变更未能完整提交。",
+                stage=error_stage,
+            )
+        raise _egress_error(
+            "出站批准状态无法完整证明，账本已封锁。",
+            stage=error_stage,
+        )
 
     def snapshot(self, approval_id: UUID) -> EgressApproval:
         require_uuid(approval_id, "approval_id")
         with self._lock:
+            self._require_usable_locked()
             current = self._approvals.get(approval_id)
             if current is None:
                 raise _egress_error("出站批准不存在。")
@@ -947,6 +1473,7 @@ class EgressApprovalLedger:
         require_uuid(approval_id, "approval_id")
         require_aware_datetime(revoked_at, "revoked_at")
         with self._lock:
+            self._require_usable_locked()
             current = self._approvals.get(approval_id)
             if current is None:
                 raise _egress_error("无法撤销不存在的出站批准。")
@@ -960,15 +1487,23 @@ class EgressApprovalLedger:
                 )
             except ValueError as error:
                 raise _egress_error("出站批准当前不可撤销。") from error
-            self._approvals[approval_id] = replacement
-            self._current_digests[approval_id] = replacement.approval_digest
-            object.__setattr__(self, "_revision", self._revision + 1)
+            self._publish_lifecycle_transition_locked(
+                current=current,
+                replacement=replacement,
+                error_stage="egress_gate",
+                rollback_allowed=True,
+            )
             return replacement
 
     def _consume_with(
         self,
         *,
         approval: EgressApproval,
+        planned: PlannedExecution,
+        invocation: StageInvocation,
+        prepared: PreparedOutbound,
+        authorization: AuthorizationContext,
+        planned_stage: ExecutionPlanStage,
         now: datetime,
         action: Callable[[EgressApproval], _T],
         _authority: object | None = None,
@@ -989,7 +1524,17 @@ class EgressApprovalLedger:
         if not callable(action):
             raise TypeError("action must be callable")
         with self._lock:
+            self._require_usable_locked(stage="send_session_factory")
             self._require_current_locked(approval)
+            self._require_subject_attestation_locked(
+                approval=approval,
+                planned=planned,
+                invocation=invocation,
+                prepared=prepared,
+                authorization=authorization,
+                planned_stage=planned_stage,
+                error_stage="send_session_factory",
+            )
             try:
                 approval.validate_active_at(now)
                 consumed = approval._with_status(
@@ -1001,9 +1546,15 @@ class EgressApprovalLedger:
                 raise _egress_error(
                     "出站批准当前不可消费。", stage="send_session_factory"
                 ) from error
-            self._approvals[approval.approval_id] = consumed
-            self._current_digests[approval.approval_id] = consumed.approval_digest
-            object.__setattr__(self, "_revision", self._revision + 1)
+            # Consumption begins an irreversible one-shot handoff.  Any
+            # unprovable partial write poisons the ledger instead of making
+            # the original approval reusable.
+            self._publish_lifecycle_transition_locked(
+                current=approval,
+                replacement=consumed,
+                error_stage="send_session_factory",
+                rollback_allowed=False,
+            )
             return action(consumed)
 
     def _run_consumed_action(
@@ -1013,6 +1564,11 @@ class EgressApprovalLedger:
         approval_terms_digest: Digest256,
         consumed_approval_digest: Digest256,
         consumed_at: datetime,
+        planned: PlannedExecution,
+        invocation: StageInvocation,
+        prepared: PreparedOutbound,
+        authorization: AuthorizationContext,
+        planned_stage: ExecutionPlanStage,
         now: datetime,
         action: Callable[[], _T],
         _authority: object | None = None,
@@ -1029,6 +1585,7 @@ class EgressApprovalLedger:
         if not callable(action):
             raise TypeError("action must be callable")
         with self._lock:
+            self._require_usable_locked(stage="attempt_gate")
             current = self._approvals.get(approval_id)
             if current is None:
                 raise _egress_error(
@@ -1036,6 +1593,15 @@ class EgressApprovalLedger:
                     stage="attempt_gate",
                 )
             self._require_current_locked(current)
+            self._require_subject_attestation_locked(
+                approval=current,
+                planned=planned,
+                invocation=invocation,
+                prepared=prepared,
+                authorization=authorization,
+                planned_stage=planned_stage,
+                error_stage="attempt_gate",
+            )
             if (
                 current.approval_terms_digest != approval_terms_digest
                 or current.approval_digest != consumed_approval_digest
@@ -1050,12 +1616,13 @@ class EgressApprovalLedger:
                 )
             return action()
 
-    def safe_metadata(self) -> dict[str, int]:
+    def safe_metadata(self) -> dict[str, int | bool]:
         with self._lock:
             return {
                 "revision": self._revision,
                 "approval_count": len(self._approvals),
                 "preview_decision_count": len(self._preview_decisions),
+                "poisoned": self._poisoned,
             }
 
 
@@ -1086,33 +1653,12 @@ def _validate_exact_egress_binding_core(
         planned.validate_integrity()
         invocation.validate_integrity()
         validate_prepared_outbound_against_plan(prepared, planned.plan)
-        # W08 Phase 1 is deliberately tied to the one frozen pass-through
-        # Adapter.  PreparedOutbound is a public immutable value object, so its
-        # self-consistent digests and source claims are not provenance by
-        # themselves.  Re-preparing locally proves every field and body byte
-        # came from the trusted deterministic Adapter path.
-        from snapquiz.adapters.openai_chat_compatible import (
-            OpenAIChatCompatibleAdapter,
-        )
-
-        expected_prepared = OpenAIChatCompatibleAdapter.prepare(
-            planned=planned,
-            invocation=invocation,
-            operation_id=prepared.operation_id,
-        )
     except EndpointPolicyError:
         raise
     except Exception:
         validation_failed = True
-        expected_prepared = None
     if validation_failed:
         raise _egress_error("出站绑定完整性校验失败。")
-    assert expected_prepared is not None
-    if any(
-        getattr(prepared, name) != getattr(expected_prepared, name)
-        for name in PreparedOutbound.__slots__
-    ):
-        raise _egress_error("待发送内容不是当前受信 Adapter 的精确输出。")
     stage = next(
         (item for item in planned.plan.stages if item.stage_id == invocation.stage_id),
         None,
@@ -1170,6 +1716,84 @@ def _validate_exact_egress_binding_core(
     if granted_scope is not None and granted_scope != capture.scope_fingerprint:
         raise _egress_error("同意记录未覆盖当前截图区域。")
     return stage, operation
+
+
+def _trusted_adapter_type(
+    *,
+    adapter_family: str,
+    adapter_version: str,
+) -> type[DirectMultimodalAdapter]:
+    """Resolve only an exact built-in Adapter family/version pair."""
+
+    adapter_type = _trusted_adapter_catalog_match(
+        adapter_family=adapter_family,
+        adapter_version=adapter_version,
+    )
+    if adapter_type is None:
+        raise _egress_error("当前 Adapter 不在受信请求包络目录中。")
+    return adapter_type
+
+
+def _rebuild_trusted_envelope_once(
+    *,
+    planned: PlannedExecution,
+    invocation: StageInvocation,
+    prepared: PreparedOutbound,
+    authorization: AuthorizationContext,
+    stage: ExecutionPlanStage,
+) -> tuple[str, str, Digest256]:
+    """Perform Egress's sole trusted rebuild and return a digest-only proof."""
+
+    adapter_family = getattr(stage, "adapter_family", None)
+    adapter_version = getattr(stage, "adapter_version", None)
+    if type(adapter_family) is not str or type(adapter_version) is not str:
+        raise _egress_error("冻结阶段缺少受信 Adapter 标识。")
+    adapter_type = _trusted_adapter_type(
+        adapter_family=adapter_family,
+        adapter_version=adapter_version,
+    )
+    rebuild_failed = False
+    try:
+        expected_prepared = adapter_type.prepare(
+            planned=planned,
+            invocation=invocation,
+            operation_id=prepared.operation_id,
+        )
+        expectation_digest = _prepared_expectation_digest(prepared)
+        expected_digest = _prepared_expectation_digest(expected_prepared)
+    except EndpointPolicyError:
+        raise
+    except Exception:
+        rebuild_failed = True
+        expected_prepared = None
+        expectation_digest = None
+        expected_digest = None
+    if rebuild_failed:
+        raise _egress_error("无法重建受信 Adapter 请求包络。")
+    if (
+        expectation_digest != expected_digest
+        or any(
+            getattr(prepared, name) != getattr(expected_prepared, name)
+            for name in PreparedOutbound.__slots__
+        )
+    ):
+        raise _egress_error("待发送内容不是当前受信 Adapter 的精确输出。")
+    subject_failed = False
+    try:
+        subject_digest = _full_egress_subject_digest(
+            planned=planned,
+            invocation=invocation,
+            prepared=prepared,
+            authorization=authorization,
+            stage=stage,
+        )
+    except (ValueError, TypeError, AttributeError):
+        subject_failed = True
+        subject_digest = None
+    if subject_failed:
+        raise _egress_error("无法构造完整受信 authority subject。")
+    assert subject_digest is not None
+    return adapter_family, adapter_version, subject_digest
 
 
 def _validate_exact_egress_binding(
@@ -1247,13 +1871,24 @@ class EgressGate:
 
         # Preliminary validation keeps malformed inputs away from the trusted UI.
         preliminary_now = authorization.authorized_at
-        _validate_exact_egress_binding(
+        stage, operation = _validate_exact_egress_binding(
             planned=planned,
             invocation=invocation,
             prepared=prepared,
             authorization=authorization,
             consent_ledger=consent_ledger,
             now=preliminary_now,
+        )
+        (
+            trusted_adapter_family,
+            trusted_adapter_version,
+            trusted_subject_digest,
+        ) = _rebuild_trusted_envelope_once(
+            planned=planned,
+            invocation=invocation,
+            prepared=prepared,
+            authorization=authorization,
+            stage=stage,
         )
         preview_failed = False
         try:
@@ -1317,7 +1952,7 @@ class EgressGate:
         approved_at = decision.decided_at
 
         def issue() -> EgressApproval:
-            stage, operation = _validate_exact_egress_binding(
+            current_stage, current_operation = _validate_exact_egress_binding(
                 planned=planned,
                 invocation=invocation,
                 prepared=prepared,
@@ -1325,8 +1960,33 @@ class EgressGate:
                 consent_ledger=consent_ledger,
                 now=approved_at,
             )
-            # Rebuild after the callback so a callback-side mutation cannot reuse
-            # the earlier subject.  Normal callers cannot mutate these objects.
+            if (
+                current_stage is not stage
+                or current_operation is not operation
+                or getattr(current_stage, "adapter_family", None)
+                != trusted_adapter_family
+                or getattr(current_stage, "adapter_version", None)
+                != trusted_adapter_version
+            ):
+                raise _egress_error("预览后冻结计划或 Adapter 标识发生了变化。")
+            current_subject_failed = False
+            try:
+                current_subject_digest = _full_egress_subject_digest(
+                    planned=planned,
+                    invocation=invocation,
+                    prepared=prepared,
+                    authorization=authorization,
+                    stage=current_stage,
+                )
+            except (ValueError, TypeError, AttributeError):
+                current_subject_failed = True
+                current_subject_digest = None
+            if current_subject_failed:
+                raise _egress_error("预览后 authority subject 完整性校验失败。")
+            if current_subject_digest != trusted_subject_digest:
+                raise _egress_error("预览后 authority subject 发生了变化。")
+            # Rebuild the ephemeral preview, but not the Adapter envelope, so a
+            # callback-side mutation cannot reuse the earlier review subject.
             current_preview_failed = False
             try:
                 current_preview = EgressPreview(
@@ -1373,8 +2033,16 @@ class EgressGate:
                 approval_ledger=approval_ledger,
                 _authority=_APPROVAL_AUTHORITY,
             )
+            attestation = _EnvelopeAttestation(
+                approval=approval,
+                adapter_family=trusted_adapter_family,
+                adapter_version=trusted_adapter_version,
+                subject_digest=trusted_subject_digest,
+                _authority=_ENVELOPE_ATTESTATION_AUTHORITY,
+            )
             approval_ledger._issue(
                 approval,
+                attestation=attestation,
                 _authority=_APPROVAL_LEDGER_AUTHORITY,
             )
             return approval

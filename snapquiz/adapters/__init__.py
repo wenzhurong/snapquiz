@@ -2,4 +2,6 @@
 
 # Keep package import minimal: the built-in Registry imports the content-
 # addressed prompt policy, while concrete Adapters consume that Registry.
-__all__: list[str] = []
+from snapquiz.adapters.base import DirectMultimodalAdapter
+
+__all__ = ["DirectMultimodalAdapter"]

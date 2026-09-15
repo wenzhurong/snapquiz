@@ -1863,7 +1863,7 @@ class W09AttemptGateTest(unittest.TestCase):
         )
         self.assertTrue(runtime.context_ledger.close(runtime.call_context))
 
-    def test_each_stage_reprepares_exact_envelope_and_performs_no_io(self):
+    def test_each_stage_uses_ledger_attestation_without_reprepare_or_io(self):
         runtime = _make_runtime()
         gate = AttemptGate()
         original_prepare = OpenAIChatCompatibleAdapter.prepare
@@ -1893,15 +1893,35 @@ class W09AttemptGateTest(unittest.TestCase):
                 _authority=_TRANSPORT_ATTEMPT_AUTHORITY,
             )
 
-        # Authorize, resolver claim, resolver post-read confirmation, reserve
-        # and transport claim each rebuild the exact trusted request.
-        self.assertEqual(prepare.call_count, 5)
+        # Egress already stored one trusted rebuild attestation.  Every W09
+        # checkpoint verifies current bytes against it without base64/JSON
+        # reconstruction or side effects.
+        self.assertEqual(prepare.call_count, 0)
         self.assertIsNotNone(credential)
         open_file.assert_not_called()
         getenv.assert_not_called()
         getaddrinfo.assert_not_called()
         socket_factory.assert_not_called()
         sleep.assert_not_called()
+
+    def test_attestation_tamper_blocks_attempt_before_permit_or_budget(self):
+        runtime = _make_runtime()
+        gate = AttemptGate()
+        runtime.approval_ledger._issued_attestation_digests[
+            runtime.session.approval_id
+        ] = Digest256("f" * 64)
+
+        with self.assertRaises(EndpointPolicyError):
+            _authorize(runtime, gate)
+
+        self.assertEqual(gate.safe_metadata()["credential_permit_count"], 0)
+        self.assertEqual(
+            runtime.context_ledger.safe_metadata()[
+                "active_gate_activity_count"
+            ],
+            0,
+        )
+        self.assertTrue(runtime.context_ledger.close(runtime.call_context))
 
     def test_approval_ledger_identity_revocation_and_budget_failure_are_closed(self):
         runtime = _make_runtime()

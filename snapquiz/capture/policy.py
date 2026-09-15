@@ -39,6 +39,7 @@ _CAPTURE_CONSUMPTION_AUTHORITY = object()
 _CAPTURE_LEDGER_AUTHORITY = object()
 _CAPTURE_ARTIFACT_AUTHORITY = object()
 _CAPTURE_VALIDATION_AUTHORITY = object()
+_CAPTURE_EXECUTION_OBSERVATION_AUTHORITY = object()
 _CAPTURE_UUID_NAMESPACE = UUID("8b1249e6-08cb-50df-a318-2772e936a729")
 
 
@@ -468,7 +469,7 @@ class CaptureAuthorizationLedger:
         object.__setattr__(self, "_artifact_attempts", set())
         object.__setattr__(self, "_artifact_claims", {})
         object.__setattr__(self, "_validation_attempts", set())
-        object.__setattr__(self, "_validated", set())
+        object.__setattr__(self, "_validated", {})
         object.__setattr__(self, "_lock", RLock())
         object.__setattr__(self, "_revision", 0)
 
@@ -589,6 +590,60 @@ class CaptureAuthorizationLedger:
             raise _capture_error("截图消费凭证不属于当前授权账本。")
         return identifier
 
+    def _authorization_is_exact_for_execution(
+        self,
+        authorization: CaptureAuthorization,
+        *,
+        _authority: object | None = None,
+    ) -> bool:
+        """Observe the exact authorization before any source-side follow-up."""
+
+        if _authority is not _CAPTURE_EXECUTION_OBSERVATION_AUTHORITY:
+            raise TypeError("capture observation requires the W10 executor")
+        if type(authorization) is not CaptureAuthorization:
+            return False
+        with self._lock:
+            try:
+                authorization.validate_integrity()
+            except (TypeError, ValueError, AttributeError):
+                return False
+            identifier = authorization.capture_authorization_id
+            return (
+                self._authorizations.get(identifier) is authorization
+                and self._authorization_digests.get(identifier)
+                == authorization.capture_authorization_digest
+                and self._capture_ids.get(authorization.capture_id)
+                == identifier
+            )
+
+    def _consumption_is_exact_for_execution(
+        self,
+        consumed: ConsumedCaptureAuthorization,
+        *,
+        authorization: CaptureAuthorization,
+        _authority: object | None = None,
+    ) -> bool:
+        """Observe the exact consumed authority before capture starts."""
+
+        if _authority is not _CAPTURE_EXECUTION_OBSERVATION_AUTHORITY:
+            raise TypeError("capture observation requires the W10 executor")
+        if (
+            type(authorization) is not CaptureAuthorization
+            or type(consumed) is not ConsumedCaptureAuthorization
+        ):
+            return False
+        with self._lock:
+            try:
+                identifier = self._require_consumption_locked(consumed)
+            except (TypeError, ValueError, AttributeError, CaptureError):
+                return False
+            return (
+                consumed.authorization is authorization
+                and self._authorizations.get(identifier) is authorization
+                and self._capture_ids.get(authorization.capture_id)
+                == identifier
+            )
+
     def _start_artifact_attempt(
         self,
         *,
@@ -647,11 +702,14 @@ class CaptureAuthorizationLedger:
         *,
         consumed: ConsumedCaptureAuthorization,
         artifact_claim_digest: Digest256,
+        validated_capture: object,
+        validation_digest: Digest256,
         _authority: object | None = None,
     ) -> None:
         if _authority is not _CAPTURE_VALIDATION_AUTHORITY:
             raise TypeError("validation completion requires InputValidator")
         require_digest(artifact_claim_digest, "artifact_claim_digest")
+        require_digest(validation_digest, "validation_digest")
         with self._lock:
             identifier = self._require_consumption_locked(consumed)
             if (
@@ -659,10 +717,93 @@ class CaptureAuthorizationLedger:
                 or self._artifact_claims.get(identifier)
                 != artifact_claim_digest
                 or identifier in self._validated
+                or validated_capture is None
+                or getattr(
+                    validated_capture,
+                    "capture_authorization_id",
+                    None,
+                )
+                != identifier
+                or getattr(
+                    validated_capture,
+                    "capture_authorization_digest",
+                    None,
+                )
+                != consumed.authorization.capture_authorization_digest
+                or getattr(
+                    validated_capture,
+                    "consumption_digest",
+                    None,
+                )
+                != consumed.consumption_digest
+                or getattr(validated_capture, "validation_digest", None)
+                != validation_digest
             ):
                 raise _capture_error("截图输入校验状态无效。")
-            self._validated.add(identifier)
+            # One mapping publication is the commit point.  Keeping the exact
+            # object and digest in one immutable pair prevents a split state if
+            # execution is interrupted between multiple container writes.
+            self._validated[identifier] = (
+                validated_capture,
+                validation_digest,
+            )
             object.__setattr__(self, "_revision", self._revision + 1)
+
+    def _validated_capture_is_exact(
+        self,
+        *,
+        consumed: ConsumedCaptureAuthorization,
+        validated_capture: object,
+        validation_digest: Digest256,
+        _authority: object | None = None,
+    ) -> bool:
+        """Observe the exact validation lease published by InputValidator."""
+
+        if _authority is not _CAPTURE_VALIDATION_AUTHORITY:
+            raise TypeError("validation observation requires InputValidator")
+        require_digest(validation_digest, "validation_digest")
+        with self._lock:
+            identifier = self._require_consumption_locked(consumed)
+            publication = self._validated.get(identifier)
+            return (
+                type(publication) is tuple
+                and len(publication) == 2
+                and publication[0] is validated_capture
+                and publication[1] == validation_digest
+                and getattr(validated_capture, "validation_digest", None)
+                == validation_digest
+            )
+
+    def _validated_capture_for_cleanup(
+        self,
+        *,
+        consumed: ConsumedCaptureAuthorization,
+        _authority: object | None = None,
+    ) -> object | None:
+        """Return only the ledger-held lease for cleanup-only recovery."""
+
+        if _authority is not _CAPTURE_VALIDATION_AUTHORITY:
+            raise TypeError("validation recovery requires InputValidator")
+        with self._lock:
+            identifier = self._require_consumption_locked(consumed)
+            publication = self._validated.get(identifier)
+            if type(publication) is not tuple or len(publication) != 2:
+                return None
+            return publication[0]
+
+    def _validated_capture_publication_is_absent(
+        self,
+        *,
+        consumed: ConsumedCaptureAuthorization,
+        _authority: object | None = None,
+    ) -> bool:
+        """Independently prove that validation published no lease owner."""
+
+        if _authority is not _CAPTURE_VALIDATION_AUTHORITY:
+            raise TypeError("validation recovery requires InputValidator")
+        with self._lock:
+            identifier = self._require_consumption_locked(consumed)
+            return identifier not in self._validated
 
     def safe_metadata(self) -> dict[str, int]:
         with self._lock:

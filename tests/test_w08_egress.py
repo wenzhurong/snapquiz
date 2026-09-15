@@ -12,8 +12,13 @@ import unittest
 from unittest.mock import patch
 from uuid import UUID
 
+from snapquiz.adapters.openai_chat_compatible import (
+    OpenAIChatCompatibleAdapter,
+)
+from snapquiz.adapters.base import DirectMultimodalAdapter
 from snapquiz.domain.errors import CancelledError, EndpointPolicyError
 from snapquiz.domain.outbound import NonSecretHeader, PreparedOutbound
+import snapquiz.privacy.egress as egress_module
 from snapquiz.privacy.egress import (
     EgressApproval,
     EgressApprovalLedger,
@@ -47,6 +52,35 @@ class _ForbiddenEnvironment:
     keys = _reject
     items = _reject
     values = _reject
+
+
+class _SetThenRaiseMap(dict):
+    """Inject one partial publication while allowing an exact rollback."""
+
+    def __init__(self, source=None):
+        super().__init__({} if source is None else source)
+        self.armed = True
+
+    def __setitem__(self, key, value):
+        super().__setitem__(key, value)
+        if self.armed:
+            self.armed = False
+            raise RuntimeError("injected publication failure")
+
+
+class _SetThenRaiseNoDeleteMap(_SetThenRaiseMap):
+    """Inject a partial publication whose removal cannot be proven."""
+
+    def __delitem__(self, key):
+        del key
+        raise RuntimeError("injected rollback failure")
+
+
+class _NoOpSetMap(dict):
+    """Return from assignment without changing the mapping."""
+
+    def __setitem__(self, key, value):
+        del key, value
 
 
 def _approve(base, prepared, ledger, controller):
@@ -167,6 +201,157 @@ class PreviewContractTest(unittest.TestCase):
 
 
 class ApprovalContractTest(unittest.TestCase):
+    def test_trusted_adapter_catalog_is_extensible_without_provider_branch(self):
+        class AlternateMultimodalAdapter(DirectMultimodalAdapter):
+            adapter_family = "test.alternate-multimodal"
+            adapter_version = "test.v1"
+
+        catalog = (
+            *egress_module._TRUSTED_DIRECT_MULTIMODAL_ADAPTERS,
+            (
+                AlternateMultimodalAdapter.adapter_family,
+                AlternateMultimodalAdapter.adapter_version,
+                AlternateMultimodalAdapter,
+            ),
+        )
+        with patch.object(
+            egress_module,
+            "_TRUSTED_DIRECT_MULTIMODAL_ADAPTERS",
+            catalog,
+        ):
+            selected = egress_module._trusted_adapter_type(
+                adapter_family=AlternateMultimodalAdapter.adapter_family,
+                adapter_version=AlternateMultimodalAdapter.adapter_version,
+            )
+
+        self.assertIs(selected, AlternateMultimodalAdapter)
+
+    def test_catalog_selected_adapter_runs_full_egress_approval_path(self):
+        prepare_calls: list[object] = []
+
+        class CatalogSelectedAdapter(DirectMultimodalAdapter):
+            adapter_family = OpenAIChatCompatibleAdapter.adapter_family
+            adapter_version = OpenAIChatCompatibleAdapter.adapter_version
+
+            @staticmethod
+            def prepare(**kwargs):
+                prepare_calls.append(kwargs["operation_id"])
+                return OpenAIChatCompatibleAdapter.prepare(**kwargs)
+
+        base = make_w07_authorities()
+        prepared = prepare_w08(base)
+        ledger = EgressApprovalLedger()
+        catalog = (
+            (
+                CatalogSelectedAdapter.adapter_family,
+                CatalogSelectedAdapter.adapter_version,
+                CatalogSelectedAdapter,
+            ),
+        )
+
+        with patch.object(
+            egress_module,
+            "_TRUSTED_DIRECT_MULTIMODAL_ADAPTERS",
+            catalog,
+        ):
+            approval = _approve(
+                base,
+                prepared,
+                ledger,
+                FixedPreviewController(),
+            )
+
+        self.assertEqual(prepare_calls, [prepared.operation_id])
+        self.assertIs(ledger.snapshot(approval.approval_id), approval)
+        self.assertEqual(
+            approval.request_envelope_digest,
+            prepared.request_envelope_digest,
+        )
+
+    def test_gate_rebuilds_the_trusted_adapter_envelope_exactly_once(self):
+        base = make_w07_authorities()
+        prepared = prepare_w08(base)
+        original_prepare = OpenAIChatCompatibleAdapter.prepare
+
+        with patch.object(
+            OpenAIChatCompatibleAdapter,
+            "prepare",
+            wraps=original_prepare,
+        ) as prepare:
+            approval = _approve(
+                base,
+                prepared,
+                EgressApprovalLedger(),
+                FixedPreviewController(),
+            )
+
+        self.assertEqual(prepare.call_count, 1)
+        self.assertEqual(
+            approval.request_envelope_digest,
+            prepared.request_envelope_digest,
+        )
+
+    def test_private_envelope_attestation_tamper_fails_closed(self):
+        authorities = make_w08_authorities()
+        ledger = authorities.approval_ledger
+        attestation = ledger._attestations[authorities.approval.approval_id]
+        object.__setattr__(
+            attestation,
+            "subject_digest",
+            authorities.prepared.body_digest,
+        )
+
+        with self.assertRaises(EndpointPolicyError):
+            ledger.snapshot(authorities.approval.approval_id)
+
+    def test_cross_ledger_attestation_swap_fails_exact_identity_check(self):
+        first = make_w08_authorities()
+        second = make_w08_authorities()
+        approval_id = first.approval.approval_id
+        first.approval_ledger._attestations[approval_id] = (
+            second.approval_ledger._attestations[approval_id]
+        )
+
+        with self.assertRaises(EndpointPolicyError):
+            first.approval_ledger.snapshot(approval_id)
+
+    def test_exact_issue_rollback_keeps_ledger_usable(self):
+        base = make_w07_authorities()
+        prepared = prepare_w08(base)
+        ledger = EgressApprovalLedger()
+        object.__setattr__(ledger, "_attestations", _SetThenRaiseMap())
+
+        with self.assertRaises(EndpointPolicyError):
+            _approve(base, prepared, ledger, FixedPreviewController())
+
+        self.assertFalse(ledger.safe_metadata()["poisoned"])
+        self.assertEqual(ledger.safe_metadata()["approval_count"], 0)
+        approval = _approve(
+            base,
+            prepared,
+            ledger,
+            FixedPreviewController(),
+        )
+        self.assertIs(ledger.snapshot(approval.approval_id), approval)
+
+    def test_unprovable_issue_rollback_poisons_every_authority_path(self):
+        base = make_w07_authorities()
+        prepared = prepare_w08(base)
+        ledger = EgressApprovalLedger()
+        object.__setattr__(
+            ledger,
+            "_attestations",
+            _SetThenRaiseNoDeleteMap(),
+        )
+
+        with self.assertRaises(EndpointPolicyError):
+            _approve(base, prepared, ledger, FixedPreviewController())
+
+        self.assertTrue(ledger.safe_metadata()["poisoned"])
+        self.assertEqual(ledger.safe_metadata()["approval_count"], 0)
+        with self.assertRaises(EndpointPolicyError):
+            _approve(base, prepared, ledger, FixedPreviewController())
+
     def test_approval_golden_and_exact_bindings(self):
         authorities = make_w08_authorities()
         approval = authorities.approval
@@ -261,6 +446,56 @@ class ApprovalContractTest(unittest.TestCase):
                 now=approval.approved_at + timedelta(seconds=2),
             )
 
+    def test_revoke_normal_noop_never_returns_false_revocation(self):
+        authorities = make_w08_authorities()
+        approval = authorities.approval
+        ledger = authorities.approval_ledger
+        object.__setattr__(
+            ledger,
+            "_approvals",
+            _NoOpSetMap(ledger._approvals),
+        )
+
+        with self.assertRaises(EndpointPolicyError):
+            ledger.revoke(
+                approval_id=approval.approval_id,
+                revoked_at=approval.approved_at + timedelta(seconds=1),
+            )
+
+        self.assertFalse(ledger.safe_metadata()["poisoned"])
+        self.assertIs(ledger.snapshot(approval.approval_id), approval)
+        ledger.validate_active(
+            approval,
+            now=approval.approved_at + timedelta(seconds=2),
+        )
+
+    def test_revoke_partial_writes_roll_back_to_exact_active_revision(self):
+        for attribute in ("_approvals", "_current_digests"):
+            with self.subTest(attribute=attribute):
+                authorities = make_w08_authorities()
+                approval = authorities.approval
+                ledger = authorities.approval_ledger
+                object.__setattr__(
+                    ledger,
+                    attribute,
+                    _SetThenRaiseMap(getattr(ledger, attribute)),
+                )
+
+                with self.assertRaises(EndpointPolicyError):
+                    ledger.revoke(
+                        approval_id=approval.approval_id,
+                        revoked_at=(
+                            approval.approved_at + timedelta(seconds=1)
+                        ),
+                    )
+
+                self.assertFalse(ledger.safe_metadata()["poisoned"])
+                self.assertIs(ledger.snapshot(approval.approval_id), approval)
+                ledger.validate_active(
+                    approval,
+                    now=approval.approved_at + timedelta(seconds=2),
+                )
+
     def test_same_preview_decision_can_issue_only_once_under_concurrency(self):
         base = make_w07_authorities()
         prepared = prepare_w08(base)
@@ -294,6 +529,25 @@ class ApprovalContractTest(unittest.TestCase):
 
 
 class EgressBindingFailureTest(unittest.TestCase):
+    def test_adapter_absent_from_exact_trusted_catalog_fails_before_preview(self):
+        base = make_w07_authorities()
+        prepared = prepare_w08(base)
+        ledger = EgressApprovalLedger()
+        controller = FixedPreviewController()
+
+        with (
+            patch.object(
+                egress_module,
+                "_TRUSTED_DIRECT_MULTIMODAL_ADAPTERS",
+                (),
+            ),
+            self.assertRaises(EndpointPolicyError),
+        ):
+            _approve(base, prepared, ledger, controller)
+
+        self.assertEqual(controller.reviews, 0)
+        self.assertEqual(ledger.safe_metadata()["approval_count"], 0)
+
     def _assert_mutation_rejected(self, name, value):
         base = make_w07_authorities()
         prepared = prepare_w08(base)

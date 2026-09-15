@@ -562,6 +562,7 @@ class SendSessionLedger:
         "_approval_ids",
         "_lock",
         "_revision",
+        "_poisoned",
     )
 
     def __init__(self) -> None:
@@ -571,6 +572,23 @@ class SendSessionLedger:
         object.__setattr__(self, "_approval_ids", {})
         object.__setattr__(self, "_lock", RLock())
         object.__setattr__(self, "_revision", 0)
+        object.__setattr__(self, "_poisoned", False)
+
+    def _require_usable_locked(
+        self,
+        *,
+        stage: str = "send_session_factory",
+    ) -> None:
+        if self._poisoned:
+            raise _session_error(
+                "发送会话账本状态无法完整证明，已封锁。",
+                stage=stage,
+            )
+
+    def _poison_locked(self) -> None:
+        if not self._poisoned:
+            object.__setattr__(self, "_poisoned", True)
+            object.__setattr__(self, "_revision", self._revision + 1)
 
     def _issue(
         self,
@@ -582,21 +600,24 @@ class SendSessionLedger:
             raise TypeError("send sessions can only be issued by SendSessionFactory")
         self._validate_new_session(session)
         with self._lock:
+            self._require_usable_locked()
             self._require_issue_slot_locked(session)
             original_revision = self._revision
             try:
                 self._publish_locked(session)
-            except BaseException:
+                self._require_current_locked(session)
+            except BaseException as publish_error:
                 try:
                     self._rollback_publish_locked(
                         session,
                         original_revision=original_revision,
                     )
-                except BaseException as rollback_error:
+                except BaseException:
+                    self._poison_locked()
                     raise _session_error(
-                        "发送会话无法安全回滚。"
-                    ) from rollback_error
-                raise
+                        "发送会话无法安全回滚，账本已封锁。"
+                    ) from None
+                raise publish_error
 
     def _issue_with_one_shot_consent(
         self,
@@ -633,11 +654,13 @@ class SendSessionLedger:
         require_aware_datetime(consumed_at, "consumed_at")
         self._validate_new_session(session)
         with self._lock:
+            self._require_usable_locked()
             self._require_issue_slot_locked(session)
             original_session_revision = self._revision
             original_consent_revision = consent_ledger._revision
             try:
                 self._publish_locked(session)
+                self._require_current_locked(session)
                 consent_ledger._consume_for_session(
                     grant=grant,
                     authorization=authorization,
@@ -668,9 +691,10 @@ class SendSessionLedger:
                     if rollback_error is None:
                         rollback_error = error
                 if rollback_error is not None:
+                    self._poison_locked()
                     raise _session_error(
-                        "发送会话与一次性同意事务无法安全回滚。"
-                    ) from rollback_error
+                        "发送会话与一次性同意事务无法安全回滚，账本已封锁。"
+                    ) from None
                 raise
             return session
 
@@ -687,6 +711,7 @@ class SendSessionLedger:
         self,
         session: AuthorizedSendSession,
     ) -> None:
+        self._require_usable_locked()
         if session._session_ledger is not self:
             raise _session_error("发送会话不属于当前账本。")
         if session.session_id in self._sessions:
@@ -726,8 +751,14 @@ class SendSessionLedger:
             ),
         )
         for mapping, key, expected in expected_entries:
-            current = mapping.get(key)
-            if current is not None and current != expected:
+            missing = object()
+            current = mapping.get(key, missing)
+            matches = (
+                current is expected
+                if mapping is self._sessions
+                else current == expected
+            )
+            if current is not missing and not matches:
                 raise _session_error("发送会话临时事务状态已经变化。")
         if self._revision not in (
             original_revision,
@@ -735,11 +766,34 @@ class SendSessionLedger:
         ):
             raise _session_error("发送会话临时事务版本已经变化。")
         for mapping, key, expected in reversed(expected_entries):
-            if mapping.get(key) == expected:
+            current = mapping.get(key)
+            matches = (
+                current is expected
+                if mapping is self._sessions
+                else current == expected
+            )
+            if matches:
                 del mapping[key]
+        if (
+            any(key in mapping for mapping, key, _ in expected_entries)
+            or any(
+                candidate is session for candidate in self._sessions.values()
+            )
+            or any(
+                candidate == session.session_id
+                for candidate in self._approval_ids.values()
+            )
+        ):
+            raise _session_error("发送会话临时事务清理无法证明。")
         object.__setattr__(self, "_revision", original_revision)
 
-    def _require_current_locked(self, session: AuthorizedSendSession) -> None:
+    def _require_current_locked(
+        self,
+        session: AuthorizedSendSession,
+        *,
+        stage: str = "send_session_factory",
+    ) -> None:
+        self._require_usable_locked(stage=stage)
         if type(session) is not AuthorizedSendSession:
             raise TypeError("session must be AuthorizedSendSession")
         try:
@@ -761,6 +815,7 @@ class SendSessionLedger:
     def snapshot(self, session_id: UUID) -> AuthorizedSendSession:
         require_uuid(session_id, "session_id")
         with self._lock:
+            self._require_usable_locked()
             current = self._sessions.get(session_id)
             if current is None:
                 raise _session_error("发送会话不存在。")
@@ -775,6 +830,7 @@ class SendSessionLedger:
     ) -> None:
         require_aware_datetime(now, "now")
         with self._lock:
+            self._require_usable_locked()
             self._require_current_locked(session)
             try:
                 session.validate_active_at(now)
@@ -797,7 +853,8 @@ class SendSessionLedger:
         if not callable(action):
             raise TypeError("action must be callable")
         with self._lock:
-            self._require_current_locked(session)
+            self._require_usable_locked(stage="attempt_gate")
+            self._require_current_locked(session, stage="attempt_gate")
             try:
                 session.validate_active_at(now)
             except ValueError as error:
@@ -816,6 +873,7 @@ class SendSessionLedger:
         require_uuid(session_id, "session_id")
         require_aware_datetime(revoked_at, "revoked_at")
         with self._lock:
+            self._require_usable_locked()
             current = self._sessions.get(session_id)
             if current is None:
                 raise _session_error("无法撤销不存在的发送会话。")
@@ -828,16 +886,47 @@ class SendSessionLedger:
                 )
             except ValueError as error:
                 raise _session_error("发送会话当前不可撤销。") from error
-            self._sessions[session_id] = replacement
-            self._current_digests[session_id] = replacement.session_digest
-            object.__setattr__(self, "_revision", self._revision + 1)
+            original_revision = self._revision
+            transition_failure: BaseException | None = None
+            rollback_proven = False
+            try:
+                self._sessions[session_id] = replacement
+                self._current_digests[session_id] = replacement.session_digest
+                object.__setattr__(self, "_revision", original_revision + 1)
+                self._require_current_locked(replacement)
+            except BaseException as error:
+                transition_failure = error
+                try:
+                    self._sessions[session_id] = current
+                    self._current_digests[session_id] = current.session_digest
+                    object.__setattr__(self, "_revision", original_revision)
+                    self._require_current_locked(current)
+                    rollback_proven = True
+                except BaseException:
+                    rollback_proven = False
+                if not rollback_proven:
+                    self._poison_locked()
+            if transition_failure is not None:
+                if rollback_proven and isinstance(
+                    transition_failure,
+                    (KeyboardInterrupt, SystemExit),
+                ):
+                    raise transition_failure
+                if rollback_proven:
+                    raise _session_error(
+                        "发送会话撤销未能完整提交。"
+                    )
+                raise _session_error(
+                    "发送会话撤销状态无法证明，账本已封锁。"
+                )
             return replacement
 
-    def safe_metadata(self) -> dict[str, int]:
+    def safe_metadata(self) -> dict[str, int | bool]:
         with self._lock:
             return {
                 "revision": self._revision,
                 "session_count": len(self._sessions),
+                "poisoned": self._poisoned,
             }
 
 
@@ -1023,6 +1112,11 @@ class SendSessionFactory:
 
             return approval_ledger._consume_with(
                 approval=approval,
+                planned=planned,
+                invocation=invocation,
+                prepared=prepared,
+                authorization=authorization,
+                planned_stage=stage,
                 now=now,
                 action=issue_session,
                 _authority=_EGRESS_SESSION_AUTHORITY,

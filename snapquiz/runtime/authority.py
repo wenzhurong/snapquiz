@@ -33,6 +33,7 @@ TRANSPORT_BINDING_SCHEMA_VERSION = "snapquiz.transport-binding.v1"
 
 _LEASE_AUTHORITY = object()
 _CONTEXT_AUTHORITY = object()
+_CONTEXT_CHECKPOINT_AUTHORITY = object()
 _ATTEMPT_AUTHORITY = object()
 _LEASE_UUID_NAMESPACE = UUID("c9d84f4f-2934-53cb-815d-f21b99171038")
 _T = TypeVar("_T")
@@ -430,6 +431,7 @@ class RegistryPolicyAuthorityLedger:
         *,
         lease: RegistryPolicyLease,
         planned: PlannedExecution,
+        error_stage: str = "attempt_gate",
     ) -> None:
         valid = type(lease) is RegistryPolicyLease
         if valid:
@@ -452,7 +454,7 @@ class RegistryPolicyAuthorityLedger:
         ):
             raise _authority_error(
                 "注册表或传输策略授权已经变化。",
-                stage="attempt_gate",
+                stage=error_stage,
             )
 
     def _issue_with(
@@ -525,6 +527,28 @@ class RegistryPolicyAuthorityLedger:
             self._require_current_lease_locked(
                 lease=lease,
                 planned=planned,
+            )
+            return action()
+
+    def _run_context_checkpoint(
+        self,
+        *,
+        lease: RegistryPolicyLease,
+        planned: PlannedExecution,
+        action: Callable[[], _T],
+        _authority: object | None = None,
+    ) -> _T:
+        """Run a W10 non-attempt checkpoint in Authority -> Context order."""
+
+        if _authority is not _CONTEXT_CHECKPOINT_AUTHORITY:
+            raise TypeError("context checkpoints require CallContextLedger")
+        if not callable(action):
+            raise TypeError("action must be callable")
+        with self._lock:
+            self._require_current_lease_locked(
+                lease=lease,
+                planned=planned,
+                error_stage="call_context",
             )
             return action()
 

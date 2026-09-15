@@ -353,7 +353,7 @@ class W09ConsentUseLeaseTest(unittest.TestCase):
         )
         self.assertEqual(
             session_ledger.safe_metadata(),
-            {"revision": 0, "session_count": 0},
+            {"revision": 0, "session_count": 0, "poisoned": False},
         )
         burned = approval_ledger.snapshot(approval.approval_id)
         self.assertEqual(burned.consumed_at, SESSION_AT)
@@ -450,7 +450,11 @@ class W09ConsentUseLeaseTest(unittest.TestCase):
 
                     self.assertEqual(
                         session_ledger.safe_metadata(),
-                        {"revision": 0, "session_count": 0},
+                        {
+                            "revision": 0,
+                            "session_count": 0,
+                            "poisoned": False,
+                        },
                     )
                     with self.assertRaises(EndpointPolicyError):
                         session_ledger.snapshot(sessions[0].session_id)
