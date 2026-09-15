@@ -51,7 +51,7 @@ class Recorder:
 
 
 def build(recorder, *, approve=True, capture_exc=None, permission_exc=None, env_key="k"):
-    cfg = Config(region=(0, 0, 640, 480))
+    cfg = Config(region=(0, 0, 640, 480), model="glm-4v-flash")
 
     def capture():
         recorder.captures += 1

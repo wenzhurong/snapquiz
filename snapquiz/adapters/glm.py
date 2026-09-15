@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 from typing import Any, Optional
 
 from snapquiz.adapters.base import DirectMultimodalAdapter
@@ -34,6 +35,34 @@ GLM_ADAPTER_VERSION = "2"
 GLM_PROVIDER_ID = "zhipu"
 PROVIDER_PROFILE_ID = "zhipu.glm-4.6v"
 MAX_OUTPUT_TOKENS = 1024
+
+
+class OutputBudgetExhausted(InvalidOutputError):
+    """max_tokens 被思维链耗尽，模型没来得及给出答案。
+
+    推理模型（见 config.REASONING_MODELS）的 token 预算必须同时覆盖
+    reasoning_content 与 content；不足时服务端返回 finish_reason="length"
+    且 content 为空字符串。
+    """
+
+
+# 实测（2026-09-15，glm-4v-flash）：即使 system prompt 明确写了
+# "no Markdown, code fence, commentary"，模型仍然会把 JSON 包在 ```json 围栏里。
+# 这是**传输层的包装**，不是内容问题，所以在严格解析前剥掉它。
+# 剥掉之后里面的 JSON 仍然走完整严格解析（重复 key / NaN / 超深嵌套一律拒绝），
+# 结果对象也仍然要过 validate_solve_result 的九字段精确校验。
+# 注意不要退回 MVP-0 那种"在任意文本里捞第一个 JSON 对象"的宽松做法 ——
+# 那会让模型的解释性文字混进结果。这里只接受**整段内容恰好是一个围栏**。
+_FENCE_RE = re.compile(
+    r"\A\s*```(?:[A-Za-z0-9_+-]{0,20})?[ \t]*\r?\n(?P<body>.*?)\r?\n?```\s*\Z",
+    re.DOTALL,
+)
+
+
+def _unwrap_code_fence(content: str) -> str:
+    match = _FENCE_RE.match(content)
+    return match.group("body") if match else content
+
 
 _ACCEPT = NonSecretHeader(
     lowercase_name="accept", normalized_value="application/json"
@@ -168,6 +197,12 @@ class GlmChatAdapter(DirectMultimodalAdapter):
 
         content = message.get("content")
         if content is None or type(content) is not str or not content.strip():
+            if finish_reason == "length":
+                # 推理模型的典型失败：思维链吃光了 token 预算，content 为空。
+                # 这不是"模型乱答"，而是预算配置问题，值得单独报出来。
+                raise OutputBudgetExhausted(
+                    stage=DECODE_STAGE, provider_profile_id=PROVIDER_PROFILE_ID
+                )
             raise _invalid()
 
         if finish_reason == "sensitive":
@@ -182,7 +217,7 @@ class GlmChatAdapter(DirectMultimodalAdapter):
             )
 
         try:
-            payload = strict_json_bytes(content.encode("utf-8"))
+            payload = strict_json_bytes(_unwrap_code_fence(content).encode("utf-8"))
         except (UnicodeError, ValueError, TypeError, OverflowError, RecursionError):
             raise _invalid() from None
         if type(payload) is not dict:
@@ -205,6 +240,7 @@ def prepared_model(prepared: OutboundRequest) -> str:
 
 
 __all__ = [
+    "OutputBudgetExhausted",
     "GLM_ADAPTER_FAMILY",
     "GLM_ADAPTER_VERSION",
     "GLM_PROVIDER_ID",

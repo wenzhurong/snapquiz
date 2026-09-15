@@ -128,7 +128,6 @@ def main(argv=None) -> int:
     print(f"  HTTP        {response.http_status}")
     print(f"  延迟        {latency_ms} ms")
     print(f"  响应体      {response.response_byte_size} 字节")
-    print(f"  request_id  {response.provider_request_id}")
 
     try:
         candidate = adapter.decode(prepared=prepared, response=response)
@@ -136,6 +135,9 @@ def main(argv=None) -> int:
         print(f"\n❌ 解码失败:{type(exc).__name__}: {exc}")
         print("   服务端接受了请求,但响应形状与 Adapter 预期不符。")
         return EXIT_API_ERROR
+
+    # 智谱把 request_id 放在响应体里，不是响应头，所以要等解码后才拿得到。
+    print(f"  request_id  {candidate.provider_request_id}")
 
     usage = candidate.usage
     print("\n— 用量 —")

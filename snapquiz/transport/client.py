@@ -102,7 +102,12 @@ def send_once(
 
 
 def _provider_request_id(response) -> str | None:
-    """智谱把请求 id 放在响应头里；取不到就算了，它只用于对账。"""
+    """响应头里的请求 id（若有）。
+
+    实测智谱不发这个头，而是把 request_id 放在响应体里 —— 那个由 Adapter 解码后
+    提供（``AnswerCandidateResult.provider_request_id``）。这里保留头部读取是因为
+    它在传输层就能拿到，对诊断「请求发出去了但响应解不开」的场景有用。
+    """
 
     value = response.headers.get("x-request-id")
     if type(value) is str and 0 < len(value) <= 256:

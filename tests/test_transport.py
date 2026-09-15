@@ -20,7 +20,7 @@ except ImportError:  # pragma: no cover - httpx 是运行依赖，纯逻辑测�
 PNG = b"\x89PNG\r\n\x1a\nfake"
 SUCCESS = json.dumps(
     {
-        "model": "glm-4.6v-flash",
+        "model": "glm-4v-flash",
         "choices": [
             {
                 "index": 0,
@@ -74,7 +74,7 @@ class SendOnceTest(unittest.TestCase):
         from snapquiz.transport.client import send_once
 
         self.send_once = send_once
-        self.cfg = Config(region=(0, 0, 640, 480))
+        self.cfg = Config(region=(0, 0, 640, 480), model="glm-4v-flash")
         self.prepared = GlmChatAdapter().prepare(config=self.cfg, png=PNG)
         for key in FORBIDDEN_TLS_ENVIRONMENT_KEYS:
             if key in os.environ:

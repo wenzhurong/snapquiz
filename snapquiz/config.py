@@ -12,13 +12,26 @@ from typing import Mapping, Optional, Tuple
 
 DEFAULT_BASE_URL = "https://open.bigmodel.cn/api/paas/v4"
 CHAT_COMPLETIONS_PATH = "/chat/completions"
-DEFAULT_MODEL = "glm-4.6v-flash"
+DEFAULT_MODEL = "glm-4v-flash"
 DEFAULT_HOTKEY = "cmd+shift+space"
 DEFAULT_TIMEOUT = 30.0
 API_KEY_ENV = "GLM_API_KEY"
 
-# 只允许已知的智谱视觉模型；未知模型名不得继承已知能力。
-ALLOWED_MODELS = frozenset({"glm-4.6v-flash", "glm-4.6v"})
+# 只允许**已实测可用**的智谱视觉模型；未知模型名不得继承已知能力。
+# 2026-09-15 实测（tests/fixtures/sample_question.png，单次调用）：
+#   glm-4v-flash    ✅ 稳定；非推理模型，答案直接在 content
+#   glm-4v          ✅ 稳定；非推理模型
+#   glm-4.6v-flash  ⚠️ 间歇 1305「访问量过大」(3 次里中 1 次)；推理模型
+#   glm-4.6v        ✅ 可用；推理模型
+#   glm-4.5v        ✅ 可用；推理模型
+#   glm-4.5-air     ❌ 纯文本，拒收图片（1210 messages.content.type 取值范围 ['text']）
+ALLOWED_MODELS = frozenset(
+    {"glm-4v-flash", "glm-4v", "glm-4.6v-flash", "glm-4.6v", "glm-4.5v"}
+)
+
+# 推理模型把思维链放在 reasoning_content，答案在 content。token 预算必须同时覆盖两者：
+# 预算不足时 finish_reason="length" 且 content 为空（实测 max_tokens=50 时 reasoning 就吃掉 49）。
+REASONING_MODELS = frozenset({"glm-4.6v-flash", "glm-4.6v", "glm-4.5v"})
 
 Region = Tuple[int, int, int, int]  # left, top, width, height（屏幕「点」坐标）
 

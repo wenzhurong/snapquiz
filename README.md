@@ -2,8 +2,9 @@
 
 个人学习刷题助手 —— 热键一按,读取屏幕上的题目,调用 LLM 给出**答案 + 解析 + 相关知识点**,辅助自学、自测与错题复习。
 
-> **状态(2026-09-15):✅ 核心闭环可用**(热键截屏 → GLM → 答案+解析)。
-> 尚未接入真实 API 冒烟(Task 3)、拖框选区(Task 4)、错题本与浮层(阶段 B)。
+> **状态(2026-09-15):✅ 核心闭环可用,真实 API 已打通**。
+> 对固定合成题图实测:`glm-4v-flash` 4.3 秒答对,过严格校验。
+> 尚未接入拖框选区(Task 4)、评测集、错题本与浮层(阶段 B)。
 > v3 时期的 7.6 万行离线安全链已封存于 tag `v3-transport-research`;
 > 重建过程与后续计划见 [docs/RECOVERY_PLAN.md](docs/RECOVERY_PLAN.md)。
 
@@ -72,7 +73,7 @@ snapquiz --trigger hotkey        # 全局热键(默认 Cmd+Shift+Space,需 [hotk
 |---|---|---|
 | `GLM_API_KEY` | ✅ | 智谱开放平台 API Key |
 | `SNAPQUIZ_REGION` | ✅ | `left,top,width,height`。**没有全屏默认值** —— 默认全屏会把聊天、终端、通知一并上传 |
-| `GLM_MODEL` | | `glm-4.6v-flash`(默认)或 `glm-4.6v`;白名单外的模型名会被拒绝 |
+| `GLM_MODEL` | | 默认 `glm-4v-flash`(实测最快最稳)。白名单:`glm-4v-flash` / `glm-4v` / `glm-4.6v` / `glm-4.5v` / `glm-4.6v-flash`。**注意 `glm-4.5-air` 等纯文本模型用不了**,本工具发的是截图 |
 | `GLM_BASE_URL` | | 只允许官方 endpoint;自定义地址会被拒绝 |
 | `SNAPQUIZ_HOTKEY` | | 默认 `cmd+shift+space` |
 | `SNAPQUIZ_TIMEOUT` | | 默认 30 秒 |
@@ -91,7 +92,10 @@ python3 -m unittest discover -s tests    # 137 个离线单测,约 0.15 秒
 GLM 线格与 34 个业务错误码、严格 JSON 解码、出站字节不可变性与密钥隔离、
 编排顺序(取消则零网络零密钥)、结果严格校验、呈现格式。
 
-真实 GLM 网络调用、真实 TCC 权限弹窗、全局热键监听需在 macOS 上实跑验证。
+另有 `python -m snapquiz.smoke` 对固定合成题图打一次**真实** GLM(单次,无重试),
+用来验证请求形状确实被服务端接受 —— 离线 golden 证明不了这件事。
+
+真实 TCC 权限弹窗、全局热键监听仍需在 macOS 上实跑验证。
 
 ## 许可
 

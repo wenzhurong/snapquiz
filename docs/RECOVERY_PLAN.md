@@ -578,14 +578,70 @@ BusyGuard 把编排丢进后台线程，后台线程的 `input()` 和主线程�
 `hotkey` 保留 BusyGuard（连击护栏是它存在的理由），确认改走 osascript 系统对话框。
 **这个 bug 靠单测发现不了，只有跑真实 CLI 才会暴露** —— 这正是「验收判据必须在代码之外」的意义。
 
+### Task 3 — 完成（2026-09-15）
+
+**验收句已满足**：对 `tests/fixtures/sample_question.png` 打真实 GLM，
+拿到通过严格 Validator 的 `SolveResult`，答案正确。
+
+```
+HTTP 200 | 延迟 4277 ms | prompt 1389 + completion 136 = 1525 tokens
+答案:C. 29   正确答案 C → ✅ 答对
+```
+
+#### 这一步暴露了三件离线永远测不出来的事
+
+**1. 模型不听 prompt，照样加 Markdown 围栏。**
+system prompt 明写 "no Markdown, code fence, commentary"，模型仍然返回：
+
+    ```json
+    { "schema_version": "snapquiz.solve-result.v2", ... }
+    ```
+
+第一次真实调用就因此 `InvalidOutputError` 失败。讽刺的是 MVP-0 的
+`llm/parse.py` 本来就处理围栏（`_FENCE_RE`），是 v3 的严格 Adapter 把这份宽容丢了。
+
+修法：`_unwrap_code_fence` 只接受**整段内容恰好是一个围栏**，剥掉后里面的 JSON
+仍走完整严格解析、结果仍过九字段精确校验。**没有**退回 MVP-0 那种
+「在任意文本里捞第一个 JSON 对象」——围栏外只要有一个字的解释文字就拒绝。
+
+**2. `glm-4.5-air` 不是多模态模型，本产品用不了。**
+`1210 messages.content.type 参数非法，取值范围 ['text']`。截图工具必须用视觉模型。
+
+**3. 「v」系列是推理模型，token 预算要同时覆盖思维链。**
+`glm-4.6v` / `glm-4.5v` / `glm-4.6v-flash` 把思维链放在 `reasoning_content`，
+答案放在 `content`。`max_tokens=50` 时 `reasoning_tokens=49`、`content=''`、
+`finish_reason="length"` —— 看起来像"模型返回空"，其实是预算配置问题。
+已为它单开 `OutputBudgetExhausted`，不和"模型乱答"混为一谈。
+
+#### 实测模型矩阵（2026-09-15，同一张图，单次调用）
+
+| 模型 | 结果 | 延迟 | completion tokens | 备注 |
+|---|---|---:|---:|---|
+| **`glm-4v-flash`** | ✅ 答对 | 4.3 s | 136 | **当前默认**；非推理，快且稳 |
+| `glm-4.6v` | ✅ 答对 | 13.5 s | 330 | 推理模型，慢 3 倍 |
+| `glm-4.6v-flash` | ❌ `1305` | — | — | 3 次里 2 次「访问量过大」 |
+| `glm-4.5v` | ⚠️ 未过完整链路 | — | — | 推理模型，仅裸 API 验证过 |
+| `glm-4.5-air` | ❌ `1210` | — | — | 纯文本，拒收图片 |
+
+默认模型因此从 `glm-4.6v-flash` 改为 `glm-4v-flash`。
+
+#### 顺带验证到的
+
+- **错误映射对真实服务端成立**：`glm-4.6v-flash` 的 `1305` 被正确映射成
+  `ProviderUnavailableError`（retryable=True），不是靠 fixture 推测的。
+- 模型返回 `confidence: 1`（int 不是 float），Validator 接受 —— 已补测试钉死。
+- 请求线格（model / messages / max_tokens 三个顶层键，`[image_url, text]` 两段）
+  **被真实服务端接受**，golden fixture 这一点是对的。
+
 ---
 
 ## 4. 已知问题（滚动记录）
 
 - `-y/--yes` 跳过确认后，隐私护栏只剩「必须显式选区」一条。Task 4 的图片预览落地前不建议常用。
 - `hotkey` 模式的 osascript 确认对话框只显示字节数和目标，不显示图片本身；Task 4 补。
-- 真实 GLM API 尚未打过一次（Task 3）。当前请求形状只对着 golden fixture 核对过，
-  **未经真实服务端验证**。
+- `glm-4.5v` 只做过裸 API 验证，没跑过完整链路（它是推理模型，理论上与 4.6v 同路）。
+- 推理模型在完整九字段 prompt 下的 token 消耗未系统测量；`MAX_OUTPUT_TOKENS=1024`
+  对这道简单题够用（330），复杂题是否够未知。
 - **v3 各层不可按文件切分**（见 §1 的结构事实框）。任何"先删一半再让另一半编译过"的
   做法都会立刻 ImportError。白名单 27 文件已实跑验证，悬空 import 恰好 5 处。
 - `PermissionGate.require_granted` 要求 `observation.observed_at == now` 精确相等，

@@ -2,7 +2,12 @@ import json
 import pathlib
 import unittest
 
-from snapquiz.adapters.glm import PROVIDER_PROFILE_ID, GlmChatAdapter
+from snapquiz.adapters.glm import (
+    PROVIDER_PROFILE_ID,
+    GlmChatAdapter,
+    OutputBudgetExhausted,
+    _unwrap_code_fence,
+)
 from snapquiz.config import Config
 from snapquiz.domain.adapter import NormalizedRefusal, TransportResponse
 from snapquiz.domain.errors import (
@@ -22,8 +27,13 @@ FIXTURES = pathlib.Path(__file__).parent / "fixtures"
 PNG = b"\x89PNG\r\n\x1a\nfake-pixels"
 
 
-def cfg():
-    return Config(region=(0, 0, 640, 480))
+# golden fixture 录的是 glm-4.6v-flash 的响应；测试显式钉住它，
+# 不依赖 DEFAULT_MODEL（那个会随实测可用性变化）。
+FIXTURE_MODEL = "glm-4.6v-flash"
+
+
+def cfg(model=FIXTURE_MODEL):
+    return Config(region=(0, 0, 640, 480), model=model)
 
 
 def err_body(code):
@@ -141,6 +151,102 @@ class DecodeTest(unittest.TestCase):
             validate_answer_candidate(
                 candidate, response=self._resp(body), provenance=provenance()
             )
+
+
+class RealWorldResponseTest(unittest.TestCase):
+    """这些形状来自 2026-09-15 对真实 GLM 的实测，不是想象出来的。"""
+
+    def setUp(self):
+        self.adapter = GlmChatAdapter()
+        self.prepared = self.adapter.prepare(config=cfg(), png=PNG)
+
+    def _resp(self, body):
+        return TransportResponse(
+            request_envelope_digest=self.prepared.envelope_digest,
+            http_status=200,
+            body=body,
+        )
+
+    def _wrapped(self, content, finish="stop"):
+        return json.dumps({
+            "model": FIXTURE_MODEL,
+            "choices": [{"index": 0,
+                         "message": {"role": "assistant", "content": content},
+                         "finish_reason": finish}],
+        }).encode()
+
+    ANSWER = {
+        "schema_version": "snapquiz.solve-result.v2", "status": "answered",
+        "question_summary": "下列四个数中，哪一个是质数？", "answer": "C. 29",
+        "rationale": "只有 29 是质数。", "confidence": 1,
+        "confidence_kind": "model_self_reported",
+        "confidence_calibration_ref": None, "warnings": [],
+    }
+
+    def test_markdown_fenced_json_is_accepted(self):
+        """实测:即使 prompt 明令禁止,模型仍会用 ```json 围栏包住答案。"""
+
+        fenced = "```json\n" + json.dumps(self.ANSWER, ensure_ascii=False) + "\n```"
+        candidate = self.adapter.decode(
+            prepared=self.prepared, response=self._resp(self._wrapped(fenced))
+        )
+        self.assertEqual(candidate.candidate_payload["answer"], "C. 29")
+
+    def test_integer_confidence_is_accepted(self):
+        """实测:模型给的是 confidence: 1(int),不是 1.0。"""
+
+        result = validate_answer_candidate(
+            self.adapter.decode(
+                prepared=self.prepared,
+                response=self._resp(self._wrapped(json.dumps(self.ANSWER))),
+            ),
+            response=self._resp(self._wrapped(json.dumps(self.ANSWER))),
+            provenance=provenance(),
+        )
+        self.assertEqual(result.confidence, 1)
+
+    def test_fence_unwrapping_stays_strict(self):
+        """只接受「整段内容恰好是一个围栏」,不退回 MVP-0 的任意捞取。"""
+
+        self.assertEqual(_unwrap_code_fence('```json\n{"a":1}\n```'), '{"a":1}')
+        self.assertEqual(_unwrap_code_fence('```\n{"a":1}\n```'), '{"a":1}')
+        self.assertEqual(_unwrap_code_fence('{"a":1}'), '{"a":1}')
+        # 围栏外有解释文字 → 不剥,后续严格解析会拒绝
+        for noisy in ('让我想想:```json\n{"a":1}\n```', '```json\n{"a":1}\n``` 完毕'):
+            self.assertEqual(_unwrap_code_fence(noisy), noisy)
+
+    def test_commentary_around_fence_is_still_refused(self):
+        noisy = '好的,答案是:```json\n' + json.dumps(self.ANSWER) + '\n```'
+        with self.assertRaises(InvalidOutputError):
+            self.adapter.decode(
+                prepared=self.prepared, response=self._resp(self._wrapped(noisy))
+            )
+
+    def test_reasoning_budget_exhaustion_is_its_own_error(self):
+        """推理模型的典型失败:思维链吃光 max_tokens,content 为空、finish=length。
+
+        实测 glm-4.6v + max_tokens=50 时 reasoning_tokens=49、content=''。
+        这是预算配置问题,不该和"模型乱答"混为一谈。
+        """
+
+        body = json.dumps({
+            "model": FIXTURE_MODEL,
+            "choices": [{"index": 0,
+                         "message": {"role": "assistant", "content": "",
+                                     "reasoning_content": "用户现在需要判断哪个数是质数..."},
+                         "finish_reason": "length"}],
+            "usage": {"prompt_tokens": 1091, "completion_tokens": 50,
+                      "total_tokens": 1141},
+        }).encode()
+        with self.assertRaises(OutputBudgetExhausted):
+            self.adapter.decode(prepared=self.prepared, response=self._resp(body))
+
+    def test_empty_content_without_length_stays_generic(self):
+        with self.assertRaises(InvalidOutputError) as ctx:
+            self.adapter.decode(
+                prepared=self.prepared, response=self._resp(self._wrapped("", finish="stop"))
+            )
+        self.assertNotIsInstance(ctx.exception, OutputBudgetExhausted)
 
 
 class ErrorMappingTest(unittest.TestCase):
