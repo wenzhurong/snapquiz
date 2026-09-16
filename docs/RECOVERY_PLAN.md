@@ -820,6 +820,54 @@ Provider 原文不进异常 · 模型自评不以百分比展示。
 **阶段 A 交付物形态**：venv + 终端命令，没有可双击的东西，
 屏幕录制权限记在终端名下。这些在 §1.5 就写清楚了，没有变。
 
+### 打包（2026-09-16，计划外提前）
+
+`python scripts/build_app.py` → `dist/SnapQuiz.app`（44 MB，未签名）。
+
+打包不只是跑 py2app —— **双击启动的 .app 没有终端**，stdin 触发、终端确认、
+`print` 输出全部失效。补齐的 GUI 路径：`is_gui_launch()` 检测无 tty 自动切到
+「热键 + 系统对话框」；结果与错误走对话框；同意书也有对话框版；热键监听在后台
+线程、主线程停在「运行中」对话框上作为唯一退出口。
+
+两个坑：py2app 0.28 不支持 `install_requires`，而 setuptools 会把 pyproject 的
+`dependencies` 映射成它（`scripts/build_app.py` 在构建期把 pyproject 临时挪开，
+try/finally 保证还原）；双击时 CWD 是 `/`，读不到仓库里的 `.env`（改成
+`~/.snapquiz/.env` 打底 + 就近 `.env` 覆盖两层加载）。
+
+### Task 9 — Carbon 零权限热键（实现完成，**等人工验证**）
+
+`snapquiz/hotkey/carbon_hotkey.py`。目标：摆脱 pynput 需要的**辅助功能**权限 ——
+那个权限等于允许程序读取所有按键并控制电脑，为一个截图工具开这口子不划算。
+
+已确认的部分：
+
+- pyobjc **只暴露了一半**：`RegisterEventHotKey` / `UnregisterEventHotKey` /
+  `EventHotKeyID` 有，`InstallEventHandler` / `GetApplicationEventTarget` /
+  `GetEventParameter` 没有。只注册不装 handler 收不到事件，所以改用 `ctypes`
+  直接调 Carbon.framework —— 那五个函数都在。
+- `InstallEventHandler` 与 `RegisterEventHotKey` 都返回 OSStatus 0，
+  **全程没有触发辅助功能权限请求**。这一点是这个 Task 的核心价值所在。
+
+**无法自动验证的部分，以及为什么**：
+
+注册成功证明不了热键可用 —— 实测会 OSStatus 0 却收不到任何事件。我试了四种
+形态：终端 Python、加 `NSApplication`、`nextEventMatchingMask` 手动泵、
+真正的 `NSApp.run()`，再加上从 .app bundle 里跑，全都收不到。
+
+于是我做了一个决定性实验：用 `CGEventPost` 合成 **Cmd+Shift+3**（系统自己的
+截图热键），桌面上**没有出现截图**。也就是说 **macOS 的热键分发层完全忽略合成
+按键** —— 我的测试装置从原理上就验证不了这件事，只有真人按键能。
+
+（注意这不影响结论方向：合成按键 pynput 是看得见的（CGEventTap 层级更低），
+但热键分发在更上层。所以「pynput 收得到、Carbon 收不到」不能说明 Carbon 坏了。）
+
+因此：**默认仍是 pynput**，Carbon 作为待验证实现并存。
+`snapquiz --carbon-selftest` 让用户按一次键，两种事件泵各试一轮，一次就能知道
+哪种（如果有）可用。验证通过再切默认。
+
+这条与 [[acceptance-criteria-must-be-user-observable]] 一致：验收判据在代码之外，
+而这一次连「代码之外」都只能是人的手指。
+
 ---
 
 ## 4. 已知问题（滚动记录）

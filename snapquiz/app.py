@@ -400,6 +400,11 @@ def main(argv=None) -> int:
         action="store_true",
         help="强制 GUI 模式(热键 + 系统对话框)。双击 .app 启动时自动开启",
     )
+    parser.add_argument(
+        "--carbon-selftest",
+        action="store_true",
+        help="检测本机能否使用零权限 Carbon 热键(需要你按一次组合键)",
+    )
     parser.add_argument("--verbose", action="store_true", help="打印调试日志")
     args = parser.parse_args(argv)
 
@@ -410,6 +415,11 @@ def main(argv=None) -> int:
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+
+    if args.carbon_selftest:
+        from snapquiz.hotkey.carbon_hotkey import selftest
+
+        return EXIT_OK if selftest() else EXIT_PERMISSION_ERROR
 
     if args.revoke_consent:
         from snapquiz.privacy import consent
