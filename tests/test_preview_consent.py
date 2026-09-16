@@ -437,3 +437,74 @@ class ShippedScriptsTest(unittest.TestCase):
                 lambda s=state, r=reason: PermissionObservation(s, r),
             ), patch.object(module, "request_screen_recording", lambda: False):
                 self.assertEqual(module.main(), expected)
+
+
+class PackagedAppConfigTest(unittest.TestCase):
+    """打包成 .app 之后工作目录是 `/`，仓库里的 .env 根本不在搜索路径上。"""
+
+    def setUp(self):
+        from snapquiz import app
+
+        self.app = app
+        self.home = pathlib.Path(tempfile.mkdtemp(prefix="snapquiz-home-"))
+        self.cwd = pathlib.Path(tempfile.mkdtemp(prefix="snapquiz-cwd-"))
+        patcher = patch.multiple(
+            app,
+            USER_CONFIG_DIR=self.home,
+            USER_ENV_PATH=self.home / ".env",
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _load_with(self, user_env=None, local_env=None):
+        import os
+
+        if user_env is not None:
+            (self.home / ".env").write_text(user_env, encoding="utf-8")
+        if local_env is not None:
+            (self.cwd / ".env").write_text(local_env, encoding="utf-8")
+        keys = ("SNAPQUIZ_PROVIDER", "SNAPQUIZ_TESTVAL")
+        saved = {k: os.environ.pop(k, None) for k in keys}
+        old = os.getcwd()
+        try:
+            os.chdir(self.cwd)
+            self.app.load_environment()
+            return {k: os.environ.get(k) for k in keys}
+        finally:
+            os.chdir(old)
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+    def test_user_level_env_is_found_regardless_of_cwd(self):
+        got = self._load_with(user_env="SNAPQUIZ_TESTVAL=from-user\n")
+        self.assertEqual(got["SNAPQUIZ_TESTVAL"], "from-user")
+
+    def test_nearby_env_overrides_the_user_level_one(self):
+        """从仓库里跑时，手头那份配置更贴近当下的工作，应当压过全局。"""
+
+        got = self._load_with(
+            user_env="SNAPQUIZ_TESTVAL=from-user\n",
+            local_env="SNAPQUIZ_TESTVAL=from-local\n",
+        )
+        self.assertEqual(got["SNAPQUIZ_TESTVAL"], "from-local")
+
+    def test_missing_both_is_not_an_error(self):
+        self._load_with()  # 不抛错即可
+
+    def test_gui_missing_key_message_names_the_fixed_path(self):
+        text = self.app.missing_key_help("GLM_API_KEY", gui=True)
+        self.assertIn(str(self.home / ".env"), text)
+        self.assertIn("GLM_API_KEY", text)
+
+    def test_terminal_missing_key_message_points_at_the_project(self):
+        text = self.app.missing_key_help("GLM_API_KEY", gui=False)
+        self.assertIn(".env.example", text)
+
+    def test_gui_launch_detected_without_a_tty(self):
+        import io
+
+        with patch("sys.stdin", io.StringIO("")):
+            self.assertTrue(self.app.is_gui_launch())

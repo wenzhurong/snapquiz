@@ -91,3 +91,42 @@ def present(result: SolveResult) -> None:
 def notify_error(message: str) -> None:
     print("⚠️ " + message, flush=True)
     _osascript_notify("snapquiz", message[:120])
+
+
+# --------------------------------------------------------------------------
+# GUI 模式：打包成 .app 双击运行时没有终端，print 会消失在虚空里
+# --------------------------------------------------------------------------
+
+
+def _osascript_dialog(text: str, *, title: str, buttons: str, timeout: int = 300) -> str:
+    safe = text.replace("\\", "\\\\").replace('"', '\\"')
+    script = (
+        f'display dialog "{safe}" with title "{title}" '
+        f"buttons {buttons} giving up after {timeout}"
+    )
+    try:
+        done = subprocess.run(
+            ["osascript", "-e", script], capture_output=True, timeout=timeout + 10,
+            check=False,
+        )
+    except Exception as exc:
+        logger.debug("osascript dialog 失败:%s", exc)
+        return ""
+    return done.stdout.decode("utf-8", errors="replace")
+
+
+def present_in_dialog(result: SolveResult) -> None:
+    """GUI 模式的结果呈现：把完整答案放进系统对话框。
+
+    通知栏放不下解析（会被截断），所以答案走对话框、通知只做提醒。
+    """
+
+    print(format_result(result), flush=True)  # 从终端启动时仍然有用
+    _osascript_dialog(
+        format_result(result), title="snapquiz", buttons='{"好"}'
+    )
+
+
+def notify_error_in_dialog(message: str) -> None:
+    print("⚠️ " + message, flush=True)
+    _osascript_dialog(message, title="snapquiz 出错", buttons='{"好"}', timeout=60)

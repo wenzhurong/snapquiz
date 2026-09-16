@@ -42,6 +42,11 @@ DerivedData/
 xcuserdata/
 *.xcuserstate
 
+# === py2app 打包产物 ===
+build/
+dist/
+*.py2app-stash
+
 # === Runtime artifacts ===
 *.log
 logs/

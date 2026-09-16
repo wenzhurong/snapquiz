@@ -20,6 +20,8 @@ snapquiz = "snapquiz.app:main"
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
+# 打包成 SnapQuiz.app（不签名）
+app = ["py2app>=0.28", "pynput>=1.7"]
 # 真·全局热键(--trigger hotkey);macOS 上需授予「辅助功能」权限
 hotkey = ["pynput>=1.7"]
 
