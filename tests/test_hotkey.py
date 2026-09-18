@@ -1,6 +1,6 @@
 import unittest
 
-from snapquiz.hotkey.global_hotkey import run_global_hotkey, to_pynput_hotkey
+from snapquiz.platform._pynput import run_global_hotkey, to_pynput_hotkey
 from snapquiz.hotkey.stdin_trigger import run_stdin_trigger
 
 

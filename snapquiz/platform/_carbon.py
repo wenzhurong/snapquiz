@@ -24,6 +24,8 @@ import logging
 import time
 from typing import Callable, Optional
 
+from snapquiz.platform.base import HotkeyConflict, HotkeyUnavailable
+
 logger = logging.getLogger(__name__)
 
 CARBON_PATH = "/System/Library/Frameworks/Carbon.framework/Carbon"
@@ -47,10 +49,6 @@ MODIFIERS = {
     "alt": 0x0800, "option": 0x0800, "opt": 0x0800,
     "ctrl": 0x1000, "control": 0x1000,
 }
-
-
-class HotkeyUnavailable(Exception):
-    """这台机器 / 这个进程形态下用不了 Carbon 热键。"""
 
 
 class _EventTypeSpec(ctypes.Structure):
@@ -183,10 +181,11 @@ class CarbonHotkey:
             target, 0, ctypes.byref(self._hotkey_ref),
         )
         if status != 0:
-            # -9878 = eventHotKeyExistsErr：组合已被别的 app 占用。
-            hint = "(该组合已被其他程序占用)" if status == -9878 else ""
+            # -9878 = eventHotKeyExistsErr：组合已被别的 app 占用（D8）。
+            if status == -9878:
+                raise HotkeyConflict(self._spec, "eventHotKeyExistsErr")
             raise HotkeyUnavailable(
-                f"注册热键 {self._spec} 失败 (OSStatus {status}){hint}"
+                f"注册热键 {self._spec} 失败 (OSStatus {status})"
             )
 
     def stop(self) -> None:
@@ -242,6 +241,36 @@ class CarbonHotkey:
         if self._hotkey_ref:
             lib.UnregisterEventHotKey(self._hotkey_ref)
             self._hotkey_ref = ctypes.c_void_p()
+
+
+class CarbonHotkeyHandle:
+    """符合 ``platform.base.HotkeyHandle`` 的句柄。
+
+    注意：装上不等于会收到事件 —— Carbon 事件要由**宿主的** NSApplication
+    循环分发。B0-5 之后宿主是 Qt；在那之前调用方得自己 ``pump``。
+    """
+
+    __slots__ = ("_hotkey",)
+
+    def __init__(self, hotkey: "CarbonHotkey") -> None:
+        self._hotkey = hotkey
+
+    def unregister(self) -> None:
+        self._hotkey.stop()
+        self._hotkey.uninstall()
+
+    def pump(self, *, timeout: Optional[float] = None, strategy: str = "manual") -> None:
+        """仅供尚未把循环交给 Qt 的宿主使用。"""
+
+        self._hotkey.pump(timeout=timeout, strategy=strategy)
+
+
+def install(spec: str, on_trigger: Callable[[], None]) -> CarbonHotkeyHandle:
+    """装上热键并立即返回。不阻塞、不起循环。"""
+
+    hotkey = CarbonHotkey(spec, on_trigger)
+    hotkey.install()
+    return CarbonHotkeyHandle(hotkey)
 
 
 def run_carbon_hotkey(spec: str, on_trigger: Callable[[], None]) -> None:

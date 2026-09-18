@@ -101,7 +101,7 @@ class Platform(Protocol):
 > **不是真正的 NSApplication 循环**。
 >
 > **Qt 提供的恰好是真正的 NSApplication 循环。** 所以 B0 里要重跑一次
-> `--carbon-selftest`，这次跑在 `QApplication.exec()` 里面。
+> `--hotkey-selftest`，这次跑在 `QApplication.exec()` 里面。
 > 如果通过，pynput 和它带来的辅助功能权限一起删掉。
 > 如果还是不通过，删掉 `carbon_hotkey.py` 那 297 行，保留 pynput —— **不留着当"以后再说"的死代码**。
 
@@ -242,10 +242,39 @@ python -m unittest discover -s tests    # 现有 206 个用例不得回归
 
 ## 8. 工作拆分
 
+### B0-1 已完成（2026-09-18）
+
+```
+snapquiz/platform/
+    base.py       接口 + 纯类型（三个方法：两个权限 + 一个热键）
+    __init__.py   current() 工厂 + hotkey_selftest() 临时诊断
+    darwin.py     macOS 实现
+    _carbon.py    零权限热键后端（待 B0-2 验证）
+    _pynput.py    需辅助功能权限的后端（当前默认）
+```
+
+删除 `core/permissions.py`；`hotkey/{carbon,global}_hotkey.py` 搬进 platform。
+`core/` 只剩 busyguard 与 orchestrator，`hotkey/` 只剩 stdin_trigger（平台无关）。
+
+**判据已写成测试**（`test_platform.PlatformSeamTest`）：扫描 `snapquiz/` 下每个
+文件，`snapquiz/platform/` 之外出现 Quartz / Carbon / pynput 即失败。以后回归不了。
+
+实跑发现并修掉的两件事：
+
+1. **`app.py` 直接 import 了 `platform._carbon` / `platform._pynput`**，绕过接口。
+   seam 测试当场抓到。改走 `install_hotkey()`；自检改走
+   `platform.hotkey_selftest()`；`--carbon-selftest` 顺势改名
+   `--hotkey-selftest`（flag 名不该绑死后端）。
+2. **显式 `--trigger stdin` 被 GUI 自动检测覆盖了。** 在没有 tty 的环境
+   （CI、管道、harness）里，用户明确指定的触发方式会被静默改成 hotkey。
+   改成：`--gui` > 显式 `--trigger` > 自动检测。
+
+测试 208 → 221。
+
 | 步 | 内容 | 验收 |
 |---|---|---|
-| B0-1 | 立 `platform/base.py` 接口 + `platform/darwin.py`，把权限与热键搬进去 | `grep` 检查核心层干净 |
-| B0-2 | **在 `QApplication.exec()` 里重跑 `--carbon-selftest`** | 通过则删 pynput，不通过则删 carbon_hotkey |
+| ~~B0-1~~ | ~~立 `platform/base.py` 接口 + `platform/darwin.py`~~ **✅ 2026-09-18** | 已达成，并把判据写成了测试 |
+| B0-2 | **在 `QApplication.exec()` 里重跑 `--hotkey-selftest`** | 通过则删 pynput，不通过则删 carbon_hotkey |
 | B0-3 | 截屏与拓扑换 Qt，删 mss 与 `topology.py`，顺带接上坐标校验 | 双屏各截一次，DPR 换算有测试 |
 | B0-4 | 选区覆盖窗（透明全屏 + QRubberBand） | 在第二块屏上也能正确拖框 |
 | B0-5 | 预览 / 对话框 / 通知 / 托盘换 Qt，删 `_run_gui` 的退出 hack | 从菜单栏能退出 |

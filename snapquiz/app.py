@@ -20,6 +20,7 @@ import os
 import pathlib
 import subprocess
 import sys
+import threading
 
 from snapquiz.config import ConfigError, load_config
 
@@ -77,7 +78,7 @@ def _build_orchestrator(cfg, *, approve, interactive: bool, gui: bool = False):
     # 延迟 import：未装依赖时不影响纯逻辑测试。
     from snapquiz.adapters.openai_chat import OpenAIChatAdapter
     from snapquiz.core.orchestrator import Orchestrator
-    from snapquiz.core.permissions import require_screen_permission
+    from snapquiz.platform import current as current_platform, require_granted
     from snapquiz.present.notify import (
         notify_error,
         notify_error_in_dialog,
@@ -96,7 +97,7 @@ def _build_orchestrator(cfg, *, approve, interactive: bool, gui: bool = False):
         capture_fn=_build_capture_fn(cfg, interactive=interactive),
         send_fn=send_once,
         present_fn=present_fn,
-        require_permission_fn=require_screen_permission,
+        require_permission_fn=lambda: require_granted(current_platform()),
         on_error=error_fn,
         approve_fn=approve,
     )
@@ -298,15 +299,11 @@ def _ask_in_dialog(text: str, *, title: str) -> bool:
 
 
 def _startup_permission_hint(*, gui: bool = False) -> bool:
-    from snapquiz.core.permissions import (
-        ScreenPermissionState,
-        observe_screen_permission,
-        request_screen_recording,
-    )
-
+    from snapquiz.platform import ScreenPermissionState, current as current_platform
     from snapquiz.present.notify import notify_error_in_dialog
 
-    observation = observe_screen_permission()
+    platform = current_platform()
+    observation = platform.screen_permission()
     if observation.granted:
         return True
 
@@ -316,7 +313,7 @@ def _startup_permission_hint(*, gui: bool = False) -> bool:
             "尚未授予屏幕录制权限,正在弹出系统授权请求。\n"
             f"请在 系统设置 › 隐私与安全性 › 屏幕录制 中勾选 {who},然后重新启动。"
         )
-        request_screen_recording()
+        platform.request_screen_permission()
     else:
         message = (
             f"无法确认屏幕录制权限(原因:{observation.reason.value});"
@@ -337,18 +334,14 @@ def _run_gui(cfg, trigger, guard) -> int:
     做成菜单栏图标是更体面的方案，属于后续打磨。
     """
 
-    import threading
-
-    from snapquiz.hotkey.global_hotkey import run_global_hotkey
+    from snapquiz.platform import HotkeyUnavailable, current as current_platform
     from snapquiz.present.notify import _osascript_dialog, notify_error_in_dialog
 
     try:
-        listener = threading.Thread(
-            target=run_global_hotkey, args=(cfg.hotkey, trigger), daemon=True
-        )
-        listener.start()
-    except Exception as exc:  # pragma: no cover - 取决于系统权限
-        notify_error_in_dialog(f"无法注册全局热键:{exc}")
+        hotkey = current_platform().install_hotkey(cfg.hotkey, trigger)
+    except HotkeyUnavailable as exc:
+        # D8：冲突/不可用都要说人话，不是「热键没反应」。
+        notify_error_in_dialog(str(exc))
         return EXIT_PERMISSION_ERROR
 
     _osascript_dialog(
@@ -361,6 +354,7 @@ def _run_gui(cfg, trigger, guard) -> int:
         buttons='{"退出"}',
         timeout=86_400,
     )
+    hotkey.unregister()
     guard.wait_idle(timeout=cfg.timeout + 5)
     return EXIT_OK
 
@@ -370,8 +364,9 @@ def main(argv=None) -> int:
     parser.add_argument(
         "--trigger",
         choices=["stdin", "hotkey"],
-        default="stdin",
-        help="触发方式:stdin=终端按 Enter(默认);hotkey=全局热键(需辅助功能权限)",
+        default=None,
+        help="触发方式:stdin=终端按 Enter;hotkey=全局热键。"
+        "不指定时:有终端就用 stdin,没终端(双击 .app)就用 hotkey",
     )
     parser.add_argument(
         "--select",
@@ -401,25 +396,33 @@ def main(argv=None) -> int:
         help="强制 GUI 模式(热键 + 系统对话框)。双击 .app 启动时自动开启",
     )
     parser.add_argument(
-        "--carbon-selftest",
+        "--hotkey-selftest",
         action="store_true",
-        help="检测本机能否使用零权限 Carbon 热键(需要你按一次组合键)",
+        help="检测本机能否使用零权限全局热键(需要你亲手按一次组合键)",
     )
     parser.add_argument("--verbose", action="store_true", help="打印调试日志")
     args = parser.parse_args(argv)
 
     # 双击 .app 时没有终端:stdin 触发、终端确认、print 全部失效。
-    gui = args.gui or is_gui_launch()
+    # 但**显式指定的 --trigger 优先于自动检测** —— 用户说了要 stdin,
+    # 就不该因为「检测到没有 tty」把他甩进 GUI 分支。
+    if args.gui:
+        gui = True
+    elif args.trigger is not None:
+        gui = False
+    else:
+        gui = is_gui_launch()
+    trigger_mode = args.trigger or ("hotkey" if gui else "stdin")
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
-    if args.carbon_selftest:
-        from snapquiz.hotkey.carbon_hotkey import selftest
+    if args.hotkey_selftest:
+        from snapquiz.platform import hotkey_selftest
 
-        return EXIT_OK if selftest() else EXIT_PERMISSION_ERROR
+        return EXIT_OK if hotkey_selftest() else EXIT_PERMISSION_ERROR
 
     if args.revoke_consent:
         from snapquiz.privacy import consent
@@ -475,9 +478,9 @@ def main(argv=None) -> int:
         )
 
     # GUI 模式只能走热键 —— 没有终端可以按 Enter。
-    if gui or args.trigger == "hotkey":
+    if gui or trigger_mode == "hotkey":
         from snapquiz.core.busyguard import BusyGuard
-        from snapquiz.hotkey.global_hotkey import run_global_hotkey
+        from snapquiz.platform import HotkeyUnavailable, current as current_platform
 
         approve = always_approve if args.yes else _confirm_in_dialog
         orchestrator = _build_orchestrator(
@@ -492,7 +495,20 @@ def main(argv=None) -> int:
         print(banner, flush=True)
         if gui:
             return _run_gui(cfg, trigger, guard)
-        run_global_hotkey(cfg.hotkey, trigger)
+
+        # 终端热键模式(开发用):装上热键后等着,直到 Ctrl-C。
+        try:
+            hotkey = current_platform().install_hotkey(cfg.hotkey, trigger)
+        except HotkeyUnavailable as exc:
+            print(f"❌ {exc}", file=sys.stderr, flush=True)
+            return EXIT_PERMISSION_ERROR
+        print(f"热键 {cfg.hotkey} 已就绪。Ctrl-C 退出。", flush=True)
+        try:
+            threading.Event().wait()
+        except KeyboardInterrupt:
+            print()
+        finally:
+            hotkey.unregister()
         guard.wait_idle(timeout=cfg.timeout + 5)
     else:
         from snapquiz.hotkey.stdin_trigger import run_stdin_trigger

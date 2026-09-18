@@ -419,11 +419,26 @@ class ShippedScriptsTest(unittest.TestCase):
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
 
-        from snapquiz.core.permissions import (
+        from snapquiz.platform import (
             PermissionObservation,
             PermissionReason,
             ScreenPermissionState,
         )
+
+        class FakePlatform:
+            name = "fake"
+
+            def __init__(self, observation):
+                self._observation = observation
+
+            def screen_permission(self):
+                return self._observation
+
+            def request_screen_permission(self):
+                return False
+
+            def install_hotkey(self, spec, on_trigger):  # pragma: no cover
+                raise NotImplementedError
 
         cases = [
             (ScreenPermissionState.GRANTED, PermissionReason.GRANTED, 0),
@@ -432,10 +447,9 @@ class ShippedScriptsTest(unittest.TestCase):
         ]
         for state, reason, expected in cases:
             with self.subTest(state=state), patch.object(
-                module,
-                "observe_screen_permission",
-                lambda s=state, r=reason: PermissionObservation(s, r),
-            ), patch.object(module, "request_screen_recording", lambda: False):
+                module, "current",
+                lambda s=state, r=reason: FakePlatform(PermissionObservation(s, r)),
+            ):
                 self.assertEqual(module.main(), expected)
 
 

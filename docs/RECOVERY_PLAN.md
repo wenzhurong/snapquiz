@@ -895,7 +895,7 @@ try/finally 保证还原）；双击时 CWD 是 `/`，读不到仓库里的 `.en
 但热键分发在更上层。所以「pynput 收得到、Carbon 收不到」不能说明 Carbon 坏了。）
 
 因此：**默认仍是 pynput**，Carbon 作为待验证实现并存。
-`snapquiz --carbon-selftest` 让用户按一次键，两种事件泵各试一轮，一次就能知道
+`snapquiz --hotkey-selftest` 让用户按一次键，两种事件泵各试一轮，一次就能知道
 哪种（如果有）可用。验证通过再切默认。
 
 这条与 [[acceptance-criteria-must-be-user-observable]] 一致：验收判据在代码之外，

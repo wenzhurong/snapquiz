@@ -1,13 +1,13 @@
 import unittest
 from unittest.mock import patch
 
-from snapquiz.hotkey.carbon_hotkey import (
+from snapquiz.platform import HotkeyUnavailable
+from snapquiz.platform._carbon import (
     MODIFIERS,
     VIRTUAL_KEYS,
-    HotkeyUnavailable,
     parse_hotkey,
 )
-from snapquiz.hotkey.global_hotkey import to_pynput_hotkey
+from snapquiz.platform._pynput import to_pynput_hotkey
 
 
 class ParseHotkeyTest(unittest.TestCase):
@@ -65,7 +65,7 @@ class ParseHotkeyTest(unittest.TestCase):
                 to_pynput_hotkey(spec)      # pynput
 
     def test_missing_cocoa_reports_unavailable(self):
-        from snapquiz.hotkey import carbon_hotkey
+        from snapquiz.platform import _carbon as carbon_hotkey
 
         with patch.object(
             carbon_hotkey, "_ensure_gui_process",

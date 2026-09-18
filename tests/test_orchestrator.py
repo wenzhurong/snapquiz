@@ -5,7 +5,7 @@ from snapquiz.adapters.openai_chat import OpenAIChatAdapter
 from snapquiz.config import Config
 from snapquiz.providers import ZHIPU
 from snapquiz.core.orchestrator import Orchestrator
-from snapquiz.core.permissions import PermissionDenied
+from snapquiz.platform import PermissionDenied
 from snapquiz.domain.adapter import TransportResponse
 from snapquiz.domain.solve import SolveStatus
 
