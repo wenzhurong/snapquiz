@@ -8,6 +8,7 @@ capability —— 对一个单用户本地工具、调用一个固定官方域�
 
 保留的不变量：
 - 不自动重试（v3 与 MVP-0 审计都指出对 4xx 重试是错的）
+- **跟随系统代理**
 - 不跟随 3xx（重定向可以把截图和密钥送到别处）
 - 响应体有上限
 - 密钥只在这里注入，不进 OutboundRequest、不进 envelope digest、不进日志
@@ -54,11 +55,13 @@ def send_once(
     logger.info("outbound %s", prepared.safe_metadata())
 
     try:
+        # 刻意**不传** transport：传了会连带把系统代理挂载一起旁路掉。
+        # 而 httpx.HTTPTransport 的 retries 默认就是 0，所以那个参数本来就是多余的
+        # —— 它唯一的实际效果是让请求绕过系统代理，这不是我们要的（见 D4）。
         with httpx.Client(
             timeout=timeout,
             follow_redirects=False,
             verify=True,
-            transport=httpx.HTTPTransport(retries=0),
         ) as client:
             response = client.request(
                 prepared.http_method,
@@ -72,6 +75,7 @@ def send_once(
         ) from None
     except httpx.HTTPError:
         # 不让 httpx 的异常文本外泄，它可能包含完整 URL 与 header 名。
+        # 注意：走系统代理时，代理本身挂了也长这样。诊断提示见 app 层。
         raise NetworkError(
             stage=TRANSPORT_STAGE, provider_profile_id=provider_profile_id
         ) from None

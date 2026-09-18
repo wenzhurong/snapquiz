@@ -170,6 +170,42 @@ class SendOnceTest(unittest.TestCase):
         self.assertNotIn("zp-secret", repr(ctx.exception))
         self.assertNotIn("bigmodel", repr(ctx.exception))
 
+    def test_client_is_built_without_a_custom_transport(self):
+        """跟随系统代理(D4)。
+
+        传 ``transport=`` 会把 httpx 自动探测到的代理挂载一起旁路掉 ——
+        这正是之前意外直连的原因。而 ``HTTPTransport`` 的 ``retries``
+        默认就是 0，所以那个参数本来就没有存在的必要。
+        """
+
+        seen = {}
+        real = httpx.Client
+
+        def factory(**kwargs):
+            seen.update(kwargs)
+            return real(transport=httpx.MockTransport(
+                lambda r: httpx.Response(200, content=SUCCESS)), **{
+                k: v for k, v in kwargs.items() if k != "transport"})
+
+        with patch.object(httpx, "Client", factory):
+            self.send_once(self.prepared, api_key="x", timeout=5,
+                           provider_profile_id=ZHIPU.profile_id,
+                           error_scheme=ZHIPU.error_scheme)
+
+        self.assertNotIn("transport", seen, "传 transport 会旁路系统代理")
+        self.assertIs(seen.get("follow_redirects"), False)
+        self.assertIs(seen.get("verify"), True)
+
+    def test_httpx_still_defaults_to_zero_retries(self):
+        """我们依赖这个默认值。它哪天变了，这条会先响。"""
+
+        import inspect
+
+        default = inspect.signature(
+            httpx.HTTPTransport.__init__
+        ).parameters["retries"].default
+        self.assertEqual(default, 0)
+
     def test_tls_environment_is_checked_before_any_request(self):
         called = []
 
