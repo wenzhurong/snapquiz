@@ -398,7 +398,13 @@ def main(argv=None) -> int:
     parser.add_argument(
         "--hotkey-selftest",
         action="store_true",
-        help="检测本机能否使用零权限全局热键(需要你亲手按一次组合键)",
+        help="检测本机能否使用零权限全局热键(需要你亲手按两次组合键)",
+    )
+    parser.add_argument(
+        "--selftest-hotkey",
+        default=None,
+        metavar="组合",
+        help="自检用的组合,默认 ctrl+alt+cmd+j(撞上别的程序时换一个)",
     )
     parser.add_argument("--verbose", action="store_true", help="打印调试日志")
     args = parser.parse_args(argv)
@@ -422,7 +428,8 @@ def main(argv=None) -> int:
     if args.hotkey_selftest:
         from snapquiz.platform import hotkey_selftest
 
-        return EXIT_OK if hotkey_selftest() else EXIT_PERMISSION_ERROR
+        ok = hotkey_selftest(spec=args.selftest_hotkey)
+        return EXIT_OK if ok else EXIT_PERMISSION_ERROR
 
     if args.revoke_consent:
         from snapquiz.privacy import consent

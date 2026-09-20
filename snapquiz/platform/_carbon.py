@@ -109,8 +109,13 @@ class _CarbonRuntime:
         lib = self.lib
         lib.GetApplicationEventTarget.restype = ctypes.c_void_p
         lib.InstallEventHandler.restype = ctypes.c_int32
+        # ⚠️ 第三个参数是 ItemCount，在 64 位 macOS 上是 `unsigned long`（64 位），
+        # 不是 UInt32。声明成 c_uint32 会让被调方读到高 32 位的垃圾，
+        # inNumTypes 变成一个巨大的数 —— 于是 handler 注册到一堆越界读出来的
+        # 事件类型上。实测症状：outRef 拿到 6 这种非法指针值、热键永远收不到
+        # 事件、之后任何键盘事件都可能把进程打成 SIGTRAP。
         lib.InstallEventHandler.argtypes = [
-            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong,
             ctypes.POINTER(_EventTypeSpec), ctypes.c_void_p,
             ctypes.POINTER(ctypes.c_void_p),
         ]
@@ -121,6 +126,8 @@ class _CarbonRuntime:
         ]
         lib.UnregisterEventHotKey.restype = ctypes.c_int32
         lib.UnregisterEventHotKey.argtypes = [ctypes.c_void_p]
+        lib.RemoveEventHandler.restype = ctypes.c_int32
+        lib.RemoveEventHandler.argtypes = [ctypes.c_void_p]
 
 
 def _ensure_gui_process():
@@ -237,10 +244,25 @@ class CarbonHotkey:
         app.run()
 
     def uninstall(self) -> None:
+        """解注册热键**并移除事件 handler**。
+
+        ⚠️ 只解注册热键是不够的：handler 是一个 ctypes 回调，留在系统的
+        application event target 上；本对象被 GC 之后 ``self._callback``
+        随之释放，系统就持有了一个**指向已释放内存的函数指针**，下一个键盘
+        事件到来时进程 SIGTRAP。
+
+        这是 B0-2 的对照组实验撞出来的：同进程先跑 Carbon 再跑 pynput，
+        第二轮必崩（exit 133）。单独跑任何一个都正常，所以很容易误判成
+        「pynput 和 Qt 不兼容」。
+        """
+
         lib = self._runtime.lib
         if self._hotkey_ref:
             lib.UnregisterEventHotKey(self._hotkey_ref)
             self._hotkey_ref = ctypes.c_void_p()
+        if self._handler_ref:
+            lib.RemoveEventHandler(self._handler_ref)
+            self._handler_ref = ctypes.c_void_p()
 
 
 class CarbonHotkeyHandle:

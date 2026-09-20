@@ -44,21 +44,26 @@ def current() -> Platform:
     raise UnsupportedPlatform(f"未支持的平台:{sys.platform}")
 
 
-def hotkey_selftest(spec: str = "cmd+shift+space", seconds: float = 15.0) -> bool:
-    """临时诊断：验证**零权限**热键在当前进程形态下是否真的收得到事件。
+def hotkey_selftest(spec: str | None = None, seconds: float | None = None) -> bool:
+    """B0-2：在**真正的 Qt 事件循环**里验证零权限热键。
 
-    需要人亲手按一次 —— macOS 的热键分发层忽略 ``CGEventPost`` 合成的按键
-    （实测连系统自己的 Cmd+Shift+3 都不触发），所以这件事无法自动化验证。
+    需要人亲手按两次（Carbon 一次、pynput 对照组一次）—— macOS 的热键分发层
+    忽略 ``CGEventPost`` 合成的按键（实测连系统自己的 Cmd+Shift+3 都不触发），
+    所以这件事在原理上无法自动化验证。
 
-    B0-2 用它定夺 Carbon 能否取代 pynput；定完之后**这个函数连同落败的那个
-    后端一起删掉**，不留死代码。
+    定夺之后**这个函数连同落败的那个后端一起删掉**，不留死代码。
     """
 
     if sys.platform != "darwin":
         raise UnsupportedPlatform("零权限热键自检目前只有 macOS 实现")
-    from snapquiz.platform._carbon import selftest
+    from snapquiz.platform import _qt_selftest
 
-    return selftest(spec=spec, seconds=seconds)
+    kwargs = {}
+    if spec is not None:
+        kwargs["spec"] = spec
+    if seconds is not None:
+        kwargs["seconds"] = seconds
+    return _qt_selftest.run(**kwargs)
 
 
 __all__ = [

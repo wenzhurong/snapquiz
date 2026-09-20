@@ -82,3 +82,60 @@ class ParseHotkeyTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SelftestDecisionMatrixTest(unittest.TestCase):
+    """B0-2 的判定逻辑。
+
+    实验本身要人按键，但「拿到两个结果之后怎么判」是纯逻辑，可以测。
+    关键是第三行：两个都没收到时**不能**判 Carbon 不行 —— 那是上一轮
+    差点犯的错。
+    """
+
+    def _run_with(self, carbon, pynput):
+        from snapquiz.platform import _qt_selftest
+
+        results = {"carbon": carbon, "pynput": pynput}
+        with patch.object(
+            _qt_selftest, "_trial", side_effect=lambda b, s, t: results[b]
+        ), patch("builtins.print"):
+            return _qt_selftest.run(seconds=0.01)
+
+    def test_carbon_works_means_drop_pynput(self):
+        self.assertTrue(self._run_with(True, True))
+        self.assertTrue(self._run_with(True, False))
+
+    def test_only_control_fires_means_carbon_is_out(self):
+        self.assertFalse(self._run_with(False, True))
+
+    def test_neither_fires_is_inconclusive_not_a_carbon_verdict(self):
+        """两个都没收到 → 返回 False，但理由是「装置有问题」而不是「Carbon 不行」。"""
+
+        from snapquiz.platform import _qt_selftest
+
+        lines = []
+        results = {"carbon": False, "pynput": False}
+        with patch.object(
+            _qt_selftest, "_trial", side_effect=lambda b, s, t: results[b]
+        ), patch("builtins.print", side_effect=lambda *a, **k: lines.append(" ".join(map(str, a)))):
+            verdict = _qt_selftest.run(seconds=0.01)
+
+        self.assertFalse(verdict)
+        text = "\n".join(lines)
+        self.assertIn("不能下结论", text)
+        self.assertNotIn("删掉 _carbon.py", text)
+
+    def test_uninstallable_backend_is_not_a_false_negative(self):
+        """装不上（None）不等于没收到（False）。"""
+
+        self.assertFalse(self._run_with(None, True))
+        self.assertTrue(self._run_with(True, None))
+
+    def test_child_exit_codes_are_distinct(self):
+        from snapquiz.platform._qt_selftest import (
+            EXIT_CANNOT_INSTALL,
+            EXIT_FIRED,
+            EXIT_NOT_FIRED,
+        )
+
+        self.assertEqual(len({EXIT_FIRED, EXIT_NOT_FIRED, EXIT_CANNOT_INSTALL}), 3)

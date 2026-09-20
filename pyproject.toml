@@ -22,6 +22,10 @@ snapquiz = "snapquiz.app:main"
 dev = ["pytest>=8.0"]
 # 打包成 SnapQuiz.app（不签名）
 app = ["py2app>=0.28", "pynput>=1.7"]
+# GUI（D1）。B1 落地后会升为主依赖；B0-2 的热键自检已经需要它。
+# 注意：完整 PySide6 装下来约 1.2 GB，其中 QtWebEngine 一个就占 476 MB；
+# 实际只用到 QtCore + QtGui + QtWidgets（约 88 MB），打包器只带用到的部分。
+gui = ["PySide6>=6.6", "pynput>=1.7"]
 # 真·全局热键(--trigger hotkey);macOS 上需授予「辅助功能」权限
 hotkey = ["pynput>=1.7"]
 

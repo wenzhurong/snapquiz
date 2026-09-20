@@ -242,6 +242,37 @@ python -m unittest discover -s tests    # 现有 206 个用例不得回归
 
 ## 8. 工作拆分
 
+### B0-2 进行中（2026-09-19）：装置就绪，等人工按键
+
+`snapquiz/platform/_qt_selftest.py`。实验设计上做了两处改动，都是被现实逼出来的：
+
+**① 带对照组。** 同一个 Qt 循环里依次测 Carbon 与 pynput：
+
+| carbon | pynput | 结论 |
+|---|---|---|
+| ✅ | ✅/❌ | Carbon 可用 → 删 `_pynput.py`，摆脱辅助功能权限 |
+| ❌ | ✅ | Carbon 在 Qt 里也收不到 → 删 `_carbon.py`(297 行) |
+| ❌ | ❌ | **装置有问题，不下结论** |
+
+第三行是重点：上一轮我差点直接从「Carbon 收不到」判「Carbon 不可用」，
+而真相是测试装置验证不了。没有对照组就区分不开这两种情况。
+
+**② 每个后端跑在独立子进程里。** 同进程先装 Carbon 再装 pynput 会 SIGTRAP
+（实测 exit 133）。根因在 Carbon 这边的 ctypes 绑定 —— 但**不该让待验证后端的
+缺陷污染对照组**，那正好会伪造出上表第三行。
+
+#### 顺带修掉的一个真 bug
+
+`CarbonHotkey.uninstall()` 只解注册热键，**从不移除事件 handler**。handler 是
+一个 ctypes 回调，留在系统的 application event target 上；对象被 GC 后
+`self._callback` 随之释放，系统就持有了**指向已释放内存的函数指针**，
+下一个键盘事件到来即崩。已补 `RemoveEventHandler`。
+
+（顺带查证过但**不是**原因的：`InstallEventHandler` 第三个参数 `ItemCount`
+在 64 位 macOS 上是 `unsigned long` 而非 `UInt32`，已一并改正；
+符号地址正常、OSStatus 返回 0、`outRef` 是小整数 3/6 —— HIToolbox 用的
+应该就是小句柄，不是非法指针。）
+
 ### B0-1 已完成（2026-09-18）
 
 ```
@@ -274,7 +305,7 @@ snapquiz/platform/
 | 步 | 内容 | 验收 |
 |---|---|---|
 | ~~B0-1~~ | ~~立 `platform/base.py` 接口 + `platform/darwin.py`~~ **✅ 2026-09-18** | 已达成，并把判据写成了测试 |
-| B0-2 | **在 `QApplication.exec()` 里重跑 `--hotkey-selftest`** | 通过则删 pynput，不通过则删 carbon_hotkey |
+| B0-2 | **在 `QApplication.exec()` 里重跑 `--hotkey-selftest`** ⏳ 待人工按键 | 通过则删 pynput，不通过则删 carbon_hotkey |
 | B0-3 | 截屏与拓扑换 Qt，删 mss 与 `topology.py`，顺带接上坐标校验 | 双屏各截一次，DPR 换算有测试 |
 | B0-4 | 选区覆盖窗（透明全屏 + QRubberBand） | 在第二块屏上也能正确拖框 |
 | B0-5 | 预览 / 对话框 / 通知 / 托盘换 Qt，删 `_run_gui` 的退出 hack | 从菜单栏能退出 |
